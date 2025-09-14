@@ -2,7 +2,15 @@
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
+
 using json = nlohmann::json;
+
+Pipeline::~Pipeline() {
+   delete rawChain_;
+   delete apv_id_;
+   delete apv_ch_;
+   delete apv_q_;
+}
 
 void Pipeline::Initialize(const std::string& configFile) {
    std::ifstream in(configFile);
@@ -20,20 +28,25 @@ void Pipeline::Initialize(const std::string& configFile) {
    }
 }
 
+std::tuple<int, int, int> Pipeline::ElectronicMap(int boardID, int channelID) {
+   // 映射规则示例
+   int detID = boardID / 10;  // 例如：10x = detectorID
+   int stripID = channelID % 128;
+   int type = (channelID < 128) ? 0 : 1;  // 0 = X, 1 = Y
+   return {detID, stripID, type};
+}
+
 void Pipeline::Run(const std::string& inputFile) {
    rawChain_ = new TChain("raw");
    rawChain_->Add(inputFile.c_str());
 
-   // 设置分支
    apv_id_ = new std::vector<unsigned int>;
    apv_ch_ = new std::vector<unsigned int>;
-   mm_strip_ = new std::vector<unsigned int>;
    apv_q_ = new std::vector<std::vector<double>>;
 
    rawChain_->SetBranchAddress("apv_evt", &apv_evt_);
    rawChain_->SetBranchAddress("apv_id", &apv_id_);
    rawChain_->SetBranchAddress("apv_ch", &apv_ch_);
-   rawChain_->SetBranchAddress("mm_strip", &mm_strip_);
    rawChain_->SetBranchAddress("apv_q", &apv_q_);
 
    int totalEntries = rawChain_->GetEntries();
@@ -43,9 +56,6 @@ void Pipeline::Run(const std::string& inputFile) {
    // ---- 核心事件循环 ----
    for (int i = 0; i < totalEntries; ++i) {
       rawChain_->GetEntry(i);
-      if (i % 1000 == 0) {
-         std::cout << "Event " << i << " / " << totalEntries << std::endl;
-      }
 
       // 1. 构建RawData
       std::map<int, std::vector<RawData>> rawDataBuffer;
@@ -54,25 +64,22 @@ void Pipeline::Run(const std::string& inputFile) {
          int channelID = apv_ch_->at(j);
 
          auto [detID, stripID, type] = ElectronicMap(boardID, channelID);
-
-         RawData raw;
-         raw.StripID = stripID;
-         raw.type = type;
-         raw.adc = apv_q_->at(j);
-
+         RawData raw{stripID, type, apv_q_->at(j)};
          rawDataBuffer[detID].push_back(raw);
       }
 
-      // 2. 逐探测器重建
+      // 2. algorithms: rawData->StripHit->RecCluster->LocalHit->GlobleHit
       Event event;
       event.eventID = apv_evt_;
 
-      for (auto& [detID, det] : detectors_) {
+      for (auto& [detID, det] : m_dets) {
          auto& rawHits = rawDataBuffer[detID];
+         if (rawHits.empty()) continue;
 
-         // Raw -> StripHit -> Cluster
-         auto stripHits = det->ProcessRawData(rawHits);
+         // Raw -> StripHit
+         auto stripHits = det->BuildStripHit(rawHits);
 
+         // StripHit -> Cluster
          auto recClusters = det->BuildClusters(stripHits);
          event.clusterMap[detID] = recClusters;
 
@@ -80,26 +87,88 @@ void Pipeline::Run(const std::string& inputFile) {
          auto localHits = det->RecLocalHit(recClusters);
          event.localHits[detID] = localHits;
 
-         // Local -> Global
+         // LocalHit -> GlobalHit
          for (auto& lh : localHits) {
-            event.globalHits[detID].push_back(det->LocalToGlobal(lh));
+            GlobalHit gh = det->LocalToGlobal(lh);
+            event.globalHits[detID].push_back(gh);
          }
       }
 
-      // 3. 简单Track拟合（可直接内联，不单独函数）
-      if (event.globalHits.size() >= 2) {
-      }
+      // 3. Find Track And Pick Event you want
+      if (!EventFilter(event)) continue;
 
-      // 4. 输出或保存
       std::cout << "Event " << event.eventID
                 << " hits: " << event.globalHits.size() << std::endl;
    }
 }
 
-std::tuple<int, int, int> Pipeline::ElectronicMap(int boardID, int channelID) {
-   // 映射规则示例
-   int detID = boardID / 10;  // 例如：10x = detectorID
-   int stripID = channelID % 128;
-   int type = (channelID < 128) ? 0 : 1;  // 0 = X, 1 = Y
-   return {detID, stripID, type};
+bool Pipeline::EventFilter(Event& event) {
+   std::vector<double> z_vals;
+   std::vector<double> x_vals;
+   std::vector<double> y_vals;
+
+   // 1. 检查每个Tracker是否恰好只有一个GlobalHit
+   for (auto& [detID, det] : m_dets) {
+      if (!det->isTracker()) continue;
+
+      auto it = event.globalHits.find(detID);
+      if (it == event.globalHits.end() || it->second.size() != 1) {
+         return false;
+      }
+
+      const GlobalHit& hit = it->second[0];
+      z_vals.push_back(hit.z);
+      x_vals.push_back(hit.x);
+      y_vals.push_back(hit.y);
+   }
+
+   if (z_vals.size() < 2) {
+      return false;
+   }
+
+   // 计算z、x、y的均值
+   auto mean = [](const std::vector<double>& v) {
+      double sum = 0.0;
+      for (auto& val : v) sum += val;
+      return sum / v.size();
+   };
+
+   double z_mean = mean(z_vals);
+   double x_mean = mean(x_vals);
+   double y_mean = mean(y_vals);
+
+   // 计算斜率和截距
+   auto calcSlopeIntercept = [&](const std::vector<double>& z, const std::vector<double>& val, double mean_z, double mean_val) {
+      double num = 0.0;
+      double den = 0.0;
+      for (size_t i = 0; i < z.size(); ++i) {
+         double dz = z[i] - mean_z;
+         num += dz * (val[i] - mean_val);
+         den += dz * dz;
+      }
+      double slope = num / den;
+      double intercept = mean_val - slope * mean_z;
+      return std::make_pair(slope, intercept);
+   };
+
+   auto [slope_x, intercept_x] = calcSlopeIntercept(z_vals, x_vals, z_mean, x_mean);
+   auto [slope_y, intercept_y] = calcSlopeIntercept(z_vals, y_vals, z_mean, y_mean);
+
+   // 计算chi2和ndf
+   double chi2 = 0.0;
+   for (size_t i = 0; i < z_vals.size(); ++i) {
+      double dx = x_vals[i] - (intercept_x + slope_x * z_vals[i]);
+      double dy = y_vals[i] - (intercept_y + slope_y * z_vals[i]);
+      chi2 += dx * dx + dy * dy;
+   }
+   int ndf = static_cast<int>(2 * z_vals.size() - 4);
+
+   // 5. 保存结果到event.track
+   event.track.slope_x = slope_x;
+   event.track.intercept_x = intercept_x;
+   event.track.slope_y = slope_y;
+   event.track.intercept_y = intercept_y;
+   event.track.chi2 = chi2 / ndf;
+
+   return true;
 }

@@ -1,0 +1,32 @@
+{
+  "detectors": [
+
+    {
+      "id": 1,
+      "name": "Detector1",
+      "role": "Tracker",
+      "geometry": {
+        "position": [0.0, 0.0, 100.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "readoutPlanes": {
+          "0": { "angle": 0.0, "pitch": 0.4 },
+          "1": { "angle": 90.0, "pitch": 0.4 }
+        }
+      },
+      "algorithms": {
+        "stripHitBuilder": {
+          "name": "DefaultStripHitBuilder",
+          "params": { "baselineWindow": 10,"cfdFraction": 0.5}
+        },
+        "clusterBuilder": {
+          "name": "ChargeWeightedCluster",
+          "params": {"maxGap": 1,"minSize": 2 }
+        }
+      }
+    }
+
+
+
+
+  ]
+}

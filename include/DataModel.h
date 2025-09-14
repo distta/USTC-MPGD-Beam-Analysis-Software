@@ -55,21 +55,13 @@ struct GlobalHit {
 
 // 径迹数据结构
 struct Track {
-   int trackID;
 
-   std::map<int, std::vector<RecCluster>*> detectorClusters;  // 各探测器层的聚类
-   std::map<int, LocalHit> localHits;                         // 各探测器层的局部命中位置
-   std::map<int, GlobalHit> globalHits;                       // 各探测器层的全局命中位置
-
-   // 径迹参数 (直线拟合)
    double slope_x;      // x方向斜率
    double slope_y;      // y方向斜率
    double intercept_x;  // x截距
    double intercept_y;  // y截距
    double chi2;         // 拟合质量
-   int ndf;             // 自由度
 
-   // 计算径迹在指定z位置的坐标
    std::pair<double, double> getPositionAtZ(double z) const {
       double x = intercept_x + slope_x * z;
       double y = intercept_y + slope_y * z;

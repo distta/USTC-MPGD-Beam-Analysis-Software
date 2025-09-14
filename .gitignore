@@ -1,0 +1,7 @@
+/build/
+/rawData/
+/result/
+
+/.cache/
+/.vscode/
+/.qoder/
