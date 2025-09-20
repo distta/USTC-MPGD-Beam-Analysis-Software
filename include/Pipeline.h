@@ -1,39 +1,42 @@
 #pragma once
 
 #include "DataModel.h"
-#include "Detector.h"
+#include "Detector/Detector.h"
 #include <TChain.h>
 #include <map>
 #include <memory>
 #include <string>
-#include <vector>
 
 class Pipeline {
-  public:
-   Pipeline() = default;
-   ~Pipeline();
+   public:
+    Pipeline() = default;
+    ~Pipeline();
 
-   void Initialize(const std::string& configFile);
+    void Initialize(const std::string& configFile);
+    void SetRawDataFile(const std::string& dataFile);
+    void SetOutputDirectory(const std::string& outputDir);
+    void Run();
+    void Finalize();
 
-   void AddDetector(std::shared_ptr<Detector> det) {
-       m_dets[det->GetID()] = det;
-   }
-   
-   void Run(const std::string& inputFile);
+   private:
+    void AddDetector(std::shared_ptr<Detector> det) {
+        m_dets[det->GetID()] = det;
+    }
+    std::tuple<int, int, int> ElectronicMap(int boardID, int channelID);
 
-   bool EventFilter(Event& event);
+    void GenerateCache();
+    bool EventFilter(Event& event);
+    void CreateGlobalHits(Event& event);
 
-  private:
-   std::tuple<int, int, int> ElectronicMap(int boardID, int channelID);
+   private:
+    std::string m_cacheFileName;
+    std::string m_rawDataFileName;
+    std::string m_outputDirectory;
 
-  private:
-   std::map<int, std::shared_ptr<Detector>> m_dets;
+    int m_eventID;
+    int m_detID;
+    std::vector<RecCluster>* m_clusterBuffer;
 
-   // ROOT 变量
-   TChain* rawChain_ = nullptr;
-   unsigned int apv_evt_ = 0;
-   std::vector<unsigned int>* apv_id_ = nullptr;
-   std::vector<unsigned int>* apv_ch_ = nullptr;
-   std::vector<unsigned int>* mm_strip_ = nullptr;
-   std::vector<std::vector<double>>* apv_q_ = nullptr;
+    std::map<int, std::shared_ptr<Detector>> m_dets;
+    std::vector<Event> m_events;
 };
