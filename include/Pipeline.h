@@ -23,9 +23,9 @@ class Pipeline {
         m_dets[det->GetID()] = det;
     }
     std::tuple<int, int, int> ElectronicMap(int boardID, int channelID);
+    bool EventFilter(const std::map<int, std::vector<std::vector<RawData>>>& preCluster);
 
     void GenerateCache();
-    bool EventFilter(Event& event);
     void CreateGlobalHits(Event& event);
 
    private:
@@ -35,7 +35,7 @@ class Pipeline {
 
     int m_eventID;
     int m_detID;
-    std::vector<RecCluster>* m_clusterBuffer;
+    RecCluster* m_clusterBuffer;
 
     std::map<int, std::shared_ptr<Detector>> m_dets;
     std::vector<Event> m_events;

@@ -26,7 +26,7 @@ struct WaveformConfig {
 // 聚类配置
 struct ClusterConfig {
     int maxGap = 1;           // 最大间隙
-    int minClusterSize = 1;   // 最小聚类大小
+    int minClusterSize = 2;   // 最小聚类大小
     int maxClusterSize = 20;  // 最大聚类大小
 
     void loadFrom(const json& config, const std::string& section = "cluster") {

@@ -26,15 +26,17 @@ class Detector {
     virtual GlobalHit LocalToGlobal(const LocalHit& localHit) const = 0;
 
     // ---------- 核心接口 ----------
-    std::vector<RecCluster> BuildClusters(const std::vector<RawData>& raws) {
+    RecCluster BuildClusters(const std::vector<RawData>& raws) {
         return m_clusterBuilder->BuildCluster(raws);
     };
     std::vector<LocalHit> MatchCluster(const std::vector<RecCluster>& clusters) {
         return m_clusterMatcher->MatchClusters(clusters);
     };
+    std::vector<std::vector<RawData>> preClustering(const std::vector<RawData>& raws) {
+        return m_clusterBuilder->preClustering(raws);
+    };
 
    protected:
-
     double m_posX = 0, m_posY = 0, m_posZ = 0;
     double m_rotX = 0, m_rotY = 0, m_rotZ = 0;
 

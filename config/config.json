@@ -37,6 +37,17 @@
         "0": { "angle": 0.0, "pitch": 0.4 },
         "1": { "angle": 90.0, "pitch": 0.4 }
       }
+    },
+    {
+      "id": 4,
+      "name": "CylinderURGroove",
+      "role": "DUT",
+      "type": "planar",
+      "position": [ 0.0, 0.0, 100.0 ],
+      "rotation": [ 0.0, 0.0, 0.0 ],
+      "readoutPlanes": {
+        "0": { "angle": 0.0, "pitch": 0.4 }
+      }
     }
   ]
 }

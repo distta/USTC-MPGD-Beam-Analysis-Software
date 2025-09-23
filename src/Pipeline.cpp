@@ -73,7 +73,6 @@ void Pipeline::SetRawDataFile(const std::string& dataFile) {
 
 void Pipeline::SetOutputDirectory(const std::string& outputDir) {
     m_outputDirectory = outputDir;
-    // 更新 cache 文件路径以使用新的输出目录
     m_cacheFileName = m_outputDirectory + "/cache.root";
 }
 
@@ -96,7 +95,7 @@ void Pipeline::GenerateCache() {
     }
 
     TTree cacheTree("cluster", "cluster");
-    std::vector<RecCluster> clusterBuffer;
+    RecCluster clusterBuffer;
     cacheTree.Branch("eventID", &m_eventID, "eventID/I");
     cacheTree.Branch("detID", &m_detID, "detID/I");
     cacheTree.Branch("cluster", &clusterBuffer);
@@ -114,7 +113,7 @@ void Pipeline::GenerateCache() {
 
     rawChain.SetBranchAddress("apv_evt", &apv_evt_);
     rawChain.SetBranchAddress("apv_id", &apv_id_);
-    rawChain.SetBranchAddress("apv_ch", &apv_ch_);
+    rawChain.SetBranchAddress("mm_strip", &apv_ch_);
     rawChain.SetBranchAddress("apv_q", &apv_q_);
 
     int totalEntries = rawChain.GetEntries();
@@ -123,6 +122,12 @@ void Pipeline::GenerateCache() {
     std::cout << "[INFO]: Raw File contains entries: " << totalEntries << std::endl;
 
     for (int i = 0; i < 10000; ++i) {
+
+        if ((i % 1000 == 0) || i == totalEntries - 1) {
+            std::cout << "\r"
+                      << "[INFO]: Processed " << (i + 1) << "/" << totalEntries << std::flush;
+        }
+
         rawChain.GetEntry(i);
         m_eventID = apv_evt_;
 
@@ -131,21 +136,29 @@ void Pipeline::GenerateCache() {
             rawDataBuffer[detID].push_back({stripID, type, (*apv_q_)[j]});
         }
 
+        // 获取预聚类结果进行有效性判断
+        std::map<int, std::vector<std::vector<RawData>>> preCluster;
         for (auto& [detID, raws] : rawDataBuffer) {
             if (m_dets.find(detID) == m_dets.end()) continue;
-            clusterBuffer = m_dets[detID]->BuildClusters(raws);
-            m_detID = detID;
+            preCluster[detID] = m_dets[detID]->preClustering(raws);
+        }
 
-            if (clusterBuffer.size() > 0)
-                cacheTree.Fill();
+        if (!EventFilter(preCluster)) {
+            rawDataBuffer.clear();
+            continue;
+        }
+
+        for (auto& [detID, clusters] : preCluster) {
+            if (m_dets.find(detID) == m_dets.end()) continue;
+            for (auto& cluster : clusters) {
+                clusterBuffer = m_dets[detID]->BuildClusters(cluster);
+                m_detID = detID;
+                if (clusterBuffer.strips.size() > 0)
+                    cacheTree.Fill();
+            }
         }
 
         rawDataBuffer.clear();
-
-        if ((i % 100 == 0) || i == totalEntries - 1) {
-            std::cout << "\r"
-                      << "[INFO]: Processed " << (i + 1) << "/" << totalEntries << std::flush;
-        }
     }
     std::cout << std::endl;
     cacheTree.Write();
@@ -196,89 +209,43 @@ void Pipeline::Run() {
                 event.eventID = currentEventID;
 
                 CreateGlobalHits(event);
-
-                if (EventFilter(event)) {
-                    m_events.push_back(event);
-                }
+                m_events.push_back(event);
             }
 
             event = Event();
             currentEventID = m_eventID;
         }
 
-        event.recClusters[m_detID] = *m_clusterBuffer;
+        event.recClusters[m_detID].push_back(*m_clusterBuffer);
     }
 
     std::cout << "Total valid events after filtering: " << m_events.size() << " / " << nEntries << std::endl;
 }
 
-bool Pipeline::EventFilter(Event& event) {
-    std::vector<double> z_vals;
-    std::vector<double> x_vals;
-    std::vector<double> y_vals;
+bool Pipeline::EventFilter(const std::map<int, std::vector<std::vector<RawData>>>& preCluster) {
+    // 对每个探测器进行检查
+    for (auto& [detID, clusters] : preCluster) {
+        if (m_dets[detID]->isDUT()) continue;
 
-    // 1. 检查每个Tracker是否恰好只有一个GlobalHit
-    for (auto& [detID, det] : m_dets) {
-        if (!det->isTracker()) continue;
+        std::map<int, int> typeClusterCount;
 
-        auto it = event.recGlobalHits.find(detID);
-        if (it == event.recGlobalHits.end() || it->second.size() != 1) {
+        for (const auto& cluster : clusters) {
+            if (cluster.empty()) continue;
+
+            int type = cluster[0].type;
+            typeClusterCount[type]++;
+        }
+
+        for (const auto& [type, count] : typeClusterCount) {
+            if (count != 1) {
+                return false;
+            }
+        }
+
+        if (typeClusterCount.size() < 2) {
             return false;
         }
-
-        const GlobalHit& hit = it->second[0];
-        z_vals.push_back(hit.z);
-        x_vals.push_back(hit.x);
-        y_vals.push_back(hit.y);
     }
-
-    if (z_vals.size() < 2) {
-        return false;
-    }
-
-    // 计算z、x、y的均值
-    auto mean = [](const std::vector<double>& v) {
-        double sum = 0.0;
-        for (auto& val : v) sum += val;
-        return sum / v.size();
-    };
-
-    double z_mean = mean(z_vals);
-    double x_mean = mean(x_vals);
-    double y_mean = mean(y_vals);
-
-    // 计算斜率和截距
-    auto calcSlopeIntercept = [&](const std::vector<double>& z, const std::vector<double>& val, double mean_z, double mean_val) {
-        double num = 0.0;
-        double den = 0.0;
-        for (size_t i = 0; i < z.size(); ++i) {
-            double dz = z[i] - mean_z;
-            num += dz * (val[i] - mean_val);
-            den += dz * dz;
-        }
-        double slope = num / den;
-        double intercept = mean_val - slope * mean_z;
-        return std::make_pair(slope, intercept);
-    };
-
-    auto [slope_x, intercept_x] = calcSlopeIntercept(z_vals, x_vals, z_mean, x_mean);
-    auto [slope_y, intercept_y] = calcSlopeIntercept(z_vals, y_vals, z_mean, y_mean);
-
-    // 计算chi2和ndf
-    double chi2 = 0.0;
-    for (size_t i = 0; i < z_vals.size(); ++i) {
-        double dx = x_vals[i] - (intercept_x + slope_x * z_vals[i]);
-        double dy = y_vals[i] - (intercept_y + slope_y * z_vals[i]);
-        chi2 += dx * dx + dy * dy;
-    }
-    int ndf = static_cast<int>(2 * z_vals.size() - 4);
-
-    // 5. 保存结果到event.track
-    event.track.slope_x = slope_x;
-    event.track.intercept_x = intercept_x;
-    event.track.slope_y = slope_y;
-    event.track.intercept_y = intercept_y;
-    event.track.chi2 = chi2 / ndf;
 
     return true;
 }
@@ -305,16 +272,16 @@ std::tuple<int, int, int> Pipeline::ElectronicMap(int boardID, int channelID) {
         rawDataIndex = 2;
     } else if (boardID == 6 || boardID == 7) {
         rawDataIndex = 3;
-    } else if (boardID == 12 || boardID == 13) {
+    } else if (boardID == 8 || boardID == 9) {
         rawDataIndex = 4;
-    } else if (boardID == 14 || boardID == 15) {
+    } else if (boardID == 10 || boardID == 11) {
         rawDataIndex = 5;
-    } else if (boardID == 9) {
+    } else if (boardID == 12 || boardID == 13) {
         rawDataIndex = 6;
     }
 
     int type = rawDataIndex % 2 == 0 ? 0 : 1;
-    int detID = int(rawDataIndex / 2);
+    int detID = int(rawDataIndex / 2) + 1;
     int stripID = channelID;
 
     return {detID, stripID, type};
