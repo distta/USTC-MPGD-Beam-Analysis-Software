@@ -1,7 +1,6 @@
 #pragma once
 
-#include "Algorithms/ClusterMatcher.h"
-#include "Algorithms/Clustering.h"
+#include "Clustering.h"
 #include "DataModel.h"
 
 class Detector {
@@ -21,19 +20,13 @@ class Detector {
     // ---------- 对齐接口 ----------
     void Alignment(double dx, double dy, double dz, double dRotX = 0, double dRotY = 0, double dRotZ = 0);
 
-    virtual LocalHit GlobalToLocal(const GlobalHit& globalHit) const = 0;
-
-    virtual GlobalHit LocalToGlobal(const LocalHit& localHit) const = 0;
+    virtual GlobalHit LocalToGlobal(const RecHit& recHit) const = 0;
 
     // ---------- 核心接口 ----------
-    RecCluster BuildClusters(const std::vector<RawData>& raws) {
-        return m_clusterBuilder->BuildCluster(raws);
-    };
-    std::vector<LocalHit> MatchCluster(const std::vector<RecCluster>& clusters) {
-        return m_clusterMatcher->MatchClusters(clusters);
-    };
-    std::vector<std::vector<RawData>> preClustering(const std::vector<RawData>& raws) {
-        return m_clusterBuilder->preClustering(raws);
+    std::vector<RecHit> Reconstruction(const std::vector<RawData>& raws) {
+        std::vector<RecHit> hits = m_clusterBuilder->Reconstruction(raws);
+        for (auto& hit : hits) hit.detID = m_id;
+        return hits;
     };
 
    protected:
@@ -46,5 +39,4 @@ class Detector {
     Role m_role;
 
     std::shared_ptr<Clustering> m_clusterBuilder;
-    std::shared_ptr<ClusterMatcher> m_clusterMatcher;
 };

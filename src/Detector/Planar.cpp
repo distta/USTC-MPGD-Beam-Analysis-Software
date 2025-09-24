@@ -1,4 +1,5 @@
 #include "Detector/Planar.h"
+#include "DataModel.h"
 #include "iostream"
 #include <cmath>
 #include <map>
@@ -21,28 +22,10 @@ Planar::Planar(int id, const std::string& name, const json& config) : Detector(i
 }
 
 
-LocalHit Planar::GlobalToLocal(const GlobalHit& globalHit) const {
-    // 假设旋转角度较小，使用简单的平移和旋转转换
-    LocalHit local;
-    double dx = globalHit.x - m_posX;
-    double dy = globalHit.y - m_posY;
-    double dz = globalHit.z - m_posZ;
-
-    // 这里可扩展为完整的旋转矩阵
-    local.u = dx * cos(m_rotZ) + dy * sin(m_rotZ);
-
-    // 如果是二维探测器
-    if (m_config.readoutPlaneAngle.size() > 1) {
-        local.v = dx * -sin(m_rotZ) + dy * cos(m_rotZ);
-    }
-
-    return local;
-}
-
-GlobalHit Planar::LocalToGlobal(const LocalHit& localHit) const {
+GlobalHit Planar::LocalToGlobal(const RecHit& recHit) const {
     GlobalHit global;
-    double u = localHit.u;
-    double v = localHit.v.value_or(0.0);
+    double u = recHit.cluster[0].pos;
+    double v = recHit.cluster[1].pos;
 
     // 简单旋转+平移
     global.x = m_posX + u * cos(m_rotZ) - v * sin(m_rotZ);

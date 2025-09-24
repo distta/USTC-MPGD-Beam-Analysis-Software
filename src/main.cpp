@@ -5,10 +5,10 @@
  */
 
 #include "Pipeline.h"
-#include <iostream>
-#include <string>
 #include <filesystem>
+#include <iostream>
 #include <sstream>
+#include <string>
 
 void printUsage(const char* programName) {
     std::cout << "用法: " << programName << " <run_number> [config_file]" << std::endl;
@@ -31,7 +31,7 @@ std::string formatDataFileName(const std::string& runNumber) {
 }
 
 std::string formatOutputDir(const std::string& runNumber) {
-  
+
     std::stringstream ss;
     ss << "result/" << runNumber;
     return ss.str();
@@ -45,48 +45,46 @@ int main(int argc, char* argv[]) {
             printUsage(argv[0]);
             return 1;
         }
-        
+
         std::string runNumber = argv[1];
         std::string configFile = "config/config.json";
 
         if (argc > 2) {
             configFile = argv[2];
         }
-        
+
         std::string dataFile = formatDataFileName(runNumber);
         std::string outputDir = formatOutputDir(runNumber);
-        
+        std::string cacheFile = outputDir + "/cache.root";
+        std::string outFile = outputDir + "/output.root";
+
         if (!std::filesystem::exists(dataFile)) {
             std::cerr << "错误: 数据文件不存在: " << dataFile << std::endl;
             std::cerr << "请确保 raw/ 目录下存在对应的数据文件" << std::endl;
             return 1;
         }
-        
+
         if (!std::filesystem::exists(configFile)) {
             std::cerr << "错误: 配置文件不存在: " << configFile << std::endl;
             return 1;
         }
-        
+
         std::cout << "BeamAnalysis 启动中..." << std::endl;
         std::cout << "配置文件: " << configFile << std::endl;
         std::cout << "数据文件: " << dataFile << std::endl;
         std::cout << "运行编号: " << runNumber << std::endl;
         std::cout << "输出目录: " << outputDir << std::endl;
-        
+
         // 创建输出目录
         std::filesystem::create_directories(outputDir);
         // 创建并运行分析管道
-        Pipeline pipeline;
-        pipeline.Initialize(configFile);
-        pipeline.SetRawDataFile(dataFile);  // 设置要处理的数据文件
-        pipeline.SetOutputDirectory(outputDir);  // 设置输出目录
-        pipeline.Run();
-        pipeline.Finalize();
-        
+        Pipeline pipeline(configFile);
+        pipeline.Run(dataFile, cacheFile, outFile);
+
         std::cout << "分析完成！" << std::endl;
         std::cout << "结果已保存到 " << outputDir << " 目录" << std::endl;
         return 0;
-        
+
     } catch (const std::exception& e) {
         std::cerr << "错误: " << e.what() << std::endl;
         return 1;

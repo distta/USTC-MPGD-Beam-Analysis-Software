@@ -1,9 +1,9 @@
 #pragma once
 
+#include "Rtypes.h"
 #include <map>
 #include <nlohmann/json.hpp>
 #include <optional>
-#include "Rtypes.h"
 #include <vector>
 
 using json = nlohmann::json;
@@ -46,12 +46,13 @@ struct RecCluster {
     double pos;   // cluster重建位置
 };
 
-struct LocalHit {
-    double u = 0.0;                          // 一维量 (始终存在)
-    std::optional<double> v = std::nullopt;  // 二维探测器时有效，1D 探测器为空
+struct RecHit {
+    int detID;
+    std::vector<RecCluster> cluster;
 };
 
 struct GlobalHit {
+    int detID;
     double x = 0.0;
     double y = 0.0;
     double z = 0.0;
@@ -77,7 +78,7 @@ struct Event {
     int eventID;
 
     std::map<int, std::vector<RecCluster>> recClusters;
-    std::map<int, std::vector<LocalHit>> recLocalHits;
+    std::map<int, std::vector<RecHit>> recLocalHits;
     std::map<int, std::vector<GlobalHit>> recGlobalHits;
     Track track;
 };

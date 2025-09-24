@@ -1,288 +1,246 @@
 #include "Pipeline.h"
 #include "DataModel.h"
-#include "Detector/Detector.h"
-#include "Detector/Planar.h"
-#include "TChain.h"
-#include "TFile.h"
-#include "TTree.h"
+
+#include <ROOT/RDataFrame.hxx>
+#include <ROOT/RVec.hxx>
+
+#include <TFile.h>
+#include <TTree.h>
+
+#include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
-#include <nlohmann/json.hpp>
-#include <ostream>
 
-using json = nlohmann::json;
+using namespace ROOT;
 using namespace std;
 
-Pipeline::~Pipeline() {
-}
-
-void Pipeline::Finalize() {
-    std::cout << "Pipeline finalization completed." << std::endl;
-    std::cout << "Total processed events: " << m_events.size() << std::endl;
-}
-
-void Pipeline::Initialize(const std::string& configFile) {
+Pipeline::Pipeline(const std::string& configFile)
+    : m_configFile(configFile) {
     std::ifstream in(configFile);
     if (!in.is_open()) {
-        throw std::runtime_error("Failed to open config file: " + configFile);
+        throw std::runtime_error("Pipeline: cannot open config file: " + configFile);
+    }
+    in >> m_config;
+    InitializeDetectors();
+}
+
+void Pipeline::InitializeDetectors() {
+    if (!m_config.contains("detectors") || !m_config["detectors"].is_array()) {
+        throw std::runtime_error("Pipeline: no detectors defined in config");
     }
 
-    json config;
-    try {
-        in >> config;
-    } catch (const json::exception& e) {
-        throw std::runtime_error("Failed to parse JSON config: " + std::string(e.what()));
-    }
-
-    if (!config.contains("detectors") || !config["detectors"].is_array() || config["detectors"].empty()) {
-        throw std::runtime_error("No valid detectors found in configuration");
-    }
-
-    const auto& detectors = config["detectors"];
-    for (const auto& detConfig : detectors) {
-
-        if (!detConfig.contains("id") || !detConfig.contains("name")) {
-            throw std::runtime_error("Detector missing required fields: id, name");
+    for (const auto& detCfg : m_config["detectors"]) {
+        if (!detCfg.contains("id") || !detCfg.contains("name")) {
+            throw std::runtime_error("Pipeline: detector missing id or name");
         }
-
-        const int detID = detConfig["id"].get<int>();
-        const std::string name = detConfig["name"].get<std::string>();
+        int detID = detCfg["id"].get<int>();
+        std::string name = detCfg["name"].get<std::string>();
+        std::string type = detCfg.value("type", "planar");
 
         if (m_dets.find(detID) != m_dets.end()) {
-            throw std::runtime_error("Duplicate detector ID: " + std::to_string(detID));
+            throw std::runtime_error("Pipeline: duplicate detector id " + std::to_string(detID));
         }
 
-        const std::string geometryType = detConfig.value("type", "planar");
-
-        std::shared_ptr<Detector> detector;
-        if (geometryType == "planar") {
-            detector = std::make_shared<Planar>(detID, name, detConfig);
+        // Only 'planar' implemented here (you have Planar class)
+        if (type == "planar") {
+            // Planar constructor signature: Planar(int id, const std::string& name, const json& cfg)
+            m_dets[detID] = std::make_shared<Planar>(detID, name, detCfg);
         } else {
-            throw std::runtime_error("Unsupported geometry type: " + geometryType);
+            throw std::runtime_error("Pipeline: unsupported detector type: " + type);
         }
-
-        AddDetector(detector);
     }
 }
 
-void Pipeline::SetRawDataFile(const std::string& dataFile) {
-    m_rawDataFileName = dataFile;
+constexpr std::array<int, 14> kBoardToRawIndex = {
+    0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6};
+// MapBoardChannel: adopt original mapping logic (board pairs -> index -> det/type)
+std::tuple<int, int, int> Pipeline::MapBoardChannel(unsigned int boardID, unsigned int channelID) const {
+
+    int rawDataIndex = (boardID < kBoardToRawIndex.size())
+                           ? kBoardToRawIndex[boardID]
+                           : static_cast<int>(boardID) / 2;
+
+    int type = (rawDataIndex % 2 == 0) ? 0 : 1;
+    int detID = (rawDataIndex / 2) + 1;
+    int stripID = static_cast<int>(channelID);
+    return {detID, stripID, type};
 }
 
-void Pipeline::SetOutputDirectory(const std::string& outputDir) {
-    m_outputDirectory = outputDir;
-    m_cacheFileName = m_outputDirectory + "/cache.root";
-}
+void Pipeline::Run(const std::string& rawFile, const std::string& cacheFile, const std::string& outFile) {
+    auto t0 = std::chrono::high_resolution_clock::now();
 
-void Pipeline::GenerateCache() {
+    // enable ROOT implicit MT (auto parallel)
+    // ROOT::EnableImplicitMT();
 
-    if (std::filesystem::exists(m_cacheFileName)) {
-        std::cout << "Cache file '" << m_cacheFileName << "' already exists. Overwrite? (y/n): ";
+    if (!std::filesystem::exists(cacheFile)) {
+        std::cout << "[Pipeline] Cache not found. Running Clustering stage to produce: " << cacheFile << std::endl;
+        RunClustering(rawFile, cacheFile);
+    } else {
+        std::cout << "Cache file '" << cacheFile << "' already exists. Overwrite? (y/n): ";
         char choice;
         std::cin >> choice;
         if (choice != 'y' && choice != 'Y') {
-            std::cout << "Using existing cache file.\n";
-            return;
+            std::cout << "[Pipeline] Cache exists: " << cacheFile << " -- skipping clustering stage." << std::endl;
+        } else {
+            RunClustering(rawFile, cacheFile);
         }
-        std::cout << "Overwriting existing cache file.\n";
     }
 
-    TFile outFile(m_cacheFileName.c_str(), "RECREATE");
-    if (outFile.IsZombie()) {
-        throw std::runtime_error("Failed to create cache ROOT file: " + m_cacheFileName);
-    }
+    // Light stage always runs (fast, used for parameter scans)
+    std::cout << "[Pipeline] Running light stage (matching, geometry, track fitting) ..." << std::endl;
+    RunTracking(cacheFile, outFile);
 
-    TTree cacheTree("cluster", "cluster");
-    RecCluster clusterBuffer;
-    cacheTree.Branch("eventID", &m_eventID, "eventID/I");
-    cacheTree.Branch("detID", &m_detID, "detID/I");
-    cacheTree.Branch("cluster", &clusterBuffer);
-
-    // 原始数据输入
-    TChain rawChain("raw");
-    if (rawChain.Add(m_rawDataFileName.c_str()) == 0) {
-        throw std::runtime_error("Failed to load raw data file: " + m_rawDataFileName);
-    }
-
-    unsigned int apv_evt_ = 0;
-    std::vector<unsigned int>* apv_id_ = nullptr;
-    std::vector<unsigned int>* apv_ch_ = nullptr;
-    std::vector<std::vector<short>>* apv_q_ = nullptr;
-
-    rawChain.SetBranchAddress("apv_evt", &apv_evt_);
-    rawChain.SetBranchAddress("apv_id", &apv_id_);
-    rawChain.SetBranchAddress("mm_strip", &apv_ch_);
-    rawChain.SetBranchAddress("apv_q", &apv_q_);
-
-    int totalEntries = rawChain.GetEntries();
-    std::map<int, std::vector<RawData>> rawDataBuffer;
-
-    std::cout << "[INFO]: Raw File contains entries: " << totalEntries << std::endl;
-
-    for (int i = 0; i < 10000; ++i) {
-
-        if ((i % 1000 == 0) || i == totalEntries - 1) {
-            std::cout << "\r"
-                      << "[INFO]: Processed " << (i + 1) << "/" << totalEntries << std::flush;
-        }
-
-        rawChain.GetEntry(i);
-        m_eventID = apv_evt_;
-
-        for (size_t j = 0; j < apv_id_->size(); ++j) {
-            auto [detID, stripID, type] = ElectronicMap((*apv_id_)[j], (*apv_ch_)[j]);
-            rawDataBuffer[detID].push_back({stripID, type, (*apv_q_)[j]});
-        }
-
-        // 获取预聚类结果进行有效性判断
-        std::map<int, std::vector<std::vector<RawData>>> preCluster;
-        for (auto& [detID, raws] : rawDataBuffer) {
-            if (m_dets.find(detID) == m_dets.end()) continue;
-            preCluster[detID] = m_dets[detID]->preClustering(raws);
-        }
-
-        if (!EventFilter(preCluster)) {
-            rawDataBuffer.clear();
-            continue;
-        }
-
-        for (auto& [detID, clusters] : preCluster) {
-            if (m_dets.find(detID) == m_dets.end()) continue;
-            for (auto& cluster : clusters) {
-                clusterBuffer = m_dets[detID]->BuildClusters(cluster);
-                m_detID = detID;
-                if (clusterBuffer.strips.size() > 0)
-                    cacheTree.Fill();
-            }
-        }
-
-        rawDataBuffer.clear();
-    }
-    std::cout << std::endl;
-    cacheTree.Write();
-    outFile.Close();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double sec = std::chrono::duration<double>(t1 - t0).count();
+    std::cout << "[Pipeline] Done. Total time: " << sec << " s\n";
 }
 
-void Pipeline::Run() {
-
+void Pipeline::RunClustering(const std::string& rawFile, const std::string& cacheFile) {
     auto start = std::chrono::high_resolution_clock::now();
+    ROOT::RDataFrame df("raw", rawFile);
 
-    GenerateCache();
-
-    auto end = std::chrono::high_resolution_clock::now();
-
-    std::chrono::duration<double> duration = end - start;
-
-    std::cout << "[INFO]: Generate Cache File execution time: "
-              << duration.count() << " seconds" << std::endl;
-
-    TFile* m_cacheFile = TFile::Open(m_cacheFileName.c_str(), "READ");
-    if (!m_cacheFile || m_cacheFile->IsZombie()) {
-        throw std::runtime_error("Failed to open cache file: " + m_cacheFileName);
-    }
-
-    TTree* m_cacheTree = (TTree*)m_cacheFile->Get("cluster");
-    if (!m_cacheTree) {
-        throw std::runtime_error("Cache file does not contain cluster tree!");
-    }
-
-    m_cacheTree->SetBranchAddress("eventID", &m_eventID);
-    m_cacheTree->SetBranchAddress("detID", &m_detID);
-    m_cacheTree->SetBranchAddress("cluster", &m_clusterBuffer);
-
-    const int nEntries = m_cacheTree->GetEntries();
-    if (nEntries == 0) {
-        std::cerr << "[Warning]: No entries found in cache" << std::endl;
-        return;
-    }
-
-    int currentEventID = -1;
-    Event event;
-
-    for (int i = 0; i < nEntries; ++i) {
-        m_cacheTree->GetEntry(i);
-
-        if (m_eventID != currentEventID) {
-            if (currentEventID != -1) {
-                event.eventID = currentEventID;
-
-                CreateGlobalHits(event);
-                m_events.push_back(event);
+    // --------------------------
+    // Step 1: 构建 RawData
+   auto df_result = df.Define("ClusterData", 
+        [this](const std::vector<unsigned int>& apv_id, 
+               const std::vector<unsigned int>& apv_ch, 
+               std::vector<std::vector<short>>& apv_q,
+               unsigned int apv_evt) {
+            
+            // 构建RawData
+            std::unordered_map<int, std::vector<RawData>> rawHits;
+            for (size_t i = 0; i < apv_id.size(); ++i) {
+                auto [detID, stripID, type] = MapBoardChannel(apv_id[i], apv_ch[i]);
+                if (m_dets.find(detID) != m_dets.end()) {
+                    rawHits[detID].emplace_back(RawData{stripID, type, apv_q[i]});
+                }
             }
-
-            event = Event();
-            currentEventID = m_eventID;
-        }
-
-        event.recClusters[m_detID].push_back(*m_clusterBuffer);
-    }
-
-    std::cout << "Total valid events after filtering: " << m_events.size() << " / " << nEntries << std::endl;
+            
+             
+            int eventID=apv_evt;
+            std::vector<int> detIDs;  
+            std::vector<RecCluster> clusters;
+            
+            for (auto& [dID, raws] : rawHits) {
+                auto recHits = m_dets[dID]->Reconstruction(raws);
+                
+                for (const auto& hit : recHits) {
+                    for (const auto& cluster : hit.cluster) {
+                        detIDs.push_back(dID);
+                        clusters.push_back(cluster);
+                    }
+                }
+            }
+            
+            return std::make_tuple(eventID, detIDs, clusters);
+        },
+        {"apv_id", "apv_ch", "apv_q", "apv_evt"})
+        
+        .Define("eventID", [](const std::tuple<int, std::vector<int>, std::vector<RecCluster>>& data) {
+            return std::get<0>(data);
+        }, {"ClusterData"})
+        .Define("detID", [](const std::tuple<int, std::vector<int>, std::vector<RecCluster>>& data) {
+            return std::get<1>(data);
+        }, {"ClusterData"}) 
+        .Define("cluster", [](const std::tuple<int, std::vector<int>, std::vector<RecCluster>>& data) {
+            return std::get<2>(data);
+        }, {"ClusterData"});
+    
+    std::cout << "[Pipeline] Writing cache to " << cacheFile << " ..." << std::endl;
+    
+    df_result.Range(10000).Snapshot("clusters", cacheFile, {"eventID", "detID", "cluster"});
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    
+    std::cout << "[Pipeline] Cache written successfully. Cost Time: " 
+              << duration.count() << " s" << std::endl;
 }
 
-bool Pipeline::EventFilter(const std::map<int, std::vector<std::vector<RawData>>>& preCluster) {
-    // 对每个探测器进行检查
-    for (auto& [detID, clusters] : preCluster) {
-        if (m_dets[detID]->isDUT()) continue;
+void Pipeline::RunTracking(const std::string& cacheFile, const std::string& outFile) {
+}
 
-        std::map<int, int> typeClusterCount;
+Track Pipeline::FitTrack(const std::map<int, std::vector<GlobalHit>>& globalHits) const {
+    Track t;
+    std::vector<double> zs, xs, ys;
+    // collect first hit per detector (if exist). You may change to use centroid or best hit.
+    for (const auto& [detID, vec] : globalHits) {
+        if (vec.empty()) continue;
+        zs.push_back(vec.front().z);
+        xs.push_back(vec.front().x);
+        ys.push_back(vec.front().y);
+    }
 
-        for (const auto& cluster : clusters) {
-            if (cluster.empty()) continue;
+    const size_t n = zs.size();
+    if (n < 2) {
+        t.slope_x = t.slope_y = 0.0;
+        t.intercept_x = t.intercept_y = 0.0;
+        t.chi2 = 1e9;
+        return t;
+    }
 
-            int type = cluster[0].type;
-            typeClusterCount[type]++;
+    // Fit x(z)
+    double sum_z = 0, sum_z2 = 0, sum_x = 0, sum_zx = 0;
+    for (size_t i = 0; i < n; ++i) {
+        sum_z += zs[i];
+        sum_z2 += zs[i] * zs[i];
+        sum_x += xs[i];
+        sum_zx += zs[i] * xs[i];
+    }
+    double denom = n * sum_z2 - sum_z * sum_z;
+    if (std::abs(denom) < 1e-12) {
+        t.slope_x = 0;
+        t.intercept_x = sum_x / n;
+    } else {
+        t.slope_x = (n * sum_zx - sum_z * sum_x) / denom;
+        t.intercept_x = (sum_x - t.slope_x * sum_z) / n;
+    }
+
+    // Fit y(z)
+    double sum_y = 0, sum_zy = 0;
+    for (size_t i = 0; i < n; ++i) {
+        sum_y += ys[i];
+        sum_zy += zs[i] * ys[i];
+    }
+    if (std::abs(denom) < 1e-12) {
+        t.slope_y = 0;
+        t.intercept_y = sum_y / n;
+    } else {
+        t.slope_y = (n * sum_zy - sum_z * sum_y) / denom;
+        t.intercept_y = (sum_y - t.slope_y * sum_z) / n;
+    }
+
+    // Compute chi2 as sum of squared residuals
+    double chi2 = 0;
+    for (size_t i = 0; i < n; ++i) {
+        double dx = xs[i] - (t.intercept_x + t.slope_x * zs[i]);
+        double dy = ys[i] - (t.intercept_y + t.slope_y * zs[i]);
+        chi2 += dx * dx + dy * dy;
+    }
+    t.chi2 = chi2 / std::max(1.0, static_cast<double>(n - 2));
+    return t;
+}
+
+bool Pipeline::EventFilter(const std::vector<RecHit>& recHits) {
+
+    std::map<int, int> detectorHitCount;
+    for (const auto& hit : recHits) {
+        detectorHitCount[hit.detID]++;
+    }
+
+    for (const auto& pair : detectorHitCount) {
+        auto it = m_dets.find(pair.first);
+        if (it == m_dets.end()) {
+            std::cerr << "[Error] Unknown detID=" << pair.first << std::endl;
+            return false;
         }
-
-        for (const auto& [type, count] : typeClusterCount) {
-            if (count != 1) {
-                return false;
-            }
-        }
-
-        if (typeClusterCount.size() < 2) {
+        if (it->second->isDUT()) continue;
+        if (pair.second != 1) {
             return false;
         }
     }
 
     return true;
-}
-
-void Pipeline::CreateGlobalHits(Event& event) {
-    for (auto& [detID, recClusters] : event.recClusters) {
-        event.recLocalHits[detID] = m_dets[detID]->MatchCluster(recClusters);
-
-        if (m_dets[detID]->isDUT()) continue;
-        for (auto& hit : event.recLocalHits[detID]) {
-            event.recGlobalHits[detID].push_back(m_dets[detID]->LocalToGlobal(hit));
-        }
-    }
-}
-
-std::tuple<int, int, int> Pipeline::ElectronicMap(int boardID, int channelID) {
-    int rawDataIndex = -1;
-
-    if (boardID == 0 || boardID == 1) {
-        rawDataIndex = 0;
-    } else if (boardID == 2 || boardID == 3) {
-        rawDataIndex = 1;
-    } else if (boardID == 4 || boardID == 5) {
-        rawDataIndex = 2;
-    } else if (boardID == 6 || boardID == 7) {
-        rawDataIndex = 3;
-    } else if (boardID == 8 || boardID == 9) {
-        rawDataIndex = 4;
-    } else if (boardID == 10 || boardID == 11) {
-        rawDataIndex = 5;
-    } else if (boardID == 12 || boardID == 13) {
-        rawDataIndex = 6;
-    }
-
-    int type = rawDataIndex % 2 == 0 ? 0 : 1;
-    int detID = int(rawDataIndex / 2) + 1;
-    int stripID = channelID;
-
-    return {detID, stripID, type};
 }

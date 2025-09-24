@@ -18,8 +18,7 @@ set(SOURCES
     src/Pipeline.cpp
     src/Detector/Detector.cpp
     src/Detector/Planar.cpp
-    src/Algorithms/Clustering.cpp
-    src/Algorithms/ClusterMatcher.cpp
+    src/Clustering.cpp
 )
 
 add_executable(BeamAnalysis ${SOURCES})

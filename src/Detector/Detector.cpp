@@ -1,6 +1,5 @@
 #include "Detector/Detector.h"
-#include "Algorithms/ClusterMatcher.h"
-#include "Algorithms/Clustering.h"
+#include "Clustering.h"
 
 Detector::Detector(int id, const std::string& name, const nlohmann::json& config) : m_id(id), m_name(name) {
     // 设置探测器角色
@@ -34,13 +33,6 @@ Detector::Detector(int id, const std::string& name, const nlohmann::json& config
         m_clusterBuilder = std::make_shared<Clustering>(config["clusterBuilder"]);
     } else {
         m_clusterBuilder = std::make_shared<Clustering>(nlohmann::json{});
-    }
-
-    // HitCreator
-    if (config.contains("hitCreator")) {
-        m_clusterMatcher = std::make_shared<ClusterMatcher>(config["clusterMatcher"]);
-    } else {
-        m_clusterMatcher = std::make_shared<ClusterMatcher>(nlohmann::json{});
     }
 }
 

@@ -1,42 +1,52 @@
+
+
 #pragma once
 
-#include "DataModel.h"
-#include "Detector/Detector.h"
-#include <TChain.h>
 #include <map>
 #include <memory>
 #include <string>
 
+#include "DataModel.h"
+#include "Detector/Detector.h"
+#include "Detector/Planar.h"
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+
 class Pipeline {
    public:
-    Pipeline() = default;
-    ~Pipeline();
+    explicit Pipeline(const std::string& configFile);
+    ~Pipeline() = default;
 
-    void Initialize(const std::string& configFile);
-    void SetRawDataFile(const std::string& dataFile);
-    void SetOutputDirectory(const std::string& outputDir);
-    void Run();
-    void Finalize();
-
-   private:
-    void AddDetector(std::shared_ptr<Detector> det) {
-        m_dets[det->GetID()] = det;
-    }
-    std::tuple<int, int, int> ElectronicMap(int boardID, int channelID);
-    bool EventFilter(const std::map<int, std::vector<std::vector<RawData>>>& preCluster);
-
-    void GenerateCache();
-    void CreateGlobalHits(Event& event);
+    /**
+     * Run 完整流程
+     *  rawFile   : 输入的原始 ROOT 文件（含 raw tree）
+     *  cacheFile : heavy 阶段缓存文件路径（若存在则跳过 heavy 阶段）
+     *  outFile   : 最终输出文件（包含 Local/Global/Track）
+     */
+    void Run(const std::string& rawFile, const std::string& cacheFile, const std::string& outFile);
 
    private:
-    std::string m_cacheFileName;
+    void InitializeDetectors();
+
+    void RunClustering(const std::string& rawFile, const std::string& cacheFile);
+
+    void RunTracking(const std::string& cacheFile, const std::string& outFile);
+
+    // 把硬件 (boardID, channelID) 映射到 (detID, stripID, type)
+    std::tuple<int, int, int> MapBoardChannel(unsigned int boardID, unsigned int channelID) const;
+
+    bool EventFilter(const std::vector<RecHit>&);
+
+    // 简单轨迹拟合（直线拟合 x(z), y(z)）
+    Track FitTrack(const std::map<int, std::vector<GlobalHit>>& globalHits) const;
+
+   private:
+    std::string m_configFile;
     std::string m_rawDataFileName;
-    std::string m_outputDirectory;
 
-    int m_eventID;
-    int m_detID;
-    RecCluster* m_clusterBuffer;
+    json m_config;
 
+    // detID -> shared_ptr<Detector>
     std::map<int, std::shared_ptr<Detector>> m_dets;
-    std::vector<Event> m_events;
 };
