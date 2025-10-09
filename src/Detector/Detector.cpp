@@ -37,10 +37,16 @@ Detector::Detector(int id, const std::string& name, const nlohmann::json& config
 }
 
 void Detector::Alignment(double dx, double dy, double dz, double dRotX, double dRotY, double dRotZ) {
-    m_posX += dx;
-    m_posY += dy;
-    m_posZ += dz;
-    m_rotX += dRotX;
-    m_rotY += dRotY;
-    m_rotZ += dRotZ;
+    m_posX = dx;
+    m_posY = dy;
+    m_posZ = dz;
+    m_rotX = dRotX;
+    m_rotY = dRotY;
+    m_rotZ = dRotZ;
+}
+
+void Detector::Alignment(double dx, double dy, double dRotZ) {
+    m_posX = dx;
+    m_posY = dy;
+    m_rotZ = dRotZ;
 }

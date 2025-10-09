@@ -38,58 +38,50 @@ std::string formatOutputDir(const std::string& runNumber) {
 }
 
 int main(int argc, char* argv[]) {
-    try {
 
-        if (argc < 2) {
-            std::cerr << "错误: 缺少必要参数" << std::endl;
-            printUsage(argv[0]);
-            return 1;
-        }
-
-        std::string runNumber = argv[1];
-        std::string configFile = "config/config.json";
-
-        if (argc > 2) {
-            configFile = argv[2];
-        }
-
-        std::string dataFile = formatDataFileName(runNumber);
-        std::string outputDir = formatOutputDir(runNumber);
-        std::string cacheFile = outputDir + "/cache.root";
-        std::string outFile = outputDir + "/output.root";
-
-        if (!std::filesystem::exists(dataFile)) {
-            std::cerr << "错误: 数据文件不存在: " << dataFile << std::endl;
-            std::cerr << "请确保 raw/ 目录下存在对应的数据文件" << std::endl;
-            return 1;
-        }
-
-        if (!std::filesystem::exists(configFile)) {
-            std::cerr << "错误: 配置文件不存在: " << configFile << std::endl;
-            return 1;
-        }
-
-        std::cout << "BeamAnalysis 启动中..." << std::endl;
-        std::cout << "配置文件: " << configFile << std::endl;
-        std::cout << "数据文件: " << dataFile << std::endl;
-        std::cout << "运行编号: " << runNumber << std::endl;
-        std::cout << "输出目录: " << outputDir << std::endl;
-
-        // 创建输出目录
-        std::filesystem::create_directories(outputDir);
-        // 创建并运行分析管道
-        Pipeline pipeline(configFile);
-        pipeline.Run(dataFile, cacheFile, outFile);
-
-        std::cout << "分析完成！" << std::endl;
-        std::cout << "结果已保存到 " << outputDir << " 目录" << std::endl;
-        return 0;
-
-    } catch (const std::exception& e) {
-        std::cerr << "错误: " << e.what() << std::endl;
-        return 1;
-    } catch (...) {
-        std::cerr << "未知错误发生" << std::endl;
+    if (argc < 2) {
+        std::cerr << "错误: 缺少必要参数" << std::endl;
+        printUsage(argv[0]);
         return 1;
     }
+
+    std::string runNumber = argv[1];
+    std::string configFile = "config/config.json";
+
+    if (argc > 2) {
+        configFile = argv[2];
+    }
+
+    std::string dataFile = formatDataFileName(runNumber);
+    std::string outputDir = formatOutputDir(runNumber);
+    std::string cacheFile = outputDir + "/cache.root";
+    std::string outFile = outputDir + "/output.root";
+
+    if (!std::filesystem::exists(dataFile)) {
+        std::cerr << "错误: 数据文件不存在: " << dataFile << std::endl;
+        std::cerr << "请确保 raw/ 目录下存在对应的数据文件" << std::endl;
+        return 1;
+    }
+
+    if (!std::filesystem::exists(configFile)) {
+        std::cerr << "错误: 配置文件不存在: " << configFile << std::endl;
+        return 1;
+    }
+
+    std::cout << "BeamAnalysis 启动中..." << std::endl;
+    std::cout << "配置文件: " << configFile << std::endl;
+    std::cout << "数据文件: " << dataFile << std::endl;
+    std::cout << "运行编号: " << runNumber << std::endl;
+    std::cout << "输出目录: " << outputDir << std::endl;
+
+    // 创建输出目录
+    std::filesystem::create_directories(outputDir);
+    // 创建并运行分析管道
+    Pipeline pipeline(configFile);
+    pipeline.Initialize();
+    pipeline.Run(dataFile, cacheFile, outFile);
+
+    std::cout << "分析完成！" << std::endl;
+    std::cout << "结果已保存到 " << outputDir << " 目录" << std::endl;
+    return 0;
 }

@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 
+#include <TFile.h>
+
 #include "DataModel.h"
 #include "Detector/Detector.h"
 #include "Detector/Planar.h"
@@ -15,31 +17,36 @@ using json = nlohmann::json;
 
 class Pipeline {
    public:
-    explicit Pipeline(const std::string& configFile);
+    explicit Pipeline(const std::string& configFile) : m_configFile(configFile) {
+    }
     ~Pipeline() = default;
 
-    /**
-     * Run 完整流程
-     *  rawFile   : 输入的原始 ROOT 文件（含 raw tree）
-     *  cacheFile : heavy 阶段缓存文件路径（若存在则跳过 heavy 阶段）
-     *  outFile   : 最终输出文件（包含 Local/Global/Track）
-     */
+    void Initialize();
+
     void Run(const std::string& rawFile, const std::string& cacheFile, const std::string& outFile);
 
    private:
-    void InitializeDetectors();
-
     void RunClustering(const std::string& rawFile, const std::string& cacheFile);
 
-    void RunTracking(const std::string& cacheFile, const std::string& outFile);
+    void RunAnalysis(const std::string& cacheFile, const std::string& outFile);
 
+    void RunTrackAnalysis(TFile* outFile);
+
+    void RunDUTAnalysis(TFile* outFile);
+
+   private:
     // 把硬件 (boardID, channelID) 映射到 (detID, stripID, type)
     std::tuple<int, int, int> MapBoardChannel(unsigned int boardID, unsigned int channelID) const;
 
-    bool EventFilter(const std::vector<RecHit>&);
+    bool EventFilter(const std::unordered_map<int, std::vector<RecHit>>&);
 
-    // 简单轨迹拟合（直线拟合 x(z), y(z)）
-    Track FitTrack(const std::map<int, std::vector<GlobalHit>>& globalHits) const;
+    Track FitTrack(const std::vector<GlobalHit>& globalHits) const;
+
+    // Compute track chi2
+    double TrackChi2(const double* par);
+
+    // profile-likelihood
+    double ProfileNLL(const double* par);
 
    private:
     std::string m_configFile;
@@ -49,4 +56,6 @@ class Pipeline {
 
     // detID -> shared_ptr<Detector>
     std::map<int, std::shared_ptr<Detector>> m_dets;
+    std::vector<int> m_trackerIDs;
+    std::vector<Event> m_events;
 };

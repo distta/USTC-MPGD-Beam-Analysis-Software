@@ -67,3 +67,9 @@ struct planarConfig {
     std::map<int, double> readoutPlaneAngle = {{0, 0}, {1, 90}};
     std::map<int, double> readoutPlanePitch = {{0, 0.4}, {1, 0.4}};
 };
+
+struct cylinderConfig {
+    double radius = 65;
+    std::map<int, double> readoutPlaneAngle = {{0, 0}};
+    std::map<int, double> readoutPlanePitch = {{0, 0.4}};
+};

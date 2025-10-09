@@ -19,35 +19,34 @@ struct StripHit {
     int type;     // 读出条类型 (X, Y, U/V…)
 
     // ---- 提取的关键量 ----
-    double amplitude;  // 峰值 - baseline
-    double charge;     // 积分电荷
-    int peakTime;      // 峰值时间 (采样点索引)
-    double time;       // 信号时间 (前沿拟合+CFD)
-    double riseTime;   // 上升时间 (10%-90%)
+    double amp;       // 峰值 - baseline
+    double charge;    // 积分电荷
+    int peakTime;     // 峰值时间 (采样点索引)
+    double time;      // 信号时间 (前沿拟合+CFD)
+    double riseTime;  // 上升时间 (10%-90%)
 
     // ---- 误差信息 ----
     double timeError;  // 时间误差
 
     // ---- 标志位 ----
     bool isSaturated;  // 是否饱和
-    bool isValid;      // 波形是否有效 (fit失败/噪声事件标记)
 };
 
 struct RecCluster {
-    int type;                      // 属于X/Y/U/V 哪个方向
+    int type;  // 属于X/Y/U/V 哪个方向
+    int matchID;
     std::vector<StripHit> strips;  // 参与聚类的条
 
     // ---- 聚类整体量 ----
     int size;       // 聚类条数
     int range;      // 聚类范围 (最大ID - 最小ID)
     double charge;  // 聚类总电荷
-    double maxAmplitude;
+    double maxAmp;
     double time;  // 聚类时间 (最早)
     double pos;   // cluster重建位置
 };
 
 struct RecHit {
-    int detID;
     std::vector<RecCluster> cluster;
 };
 
@@ -60,7 +59,6 @@ struct GlobalHit {
 
 // 径迹数据结构
 struct Track {
-
     double slope_x;      // x方向斜率
     double slope_y;      // y方向斜率
     double intercept_x;  // x截距
@@ -76,9 +74,6 @@ struct Track {
 
 struct Event {
     int eventID;
-
-    std::map<int, std::vector<RecCluster>> recClusters;
     std::map<int, std::vector<RecHit>> recLocalHits;
-    std::map<int, std::vector<GlobalHit>> recGlobalHits;
     Track track;
 };

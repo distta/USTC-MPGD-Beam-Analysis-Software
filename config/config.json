@@ -5,8 +5,8 @@
       "name": "Tracker1",
       "role": "Tracker",
       "type": "planar",
-      "position": [ 0.0, 0.0, 100.0 ],
-      "rotation": [ 0.0, 0.0, 0.0 ],
+      "position": [ -0.04758, 0.36150, 100.00000 ],
+      "rotation": [ 0.0, 0.0, -0.00673],
       "readoutPlanes": {
         "0": { "angle": 0.0, "pitch": 0.4 },
         "1": { "angle": 90.0, "pitch": 0.4 }
@@ -18,8 +18,8 @@
       "name": "Tracker2",
       "role": "Tracker",
       "type": "planar",
-      "position": [ 0.0, 0.0, 100.0 ],
-      "rotation": [ 0.0, 0.0, 0.0 ],
+      "position":[0.04404,-0.33326,143.00000],
+      "rotation":[0.00000,0.00000,0.00512],
       "readoutPlanes": {
         "0": { "angle": 0.0, "pitch": 0.4 },
         "1": { "angle": 90.0, "pitch": 0.4 }
@@ -31,8 +31,8 @@
       "name": "Tracker3",
       "role": "Tracker",
       "type": "planar",
-      "position": [ 0.0, 0.0, 100.0 ],
-      "rotation": [ 0.0, 0.0, 0.0 ],
+      "position":[-0.50732,3.35250,663.00000],
+      "rotation":[0.00000,0.00000,0.11391],
       "readoutPlanes": {
         "0": { "angle": 0.0, "pitch": 0.4 },
         "1": { "angle": 90.0, "pitch": 0.4 }
@@ -42,8 +42,8 @@
       "id": 4,
       "name": "CylinderURGroove",
       "role": "DUT",
-      "type": "planar",
-      "position": [ 0.0, 0.0, 100.0 ],
+      "type": "Cylinder",
+      "position": [ 0.0, 0.0, 443],
       "rotation": [ 0.0, 0.0, 0.0 ],
       "readoutPlanes": {
         "0": { "angle": 0.0, "pitch": 0.4 }

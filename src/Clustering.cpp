@@ -29,8 +29,8 @@ std::vector<RecCluster> Clustering::BuildClusters(const std::vector<RawData>& ra
                 StripHit stripData;
                 stripData.stripID = raw.stripID;
                 stripData.type = raw.type;
-                processWaveform(raw, stripData);
-                if (stripData.isValid)
+
+                if (processWaveform(raw, stripData))
                     cluster.strips.push_back(std::move(stripData));
             }
 
@@ -53,8 +53,8 @@ std::vector<RecCluster> Clustering::BuildClusters(const std::vector<RawData>& ra
             StripHit stripData;
             stripData.stripID = raw.stripID;
             stripData.type = raw.type;
-            processWaveform(raw, stripData);
-            if (stripData.isValid)
+
+            if (processWaveform(raw, stripData))
                 cluster.strips.push_back(std::move(stripData));
         }
 
@@ -66,14 +66,13 @@ std::vector<RecCluster> Clustering::BuildClusters(const std::vector<RawData>& ra
     return clusters;
 }
 
-void Clustering::processWaveform(const RawData& rawData, StripHit& stripData) {
+bool Clustering::processWaveform(const RawData& rawData, StripHit& stripData) {
     const auto& waveform = rawData.adc;
     const size_t nSamples = waveform.size();
 
     // 空波形直接返回
     if (nSamples == 0) {
-        stripData.isValid = false;
-        return;
+        return false;
     }
 
     // 1. 找峰值 + 计算电荷 + 找阈值上下限
@@ -133,8 +132,7 @@ void Clustering::processWaveform(const RawData& rawData, StripHit& stripData) {
     double minSmooth = *std::min_element(smooth.begin(), smooth.end());
     double maxSmooth = *std::max_element(smooth.begin(), smooth.end());
     if (targetY < minSmooth || targetY > maxSmooth) {
-        stripData.isValid = false;
-        return;
+        return false;
     }
 
     // --- 4) 从前向后找首次穿越点（在峰前） ---
@@ -146,18 +144,9 @@ void Clustering::processWaveform(const RawData& rawData, StripHit& stripData) {
             break;
         }
     }
+
     if (crossingIdx == -1) {
-        // 没找到，尝试从峰后向前找（安全降级）
-        for (int i = peakIdx + 1; i < static_cast<int>(nSamples); ++i) {
-            if (smooth[i] >= targetY && smooth[i - 1] < targetY) {
-                crossingIdx = i;
-                break;
-            }
-        }
-    }
-    if (crossingIdx == -1) {
-        stripData.isValid = false;
-        return;
+        return false;
     }
 
     // --- 5) 线性插值得到更精确时间 ---
@@ -204,14 +193,15 @@ void Clustering::processWaveform(const RawData& rawData, StripHit& stripData) {
         timeErrorSamples = std::abs(sigmaY / slope);
     }
 
-    stripData.amplitude = peakAmpD - baseline;
-    stripData.charge = inducedCharge;  // 仍然可用先前计算的 inducedCharge
+    stripData.amp = peakAmpD - baseline;
+    stripData.charge = inducedCharge;  
     stripData.peakTime = peakIdx;
-    stripData.time = fitTimeSamples * m_waveformConfig.timePitch;  // 转为真实时间单位
+    stripData.time = fitTimeSamples * m_waveformConfig.timePitch;  
     stripData.riseTime = riseTimeSamples * m_waveformConfig.timePitch;
     stripData.timeError = timeErrorSamples * m_waveformConfig.timePitch;
     stripData.isSaturated = (peakAmpD > m_waveformConfig.saturationLevel);
-    stripData.isValid = true;
+
+    return true;
 }
 
 bool Clustering::processCluster(RecCluster& cluster) {
@@ -224,13 +214,13 @@ bool Clustering::processCluster(RecCluster& cluster) {
 
     // 一次遍历计算所有属性
     cluster.charge = 0.0;
-    cluster.maxAmplitude = 0.0;
+    cluster.maxAmp = 0.0;
     cluster.time = std::numeric_limits<double>::max();
     cluster.range = cluster.strips.back().stripID - cluster.strips.front().stripID + 1;
 
     for (const auto& strip : cluster.strips) {
         cluster.charge += strip.charge;
-        cluster.maxAmplitude = std::max(cluster.maxAmplitude, strip.amplitude);
+        cluster.maxAmp = std::max(cluster.maxAmp, strip.amp);
         cluster.time = std::min(cluster.time, strip.time);
     }
 
@@ -250,15 +240,41 @@ bool Clustering::processCluster(RecCluster& cluster) {
     return true;
 }
 
-void Clustering::MatchClusters(std::vector<RecCluster>& clustersU, std::vector<RecCluster>& clustersV, std::vector<RecHit>& recHits) {
+void Clustering::MatchClusters(std::map<int, std::vector<RecCluster>>& clustersByType, std::vector<RecHit>& recHits) {
 
-    for (auto& u : clustersU) {
-        for (auto& v : clustersV) {
-
+    int matchID = 0;
+    if (clustersByType.size() == 1) {
+        // --- 1D 探测器，直接输出每个 cluster 为一个 RecHit ---
+        auto& clusters = clustersByType.begin()->second;
+        for (auto& cluster : clusters) {
             RecHit hit;
-            hit.cluster.push_back(u);
-            hit.cluster.push_back(v);
+            cluster.matchID = matchID;
+            hit.cluster.push_back(cluster);
             recHits.push_back(std::move(hit));
+            matchID++;
+        }
+    } else {
+        // --- 2D 探测器，需要进行匹配，例如 U-V 匹配 ---
+        // 假设只有两种类型：U / V
+        auto it = clustersByType.begin();
+        auto& clustersU = it->second;
+        ++it;
+        auto& clustersV = it->second;
+
+        for (auto& u : clustersU) {
+            for (auto& v : clustersV) {
+
+                RecHit hit;
+                // if (std::fabs(u.charge - v.charge) > 300) {
+                //     continue;
+                // }
+                u.matchID = matchID;
+                v.matchID = matchID;
+                hit.cluster.push_back(u);
+                hit.cluster.push_back(v);
+                ++matchID;
+                recHits.push_back(std::move(hit));
+            }
         }
     }
 }
@@ -323,24 +339,7 @@ std::vector<RecHit> Clustering::Reconstruction(const std::vector<RawData>& raws)
     // -----------------------------
     if (clustersByType.empty()) return recHits;
 
-    if (clustersByType.size() == 1) {
-        // --- 1D 探测器，直接输出每个 cluster 为一个 RecHit ---
-        const auto& clusters = clustersByType.begin()->second;
-        for (const auto& cluster : clusters) {
-            RecHit hit;
-            hit.cluster.push_back(cluster);
-            recHits.push_back(std::move(hit));
-        }
-    } else {
-        // --- 2D 探测器，需要进行匹配，例如 U-V 匹配 ---
-        // 假设只有两种类型：U / V
-        auto it = clustersByType.begin();
-        auto& clustersU = it->second;
-        ++it;
-        auto& clustersV = it->second;
-
-        MatchClusters(clustersU, clustersV, recHits);
-    }
+    MatchClusters(clustersByType, recHits);
 
     return recHits;
 }

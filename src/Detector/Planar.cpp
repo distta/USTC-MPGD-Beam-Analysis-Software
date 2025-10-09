@@ -21,11 +21,11 @@ Planar::Planar(int id, const std::string& name, const json& config) : Detector(i
     }
 }
 
-
 GlobalHit Planar::LocalToGlobal(const RecHit& recHit) const {
     GlobalHit global;
-    double u = recHit.cluster[0].pos;
-    double v = recHit.cluster[1].pos;
+    global.detID = GetID();
+    double u = recHit.cluster[0].pos * m_config.readoutPlanePitch.at(0);
+    double v = recHit.cluster[1].pos * m_config.readoutPlanePitch.at(1);
 
     // 简单旋转+平移
     global.x = m_posX + u * cos(m_rotZ) - v * sin(m_rotZ);

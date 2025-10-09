@@ -7,6 +7,8 @@ set -e
 
 echo "=== BeamAnalysis 项目构建 ==="
 
+# source /home/qxhuang/software/root-6.36.04/build/bin/thisroot.sh
+
 # 检查ROOT环境
 if ! command -v root-config &> /dev/null; then
     echo "错误: 未找到ROOT框架，请检查ROOT环境配置"

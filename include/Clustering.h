@@ -21,9 +21,9 @@ class Clustering {
     /**
      * @brief 处理波形数据
      */
-    void processWaveform(const RawData& rawData, StripHit& stripData);
+    bool processWaveform(const RawData& rawData, StripHit& stripData);
 
-    void MatchClusters(std::vector<RecCluster>& clustersU, std::vector<RecCluster>& clustersV, std::vector<RecHit>& recHits);
+    void MatchClusters(std::map<int, std::vector<RecCluster>>&, std::vector<RecHit>& recHits);
 
     /**
      * @brief 处理聚类
