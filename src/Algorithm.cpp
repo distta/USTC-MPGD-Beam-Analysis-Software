@@ -1,61 +1,51 @@
-#include "Clustering.h"
+#include "Algorithm.h"
+#include "Config.h"
 #include "DataModel.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
 
-Clustering::Clustering(const json& config) {
+Algorithm::Algorithm(const json& config) {
     m_waveformConfig.loadFrom(config);
     m_clusterConfig.loadFrom(config);
     m_reconstructionConfig.loadFrom(config);
 }
 
-std::vector<RecCluster> Clustering::BuildClusters(const std::vector<RawData>& raws) {
-    std::vector<RecCluster> clusters;
-    if (raws.empty()) return clusters;
+std::vector<Cluster> Algorithm::BuildClusters(const std::vector<StripHit>& stripHits) {
+    std::vector<Cluster> clusters;
+    if (stripHits.empty()) return clusters;
 
-    std::vector<RawData> currentGroup;
-    currentGroup.push_back(raws.front());
+    std::vector<StripHit> currentGroup;
+    currentGroup.push_back(stripHits.front());
 
-    for (size_t i = 1; i < raws.size(); ++i) {
-        if (raws[i].stripID <= raws[i - 1].stripID + 1 + m_clusterConfig.maxGap) {
-            currentGroup.push_back(raws[i]);
+    for (size_t i = 1; i < stripHits.size(); ++i) {
+        if (stripHits[i].stripID <= stripHits[i - 1].stripID + 1 + m_clusterConfig.maxGap) {
+            currentGroup.push_back(stripHits[i]);
         } else {
             // 断开 -> 完成一个 cluster
-            RecCluster cluster;
+            Cluster cluster;
             cluster.type = currentGroup.front().type;
 
-            for (const auto& raw : currentGroup) {
-                StripHit stripData;
-                stripData.stripID = raw.stripID;
-                stripData.type = raw.type;
-
-                if (processWaveform(raw, stripData))
-                    cluster.strips.push_back(std::move(stripData));
+            for (const auto& aHit : currentGroup) {
+                cluster.strips.push_back(std::move(aHit));
             }
 
             if (processCluster(cluster)) {
                 clusters.push_back(std::move(cluster));
             }
 
-            // 开启新的 cluster
             currentGroup.clear();
-            currentGroup.push_back(raws[i]);
+            currentGroup.push_back(stripHits[i]);
         }
     }
 
     // 处理最后一个 cluster
     if (!currentGroup.empty()) {
-        RecCluster cluster;
+        Cluster cluster;
         cluster.type = currentGroup.front().type;
 
-        for (const auto& raw : currentGroup) {
-            StripHit stripData;
-            stripData.stripID = raw.stripID;
-            stripData.type = raw.type;
-
-            if (processWaveform(raw, stripData))
-                cluster.strips.push_back(std::move(stripData));
+        for (const auto& aHit : currentGroup) {
+            cluster.strips.push_back(std::move(aHit));
         }
 
         if (processCluster(cluster)) {
@@ -66,14 +56,61 @@ std::vector<RecCluster> Clustering::BuildClusters(const std::vector<RawData>& ra
     return clusters;
 }
 
-bool Clustering::processWaveform(const RawData& rawData, StripHit& stripData) {
+StripHit Algorithm::processFastWaveform(const RawData& rawData) {
+    // 快速波形处理算法的简单实现
     const auto& waveform = rawData.adc;
     const size_t nSamples = waveform.size();
 
-    // 空波形直接返回
     if (nSamples == 0) {
-        return false;
+        StripHit stripData;
+        stripData.isValid = false;
+        return stripData;
     }
+
+    StripHit stripData;
+
+    // 简单的峰值查找和电荷积分
+    int peakAmp = 0;
+    int peakIdx = 0;
+    double inducedCharge = 0.0;
+    const int noiseTh = m_waveformConfig.noiseThreshold;
+
+    for (size_t i = 0; i < nSamples; ++i) {
+        if (waveform[i] > peakAmp) {
+            peakAmp = waveform[i];
+            peakIdx = static_cast<int>(i);
+        }
+
+        // 积分电荷计算
+        if (waveform[i] > noiseTh) {
+            inducedCharge += (waveform[i] - noiseTh);
+        }
+    }
+
+    // 基本的时间估算（峰值位置）
+    double fitTimeSamples = static_cast<double>(peakIdx);
+
+    stripData.amp = static_cast<double>(peakAmp);
+    stripData.charge = inducedCharge;
+    stripData.peakTime = peakIdx;
+    stripData.time = fitTimeSamples * m_waveformConfig.timePitch;
+    stripData.riseTime = 0.0;   // 快速算法不计算上升时间
+    stripData.timeError = 0.0;  // 快速算法不计算时间误差
+    stripData.isSaturated = (peakAmp > m_waveformConfig.saturationLevel);
+    stripData.isValid = true;
+
+    return stripData;
+}
+
+StripHit Algorithm::processWaveform(const RawData& rawData) {
+
+    if (m_waveformConfig.mode == "Fast") {
+        return processFastWaveform(rawData);
+    }
+    const auto& waveform = rawData.adc;
+    const size_t nSamples = waveform.size();
+
+    StripHit stripData;
 
     // 1. 找峰值 + 计算电荷 + 找阈值上下限
     int peakTime = 0;
@@ -132,7 +169,8 @@ bool Clustering::processWaveform(const RawData& rawData, StripHit& stripData) {
     double minSmooth = *std::min_element(smooth.begin(), smooth.end());
     double maxSmooth = *std::max_element(smooth.begin(), smooth.end());
     if (targetY < minSmooth || targetY > maxSmooth) {
-        return false;
+        stripData.isValid = false;
+        return stripData;
     }
 
     // --- 4) 从前向后找首次穿越点（在峰前） ---
@@ -146,7 +184,8 @@ bool Clustering::processWaveform(const RawData& rawData, StripHit& stripData) {
     }
 
     if (crossingIdx == -1) {
-        return false;
+        stripData.isValid = false;
+        return stripData;
     }
 
     // --- 5) 线性插值得到更精确时间 ---
@@ -193,18 +232,21 @@ bool Clustering::processWaveform(const RawData& rawData, StripHit& stripData) {
         timeErrorSamples = std::abs(sigmaY / slope);
     }
 
+    stripData.type = rawData.type;
+    stripData.stripID = rawData.stripID;
     stripData.amp = peakAmpD - baseline;
-    stripData.charge = inducedCharge;  
+    stripData.charge = inducedCharge;
     stripData.peakTime = peakIdx;
-    stripData.time = fitTimeSamples * m_waveformConfig.timePitch;  
+    stripData.time = fitTimeSamples * m_waveformConfig.timePitch;
     stripData.riseTime = riseTimeSamples * m_waveformConfig.timePitch;
     stripData.timeError = timeErrorSamples * m_waveformConfig.timePitch;
     stripData.isSaturated = (peakAmpD > m_waveformConfig.saturationLevel);
 
-    return true;
+    stripData.isValid = true;
+    return stripData;
 }
 
-bool Clustering::processCluster(RecCluster& cluster) {
+bool Algorithm::processCluster(Cluster& cluster) {
     cluster.size = static_cast<int>(cluster.strips.size());
 
     if (cluster.size < m_clusterConfig.minClusterSize ||
@@ -240,46 +282,50 @@ bool Clustering::processCluster(RecCluster& cluster) {
     return true;
 }
 
-void Clustering::MatchClusters(std::map<int, std::vector<RecCluster>>& clustersByType, std::vector<RecHit>& recHits) {
+std::vector<RecCluster> Algorithm::MatchClusters(std::map<int, std::vector<Cluster>>& clustersByType) {
+    std::vector<RecCluster> recClusters;
 
-    int matchID = 0;
-    if (clustersByType.size() == 1) {
-        // --- 1D 探测器，直接输出每个 cluster 为一个 RecHit ---
-        auto& clusters = clustersByType.begin()->second;
-        for (auto& cluster : clusters) {
-            RecHit hit;
-            cluster.matchID = matchID;
-            hit.cluster.push_back(cluster);
-            recHits.push_back(std::move(hit));
-            matchID++;
-        }
-    } else {
-        // --- 2D 探测器，需要进行匹配，例如 U-V 匹配 ---
-        // 假设只有两种类型：U / V
-        auto it = clustersByType.begin();
-        auto& clustersU = it->second;
-        ++it;
-        auto& clustersV = it->second;
+    if (clustersByType.empty()) return recClusters;
 
-        for (auto& u : clustersU) {
-            for (auto& v : clustersV) {
+    const auto& refType = clustersByType.begin()->first;
+    const auto& refClusters = clustersByType.begin()->second;
 
-                RecHit hit;
-                // if (std::fabs(u.charge - v.charge) > 300) {
-                //     continue;
-                // }
-                u.matchID = matchID;
-                v.matchID = matchID;
-                hit.cluster.push_back(u);
-                hit.cluster.push_back(v);
-                ++matchID;
-                recHits.push_back(std::move(hit));
+    int matchCounter = 0;
+
+    for (const auto& refCl : refClusters) {
+        RecCluster rec;
+        rec.push_back(refCl);
+
+        double refCharge = refCl.charge;
+
+        for (const auto& [type, cls] : clustersByType) {
+            if (type == refType) continue;
+            if (cls.empty()) continue;
+
+            const Cluster* best = nullptr;
+            double bestDiff = std::numeric_limits<double>::max();
+
+            for (const auto& c : cls) {
+                double diff = std::fabs(c.charge - refCharge);
+                if (diff < bestDiff) {
+                    bestDiff = diff;
+                    best = &c;
+                }
             }
+            if (best && bestDiff < m_clusterConfig.MaxChargeDiff) rec.push_back(*best);
+        }
+
+        if (rec.size() > 1) {
+            for (auto& c : rec) c.matchID = matchCounter;
+            matchCounter++;
+            recClusters.push_back(std::move(rec));
         }
     }
+
+    return recClusters;
 }
 
-void Clustering::reconstructChargeWeighted(RecCluster& cluster) {
+void Algorithm::reconstructChargeWeighted(Cluster& cluster) {
     if (cluster.charge <= 0.0) {
         cluster.pos = -999.0;
         return;
@@ -293,7 +339,7 @@ void Clustering::reconstructChargeWeighted(RecCluster& cluster) {
     cluster.pos = weightedSum / cluster.charge;
 }
 
-void Clustering::reconstructUTPC(RecCluster& cluster) {
+void Algorithm::reconstructUTPC(Cluster& cluster) {
     if (cluster.strips.empty()) {
         cluster.pos = -999.0;
         return;
@@ -307,39 +353,31 @@ void Clustering::reconstructUTPC(RecCluster& cluster) {
     cluster.pos = sum / cluster.strips.size();
 }
 
-std::vector<RecHit> Clustering::Reconstruction(const std::vector<RawData>& raws) {
-    std::vector<RecHit> recHits;
-    if (raws.empty()) return recHits;
+std::vector<RecCluster> Algorithm::Reconstruct(const std::vector<RawData>& raws) {
+    std::vector<RecCluster> recClusters;
+    if (raws.empty()) return recClusters;
 
     // -----------------------------
     // Step 1: 按 type 对 RawData 分组
     // -----------------------------
-    std::map<int, std::vector<RawData>> typeMap;
+    std::map<int, std::vector<StripHit>> stripHitsByType;
     for (const auto& rd : raws) {
-        typeMap[rd.type].push_back(rd);
+        StripHit aStripHit = processWaveform(rd);
+        if (aStripHit.isValid) stripHitsByType[rd.type].push_back(aStripHit);
     }
 
     // -----------------------------
     // Step 2: 每种 type 进行聚类
     // -----------------------------
-    std::map<int, std::vector<RecCluster>> clustersByType;
+    std::map<int, std::vector<Cluster>> clustersByType;
 
-    for (auto& [type, rawGroup] : typeMap) {
-        // 按条号排序，保证聚类算法稳定
-        std::sort(rawGroup.begin(), rawGroup.end(),
-                  [](const RawData& a, const RawData& b) { return a.stripID < b.stripID; });
+    for (auto& [type, stripHits] : stripHitsByType) {
 
-        // 调用 Clustering 完成该 type 内部的聚类
-        auto clusters = BuildClusters(rawGroup);
-        clustersByType[type] = std::move(clusters);
+        std::sort(stripHits.begin(), stripHits.end(),
+                  [](const StripHit& a, const StripHit& b) { return a.stripID < b.stripID; });
+
+        clustersByType[type] = BuildClusters(stripHits);
     }
 
-    // -----------------------------
-    // Step 3: 根据 type 数量生成 RecHit
-    // -----------------------------
-    if (clustersByType.empty()) return recHits;
-
-    MatchClusters(clustersByType, recHits);
-
-    return recHits;
+    return MatchClusters(clustersByType);
 }

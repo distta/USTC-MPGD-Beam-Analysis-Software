@@ -7,6 +7,8 @@ using json = nlohmann::json;
 
 // 波形处理配置
 struct WaveformConfig {
+
+    std::string mode = "Default";
     double cfdFraction = 0.1;
     double noiseThreshold = 60.0;
     double saturationLevel = 1800.0;
@@ -25,9 +27,10 @@ struct WaveformConfig {
 
 // 聚类配置
 struct ClusterConfig {
-    int maxGap = 1;           // 最大间隙
-    int minClusterSize = 2;   // 最小聚类大小
-    int maxClusterSize = 20;  // 最大聚类大小
+    int maxGap = 1;               // 最大间隙
+    int minClusterSize = 2;       // 最小聚类大小
+    int maxClusterSize = 20;      // 最大聚类大小
+    double MaxChargeDiff = 100000.0;  // 对于不同Cluster匹配最大电荷差
 
     void loadFrom(const json& config, const std::string& section = "cluster") {
         if (!config.contains(section)) return;

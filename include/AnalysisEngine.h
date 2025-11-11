@@ -15,11 +15,11 @@
 
 using json = nlohmann::json;
 
-class Pipeline {
+class AnalysisEngine {
    public:
-    explicit Pipeline(const std::string& configFile) : m_configFile(configFile) {
+    explicit AnalysisEngine(const std::string& configFile) : m_configFile(configFile) {
     }
-    ~Pipeline() = default;
+    ~AnalysisEngine() = default;
 
     void Initialize();
 
@@ -36,14 +36,17 @@ class Pipeline {
 
    private:
     // 把硬件 (boardID, channelID) 映射到 (detID, stripID, type)
-    std::tuple<int, int, int> MapBoardChannel(unsigned int boardID, unsigned int channelID) const;
+    std::tuple<int, int, int> MapBoardChannel(unsigned int boardID, unsigned int channelID, unsigned int mm_strip) const;
 
-    bool EventFilter(const std::unordered_map<int, std::vector<RecHit>>&);
+    bool EventFilter();
 
     Track FitTrack(const std::vector<GlobalHit>& globalHits) const;
 
     // Compute track chi2
     double TrackChi2(const double* par);
+
+    // Compute DUT chi2
+    double DUTChi2(const double* par, int detID);
 
     // profile-likelihood
     double ProfileNLL(const double* par);

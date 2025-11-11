@@ -1,10 +1,10 @@
 #pragma once
 
-#include "Rtypes.h"
+#include "Config.h"
+#include "TVector3.h"
+#include <iostream>
 #include <map>
 #include <nlohmann/json.hpp>
-#include <optional>
-#include <vector>
 
 using json = nlohmann::json;
 
@@ -30,9 +30,10 @@ struct StripHit {
 
     // ---- 标志位 ----
     bool isSaturated;  // 是否饱和
+    bool isValid;      // 是否有效
 };
 
-struct RecCluster {
+struct Cluster {
     int type;  // 属于X/Y/U/V 哪个方向
     int matchID;
     std::vector<StripHit> strips;  // 参与聚类的条
@@ -46,34 +47,21 @@ struct RecCluster {
     double pos;   // cluster重建位置
 };
 
-struct RecHit {
-    std::vector<RecCluster> cluster;
-};
-
-struct GlobalHit {
-    int detID;
-    double x = 0.0;
-    double y = 0.0;
-    double z = 0.0;
-};
+typedef TVector3 GlobalHit;
+typedef TVector3 LocalHit;
+typedef std::vector<Cluster> RecCluster;
 
 // 径迹数据结构
 struct Track {
-    double slope_x;      // x方向斜率
-    double slope_y;      // y方向斜率
-    double intercept_x;  // x截距
-    double intercept_y;  // y截距
-    double chi2;         // 拟合质量
-
-    std::pair<double, double> getPositionAtZ(double z) const {
-        double x = intercept_x + slope_x * z;
-        double y = intercept_y + slope_y * z;
-        return {x, y};
-    }
+    double kx;    // x方向斜率
+    double ky;    // y方向斜率
+    double bx;    // x截距
+    double by;    // y截距
+    double chi2;  // 拟合质量
 };
 
 struct Event {
     int eventID;
-    std::map<int, std::vector<RecHit>> recLocalHits;
+    std::map<int, std::vector<LocalHit>> recLocalHits;
     Track track;
 };

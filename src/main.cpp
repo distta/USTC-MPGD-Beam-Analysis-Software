@@ -4,7 +4,7 @@
  * @author Huang Qixuan
  */
 
-#include "Pipeline.h"
+#include "AnalysisEngine.h"
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -54,7 +54,7 @@ int main(int argc, char* argv[]) {
 
     std::string dataFile = formatDataFileName(runNumber);
     std::string outputDir = formatOutputDir(runNumber);
-    std::string cacheFile = outputDir + "/cache.root";
+    std::string cacheFile = outputDir + "/cluster.root";
     std::string outFile = outputDir + "/output.root";
 
     if (!std::filesystem::exists(dataFile)) {
@@ -77,7 +77,7 @@ int main(int argc, char* argv[]) {
     // 创建输出目录
     std::filesystem::create_directories(outputDir);
     // 创建并运行分析管道
-    Pipeline pipeline(configFile);
+    AnalysisEngine pipeline(configFile);
     pipeline.Initialize();
     pipeline.Run(dataFile, cacheFile, outFile);
 

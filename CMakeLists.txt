@@ -20,11 +20,10 @@ endif()
 
 set(SOURCES
     src/main.cpp
-    src/Pipeline.cpp
     src/Detector/Detector.cpp
     src/Detector/Planar.cpp
-    src/Detector/Cylinder.cpp
-    src/Clustering.cpp
+    src/Algorithm.cpp
+    src/AnalysisEngine.cpp
 )
 
 add_executable(BeamAnalysis ${SOURCES})

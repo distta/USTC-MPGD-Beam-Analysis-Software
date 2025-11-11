@@ -8,7 +8,7 @@ class Cylinder : public Detector {
    public:
     Cylinder(int id, const std::string& name, const json& config);
 
-    double GetLocalHit(const Track& track, int type) const override;
+    GlobalHit GetHitFromTrack(const Track& track) const override;
 
    protected:
     cylinderConfig m_config;
