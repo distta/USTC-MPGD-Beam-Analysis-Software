@@ -1,87 +1,76 @@
-/**
- * @file main.cpp
- * @brief BeamAnalysis 项目主程序入口
- * @author Huang Qixuan
- */
-
 #include "AnalysisEngine.h"
-#include <filesystem>
+#include "EventDisplay/EventDisplayManager.h"
 #include <iostream>
-#include <sstream>
 #include <string>
 
-void printUsage(const char* programName) {
-    std::cout << "用法: " << programName << " <run_number> [config_file]" << std::endl;
-    std::cout << "参数说明:" << std::endl;
-    std::cout << "  run_number  : 实验运行编号 (例如: 1537, 1538, ...)" << std::endl;
-    std::cout << "  config_file : 配置文件路径 (可选, 默认: config/config.json)" << std::endl;
-    std::cout << "示例:" << std::endl;
-    std::cout << "  " << programName << " 1537" << std::endl;
-    std::cout << "  " << programName << " 1538 config/custom.json" << std::endl;
-    std::cout << "\n输入输出规则:" << std::endl;
-    std::cout << "  输入: raw/run<run_number>.root" << std::endl;
-    std::cout << "  输出: result/<run_number>/" << std::endl;
-}
-
-std::string formatDataFileName(const std::string& runNumber) {
-    // 构造数据文件名: raw/run<runNumber>.root
-    std::stringstream ss;
-    ss << "raw/run" << runNumber << ".root";
-    return ss.str();
-}
-
-std::string formatOutputDir(const std::string& runNumber) {
-
-    std::stringstream ss;
-    ss << "result/" << runNumber;
-    return ss.str();
+void printUsage(const char* prog) {
+    std::cout << "Usage: " << prog << " <run_id> [config_file]" << std::endl;
+    std::cout << "  run_id     : Run ID (e.g., 1813)" << std::endl;
+    std::cout << "  config_file: Config path (default: config/config.json)" << std::endl;
+    std::cout << "\nExamples:" << std::endl;
+    std::cout << "  " << prog << " 1813" << std::endl;
+    std::cout << "  " << prog << " 1813 config/config1813.json" << std::endl;
+    std::cout << "\nInput/Output:" << std::endl;
+    std::cout << "  Raw data : raw/run<run_id>.root" << std::endl;
+    std::cout << "  Results  : result/<run_id>/" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
-
     if (argc < 2) {
-        std::cerr << "错误: 缺少必要参数" << std::endl;
         printUsage(argv[0]);
         return 1;
     }
 
-    std::string runNumber = argv[1];
-    std::string configFile = "config/config.json";
+    std::string runID = argv[1];
+    std::string configFile = argc > 2 ? argv[2] : "config.json";
+    configFile = "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/config/" + configFile;
+    std::string rawDir = "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/raw";
+    std::string resultDir = "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/result";
 
-    if (argc > 2) {
-        configFile = argv[2];
-    }
+    try {
+        AnalysisEngine engine(configFile, rawDir, resultDir, runID);
+        engine.Initialize();
 
-    std::string dataFile = formatDataFileName(runNumber);
-    std::string outputDir = formatOutputDir(runNumber);
-    std::string cacheFile = outputDir + "/cluster.root";
-    std::string outFile = outputDir + "/output.root";
+        while (true) {
+            std::cout << "\nSelect mode:" << std::endl;
+            std::cout << "  1) Track Analysis" << std::endl;
+            std::cout << "  2) DUT Analysis" << std::endl;
+            std::cout << "  3) Event Display Mode (DUT only)" << std::endl;
+            std::cout << "  0) Exit" << std::endl;
+            std::cout << "Choice: ";
 
-    if (!std::filesystem::exists(dataFile)) {
-        std::cerr << "错误: 数据文件不存在: " << dataFile << std::endl;
-        std::cerr << "请确保 raw/ 目录下存在对应的数据文件" << std::endl;
+            int choice;
+            std::cin >> choice;
+
+            if (std::cin.fail()) {
+                std::cin.clear();                                                    // 清除错误标志
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');  // 忽略错误输入
+                std::cerr << "Invalid input! Please enter a number." << std::endl;
+                continue;
+            }
+
+            if (choice == 1) {
+                engine.RunTrackAnalysis();
+            } else if (choice == 2) {
+                engine.RunDUTAnalysis();
+            } else if (choice == 3) {
+                EventDisplayManager edm(rawDir, resultDir, runID);
+                if (!edm.Initialize()) {
+                    std::cerr << "Failed to init EventDisplayManager\n";
+                    continue;  // 不退出，回到菜单
+                }
+                edm.RunInteractive();
+            } else if (choice == 0) {
+                std::cout << "Exiting program..." << std::endl;
+                break;
+            } else {
+                std::cerr << "Invalid choice! Please try again." << std::endl;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "\nError: " << e.what() << std::endl;
         return 1;
     }
 
-    if (!std::filesystem::exists(configFile)) {
-        std::cerr << "错误: 配置文件不存在: " << configFile << std::endl;
-        return 1;
-    }
-
-    std::cout << "BeamAnalysis 启动中..." << std::endl;
-    std::cout << "配置文件: " << configFile << std::endl;
-    std::cout << "数据文件: " << dataFile << std::endl;
-    std::cout << "运行编号: " << runNumber << std::endl;
-    std::cout << "输出目录: " << outputDir << std::endl;
-
-    // 创建输出目录
-    std::filesystem::create_directories(outputDir);
-    // 创建并运行分析管道
-    AnalysisEngine pipeline(configFile);
-    pipeline.Initialize();
-    pipeline.Run(dataFile, cacheFile, outFile);
-
-    std::cout << "分析完成！" << std::endl;
-    std::cout << "结果已保存到 " << outputDir << " 目录" << std::endl;
     return 0;
 }

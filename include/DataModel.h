@@ -1,12 +1,13 @@
 #pragma once
 
-#include "Config.h"
+#include "Algorithm/Config.h"
 #include "TVector3.h"
 #include <iostream>
 #include <map>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
+
 
 struct RawData {
     int stripID;             // 读出板编号
@@ -62,6 +63,8 @@ struct Track {
 
 struct Event {
     int eventID;
-    std::map<int, std::vector<LocalHit>> recLocalHits;
+    std::map<int, std::vector<LocalHit>> recLocalHits;     // detID -> LocalHits
+    std::map<int, std::vector<RecCluster>> recClusters;    // detID -> RecClusters
     Track track;
 };
+ 

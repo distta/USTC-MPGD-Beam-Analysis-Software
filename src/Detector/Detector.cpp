@@ -1,6 +1,12 @@
 #include "Detector/Detector.h"
+#include "Algorithm/AlgorithmFactory.h"
+#include "Algorithm/algorithms/ClusterBuilder.h"
+#include "Algorithm/algorithms/ClusterReconstructor.h"
+#include "Algorithm/algorithms/WaveformProcessor.h"
 #include "TMath.h"
 #include "TMatrixD.h"
+#include <iostream>
+#include <stdexcept>
 
 Detector::Detector(int id, const std::string& name, const nlohmann::json& config) : m_id(id), m_name(name) {
     // 设置探测器角色
@@ -14,10 +20,10 @@ Detector::Detector(int id, const std::string& name, const nlohmann::json& config
     }
 
     if (!config.contains("position") || !config["position"].is_array() || config["position"].size() < 3) {
-        throw std::runtime_error("Detector: Missing or invalid 'position' parameter in geometry config");
+        throw std::runtime_error("[Detector] Missing or invalid 'position' parameter in geometry config");
     }
     if (!config.contains("rotation") || !config["rotation"].is_array() || config["rotation"].size() < 3) {
-        throw std::runtime_error("Detector: Missing or invalid 'rotation' parameter in geometry config");
+        throw std::runtime_error("[Detector] Missing or invalid 'rotation' parameter in geometry config");
     }
 
     auto& pos = config["position"];
@@ -26,87 +32,140 @@ Detector::Detector(int id, const std::string& name, const nlohmann::json& config
     auto& rot = config["rotation"];
     m_rot.SetXYZ(rot[0], rot[1], rot[2]);
 
-    // 从配置中选择算法
-    if (config.contains("Algorithm")) {
-        auto algoConfig = config["Algorithm"];
-        m_algorithm = std::make_shared<Algorithm>(algoConfig);
+    // 算法加载 - 支持Algorithms（多算法）配置
+    auto& factory = AlgorithmFactory::Instance();
+
+    if (config.contains("Algorithms")) {
+
+        for (auto& [algoName, cfg] : config["Algorithms"].items()) {
+
+            try {
+                auto algorithm = factory.CreateAlgorithm(algoName, cfg);
+                algorithm->SetDetector(this);  // 设置算法所属的探测器
+                m_algorithms[algoName] = algorithm;
+                std::cout << "[Detector " << m_name << "] Loaded algorithm '" << algoName << std::endl;
+                algorithm->Print();
+            } catch (const std::exception& e) {
+                std::cerr << "[Detector " << m_name << "] Failed to create algorithm '" << algoName
+                          << "': " << e.what() << std::endl;
+                throw;
+            }
+        }
+
     } else {
-        m_algorithm = std::make_shared<Algorithm>();
+        try {
+            // 创建默认的waveformProcessor
+            auto waveformProc = factory.CreateAlgorithm("WaveformProcessor", json::object());
+            waveformProc->SetDetector(this);
+            m_algorithms["WaveformProcessor"] = waveformProc;
+
+            // 创建默认的clustering
+            auto clustering = factory.CreateAlgorithm("ClusterBuilder", json::object());
+            clustering->SetDetector(this);
+            m_algorithms["ClusterBuilder"] = clustering;
+
+            // 创建默认的reconstruction
+            auto reconstruction = factory.CreateAlgorithm("ClusterReconstructor", json::object());
+            reconstruction->SetDetector(this);
+            m_algorithms["ClusterReconstructor"] = reconstruction;
+        } catch (const std::exception& e) {
+            std::cerr << "[Detector " << m_name << "] Failed to create default algorithms: " << e.what() << std::endl;
+            throw;
+        }
     }
 }
 
-TMatrixD RotationMatrixXYZ(const TVector3& rot) {
+TMatrixD RotationMatrixZYX(const TVector3& rot) {
     double cx = cos(rot.X()), sx = sin(rot.X());
     double cy = cos(rot.Y()), sy = sin(rot.Y());
     double cz = cos(rot.Z()), sz = sin(rot.Z());
 
-    TMatrixD Rx(3, 3), Ry(3, 3), Rz(3, 3);
-    Rx.UnitMatrix();
-    Ry.UnitMatrix();
-    Rz.UnitMatrix();
+    TMatrixD R(3, 3);
 
-    Rx(1, 1) = cx;
-    Rx(1, 2) = -sx;
-    Rx(2, 1) = sx;
-    Rx(2, 2) = cx;
+    // R = Rz * Ry * Rx
+    R(0, 0) = cz * cy;
+    R(0, 1) = cz * sy * sx - sz * cx;
+    R(0, 2) = cz * sy * cx + sz * sx;
 
-    Ry(0, 0) = cy;
-    Ry(0, 2) = sy;
-    Ry(2, 0) = -sy;
-    Ry(2, 2) = cy;
+    R(1, 0) = sz * cy;
+    R(1, 1) = sz * sy * sx + cz * cx;
+    R(1, 2) = sz * sy * cx - cz * sx;
 
-    Rz(0, 0) = cz;
-    Rz(0, 1) = -sz;
-    Rz(1, 0) = sz;
-    Rz(1, 1) = cz;
+    R(2, 0) = -sy;
+    R(2, 1) = cy * sx;
+    R(2, 2) = cy * cx;
 
-    TMatrixD R = Rz * Ry * Rx;  // ZYX rotation
     return R;
 }
 
-GlobalHit Detector::LocalToGlobal(const LocalHit& aLocalHit) const {
-    // Combined rotation & position
-    TVector3 totalRot = GetRot();
-    TVector3 totalPos = GetPos();
+GlobalHit Detector::LocalToGlobal(const LocalHit& lh) const {
+    TMatrixD R = RotationMatrixZYX(GetRot());
+    TVector3 p = TVector3(lh.x(), lh.y(), lh.z());
 
-    TMatrixD R = RotationMatrixXYZ(totalRot);
-    TVector3 local(aLocalHit.x(), aLocalHit.y(), aLocalHit.z());
-    TVector3 global = totalPos + TVector3(R(0, 0) * local.X() + R(0, 1) * local.Y() + R(0, 2) * local.Z(),
-                                          R(1, 0) * local.X() + R(1, 1) * local.Y() + R(1, 2) * local.Z(),
-                                          R(2, 0) * local.X() + R(2, 1) * local.Y() + R(2, 2) * local.Z());
+    TVector3 global(
+        R(0, 0) * p.X() + R(0, 1) * p.Y() + R(0, 2) * p.Z(),
+        R(1, 0) * p.X() + R(1, 1) * p.Y() + R(1, 2) * p.Z(),
+        R(2, 0) * p.X() + R(2, 1) * p.Y() + R(2, 2) * p.Z());
 
-    return global;
+    return global + GetPos();
 }
 
-LocalHit Detector::GlobalToLocal(const GlobalHit& aGlobalHit) const {
-    TVector3 totalRot = GetRot();
-    TVector3 totalPos = GetPos();
+LocalHit Detector::GlobalToLocal(const GlobalHit& gh) const {
+    TMatrixD R = RotationMatrixZYX(GetRot());
+    TMatrixD Rinv(TMatrixD::kTransposed, R);
 
-    TMatrixD R = RotationMatrixXYZ(totalRot);
-    TMatrixD Rinv = TMatrixD(TMatrixD::kTransposed, R);
+    TVector3 p = TVector3(gh.x(), gh.y(), gh.z()) - GetPos();
 
-    TVector3 global(aGlobalHit.x(), aGlobalHit.y(), aGlobalHit.z());
-    TVector3 localVec = global - totalPos;
-    TVector3 local(Rinv(0, 0) * localVec.X() + Rinv(0, 1) * localVec.Y() + Rinv(0, 2) * localVec.Z(),
-                   Rinv(1, 0) * localVec.X() + Rinv(1, 1) * localVec.Y() + Rinv(1, 2) * localVec.Z(),
-                   Rinv(2, 0) * localVec.X() + Rinv(2, 1) * localVec.Y() + Rinv(2, 2) * localVec.Z());
+    TVector3 local(
+        Rinv(0, 0) * p.X() + Rinv(0, 1) * p.Y() + Rinv(0, 2) * p.Z(),
+        Rinv(1, 0) * p.X() + Rinv(1, 1) * p.Y() + Rinv(1, 2) * p.Z(),
+        Rinv(2, 0) * p.X() + Rinv(2, 1) * p.Y() + Rinv(2, 2) * p.Z());
 
     return local;
 }
 
 void Detector::Reconstruct() {
-
-    if (!m_algorithm) {
-        throw std::runtime_error("No clustering algorithm set for detector " + m_name);
-    }
-
     if (m_rawData.empty()) {
         return;
     }
 
-    m_recClusters = m_algorithm->Reconstruct(m_rawData);
+    // 阶段1：波形处理 RawData -> StripHit
+    auto waveformProc = GetAlgorithm<WaveformProcessor>("WaveformProcessor");
 
+    for (const auto& raw : m_rawData) {
+        m_StripHits[raw.type].push_back(waveformProc->ProcessWaveform(raw));
+    }
+
+    // 阶段2：聚类 StripHit -> Cluster
+    auto clusterBuilder = GetAlgorithm<ClusterBuilder>("ClusterBuilder");
+    m_recClusters = clusterBuilder->BuildClusters(m_StripHits);
+
+    // 阶段3：位置重建 修改Cluster的pos
+    auto clusterRecon = GetAlgorithm<ClusterReconstructor>("ClusterReconstructor");
+    for (auto& RecCluster : m_recClusters) {
+        for (auto& cluster : RecCluster) {
+            clusterRecon->ReconstructPosition(cluster);
+        }
+    }
+
+    // 转换RecCluster为LocalHit
     for (auto& RecCluster : m_recClusters) {
         m_localHits.push_back(GetLocalHitFromCluster(RecCluster));
     }
+}
+
+template <typename T>
+std::shared_ptr<T> Detector::GetAlgorithm(const std::string& name) const {
+
+    auto it = m_algorithms.find(name);
+    if (it == m_algorithms.end()) {
+        throw std::runtime_error("Algorithm '" + name + "' not found in detector " + m_name);
+    }
+    auto algo = it->second;
+
+    auto casted = std::dynamic_pointer_cast<T>(algo);
+    if (!casted) {
+        throw std::runtime_error("Algorithm type mismatch for: " + name);
+    }
+    return casted;
 }

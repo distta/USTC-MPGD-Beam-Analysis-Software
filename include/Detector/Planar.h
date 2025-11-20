@@ -8,8 +8,7 @@ class Planar : public Detector {
 
     GlobalHit GetHitFromTrack(const Track& track) const override;
 
-    LocalHit GetLocalHitFromCluster(const RecCluster& cluster) const override;
+    TVector3 GetPlaneNormal() const;
 
-   protected:
-    planarConfig m_config;
+    LocalHit GetLocalHitFromCluster(const RecCluster& cluster) const override;
 };

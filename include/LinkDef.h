@@ -6,3 +6,4 @@
 #pragma link C++ class std::vector<Cluster>+;
 #pragma link C++ class std::vector<std::vector<short>>+;
 #pragma link C++ class std::vector<RecCluster>+;
+#pragma link C++ class Track+;

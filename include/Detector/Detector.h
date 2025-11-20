@@ -1,7 +1,9 @@
 #pragma once
 
-#include "Algorithm.h"
+#include "Algorithm/IAlgorithm.h"
 #include "DataModel.h"
+
+#include <map>
 
 class Detector {
    public:
@@ -18,6 +20,7 @@ class Detector {
 
     int GetID() const { return m_id; }
     std::string GetName() const { return m_name; }
+
     TVector3 GetPos() const { return m_pos + m_alignPos; }
     TVector3 GetRot() const { return m_rot + m_alignRot; }
     TVector3 GetAlignPos() const { return m_alignPos; }
@@ -30,6 +33,7 @@ class Detector {
         m_alignPos.SetXYZ(dx, dy, dz);
         m_alignRot.SetXYZ(dRotX, dRotY, dRotZ);
     }
+    const planarConfig& getConfig() const { return m_config; }
 
     // Coordinate Transform
     GlobalHit LocalToGlobal(const LocalHit& aLocalHit) const;
@@ -50,10 +54,17 @@ class Detector {
     const std::vector<RecCluster>& GetRecClusters() const { return m_recClusters; }
     const std::vector<LocalHit>& GetLocalHits() const { return m_localHits; }
     const int GetNumOfHits() const { return m_localHits.size(); }
+    const std::map<int, std::vector<StripHit>>& GetStripHits() const { return m_StripHits; }
+
+    // 算法相关接口
+    template <typename T>
+    std::shared_ptr<T> GetAlgorithm(const std::string& name) const;
+
     void ClearData() {
         m_rawData.clear();
         m_recClusters.clear();
         m_localHits.clear();
+        m_StripHits.clear();
     }
 
    protected:
@@ -65,11 +76,15 @@ class Detector {
     std::vector<RawData> m_rawData;
     std::vector<RecCluster> m_recClusters;
     std::vector<LocalHit> m_localHits;
+    std::map<int, std::vector<StripHit>> m_StripHits;
 
-    std::shared_ptr<Algorithm> m_algorithm;
+    // 算法实例
+    std::map<std::string, std::shared_ptr<IAlgorithm>> m_algorithms;
 
    protected:
     int m_id;
     std::string m_name;
     Role m_role;
+
+    planarConfig m_config;
 };

@@ -99,3 +99,16 @@ GlobalHit Cylinder::GetHitFromTrack(const Track& track) const {
     // 返回全局坐标系中的击中点
     return GlobalHit(m_pos.X() + x_hit, m_pos.Y() + y_hit, m_pos.Z() + z_local);
 }
+
+LocalHit Cylinder::GetLocalHitFromCluster(const RecCluster& recCluster) const {
+    // Cylinder detector 的局域击中计算
+    LocalHit localHit = TVector3(-999, -999, 0);
+    for (int i = 0; i < recCluster.size(); i++) {
+        if (recCluster[i].type == 0) {
+            localHit.SetX(recCluster[i].pos * m_config.readoutPlanePitch.at(0));
+        } else if (recCluster[i].type == 1) {
+            localHit.SetY(recCluster[i].pos * m_config.readoutPlanePitch.at(1));
+        }
+    }
+    return localHit;
+}

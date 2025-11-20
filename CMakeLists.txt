@@ -22,14 +22,26 @@ set(SOURCES
     src/main.cpp
     src/Detector/Detector.cpp
     src/Detector/Planar.cpp
-    src/Algorithm.cpp
-    src/AnalysisEngine.cpp
+    src/Detector/Cylinder.cpp
+    src/Detector/DetectorFactory.cpp
+    src/Algorithm/AlgorithmFactory.cpp
+    src/Algorithm/algorithms/WaveformProcessor.cpp
+    src/Algorithm/algorithms/ClusterBuilder.cpp
+    src/Algorithm/algorithms/ClusterReconstructor.cpp
+    src/Analysis/AnalysisEngine.cpp
+    src/Analysis/RawDataParser.cpp
+    src/Analysis/TrackAnalysis.cpp
+    src/EventDisplay/EventDisplay.cpp
 )
 
 add_executable(BeamAnalysis ${SOURCES})
 
 target_include_directories(BeamAnalysis PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/Algorithm
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/Detector
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/EventDisplay
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/Analysis
     ${ROOT_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR} 
 )
