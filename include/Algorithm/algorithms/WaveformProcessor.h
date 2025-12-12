@@ -7,6 +7,9 @@
 #include "Config.h"
 #include "DataModel.h"
 
+// 前向声明，避免循环依赖
+class DetectorFrame;
+
 /**
  * @brief 波形处理算法 - 负责RawData到StripHit的转换
  *
@@ -33,6 +36,10 @@ class WaveformProcessor : public IAlgorithm {
         m_config.print();
     }
 
+    // 统一接口: 处理DetectorFrame中的所有RawData
+    bool Process(DetectorFrame& frame) override;
+
+    // 保留旧接口以保证兼容性
     StripHit ProcessWaveform(const RawData& rawData);
 
    private:

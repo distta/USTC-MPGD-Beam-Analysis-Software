@@ -7,6 +7,9 @@
 #include <map>
 #include <vector>
 
+// 前向声明，避免循环依赖
+class DetectorFrame;
+
 /**
  * @brief 聚类构建算法 - 负责StripHit到Cluster的聚类和匹配
  *
@@ -35,37 +38,26 @@ class ClusterBuilder : public IAlgorithm {
 
     // ========== 核心接口 ==========
 
+    // 统一接口: 处理DetectorFrame中的StripHit数据
+    bool Process(DetectorFrame& frame) override;
+
     /**
-     * @brief 从StripHit构建Cluster
-     * @param stripHitsByType 按type分组的StripHit映射
-     * @return 匹配好的RecCluster列表
+     * @brief 从 StripHit 构建Cluster（保留旧接口以保证兼容性）
+     * @param stripHits 已排序的StripHit列表（按type和stripID有序）
+     * @return 所有type的Cluster混合列表
      */
-    std::vector<RecCluster> BuildClusters(const std::map<int, std::vector<StripHit>>& stripHitsByType);
+    std::vector<Cluster> BuildClusters(const std::vector<StripHit>& stripHits);
 
    private:
     ClusterConfig m_config;
 
     /**
-     * @brief 对单个type的StripHit进行聚类
-     * @param stripHits 同一type的StripHit列表
-     * @param type StripHit的type
-     * @return Cluster列表
-     */
-    std::vector<Cluster> buildClustersForType(const std::vector<StripHit>& stripHits, int type);
-
-    /**
      * @brief 处理单个cluster（计算size、range、charge等）
      * @param cluster 要处理的cluster
+     * @param stripHits StripHit列表（用于通过索引访问）
      * @return 是否有效（通过minClusterSize等过滤）
      */
-    bool processCluster(Cluster& cluster);
-
-    /**
-     * @brief 匹配不同type的Cluster
-     * @param clustersByType 按type分组的Cluster
-     * @return 匹配好的RecCluster列表
-     */
-    std::vector<RecCluster> matchClusters(std::map<int, std::vector<Cluster>>& clustersByType);
+    bool processCluster(Cluster& cluster, const std::vector<StripHit>& stripHits);
 };
 
 

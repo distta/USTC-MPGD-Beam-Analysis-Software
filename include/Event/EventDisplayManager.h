@@ -38,16 +38,16 @@ private:
     bool ProcessEntry(const TrackEntry& te);
 
     // 显示 DUT 概览（按类型画幅度/时间，inset local XY，标出 nearest cluster 与 predicted hit）
-    void DrawDUTOverview(int eventID, std::shared_ptr<Detector> det, const Track& track);
+    void DrawDUTOverview(int eventID, std::shared_ptr<Detector> det, std::shared_ptr<DetectorFrame> detFrame, const Track& track);
 
-    // 在同一画布中为一个 cluster 绘制所有 strip 的波形（所有 ADC 采样点）
-    void DrawClusterWaveforms(int eventID, std::shared_ptr<Detector> det, const Cluster& cluster, TDirectory* dir);
-
-    // 寻找与 predicted local hit 最近的 cluster（返回指向 cluster 的指针或 nullptr）
-    const Cluster* FindNearestCluster(const std::vector<RecCluster>& recClusters,
-                                      const LocalHit& predLocal,
-                                      double& outDist,
-                                      int& outClusterType);
+    // 波形查询交互循环
+    void QueryWaveforms(const TrackEntry& te);
+    
+    // 绘制指定strip及相邻strips的波形
+    void DrawWaveforms(int eventID, int dutID, int type, int targetStrip, const std::vector<RawData>& rawData);
+    
+    // 查找目标strip及相邻strips
+    std::vector<int> FindNearbyStrips(const std::vector<RawData>& rawData, int targetStrip, int type) const;
 
     // 帮助：把 stripID -> RawData 对应起来（det->GetRawData() 中查找）
     const RawData* FindRawForStrip(const std::vector<RawData>& raw, int stripID, int type) const;

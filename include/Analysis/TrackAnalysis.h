@@ -6,25 +6,24 @@
 #include <tuple>
 #include <vector>
 
-#include "DataModel.h"
 #include "Detector/Detector.h"
 
 class TFile;
 
 /**
  * @brief 径迹分析模块
- * 
+ *
  * 负责径迹重建、探测器对齐、残差计算等功能
  * 从 AnalysisEngine 中分离出来,专注于径迹分析
  */
 class TrackAnalysis {
-public:
+   public:
     /**
      * @brief 构造函数
      * @param outputDir 输出目录路径
      * @param runID 运行ID
      */
-    TrackAnalysis(const std::string& outputDir, const std::string& runID);
+    TrackAnalysis(const std::string& outputDir);
 
     /**
      * @brief 执行径迹对齐流程
@@ -40,7 +39,7 @@ public:
      * @return 探测器本征分辨率映射表 (detID -> (sigmaX, sigmaY))
      */
     std::map<int, std::pair<double, double>> ComputeTrackError(
-        const std::vector<Event>& events, 
+        const std::vector<Event>& events,
         TFile* file);
 
     /**
@@ -60,8 +59,8 @@ public:
      * @brief 获取探测器本征分辨率映射表
      * @return 分辨率映射表
      */
-    const std::map<int, std::pair<double, double>>& GetSigmaMap() const { 
-        return m_sigmaMap; 
+    const std::map<int, std::pair<double, double>>& GetSigmaMap() const {
+        return m_sigmaMap;
     }
 
     /**
@@ -72,7 +71,7 @@ public:
         m_sigmaMap = sigmaMap;
     }
 
-private:
+   private:
     /**
      * @brief 计算预测误差
      * @param targetDetID 目标探测器ID
@@ -81,9 +80,8 @@ private:
     std::pair<double, double> ComputePredictionError(int targetDetID);
 
     std::string m_outputDir;  ///< 结果输出目录
-    std::string m_runID;  ///< 运行ID
 
-    std::vector<int> m_trackerIDs;  ///< 所有Tracker探测器的ID列表
+    std::vector<int> m_trackerIDs;                        ///< 所有Tracker探测器的ID列表
     std::map<int, std::pair<double, double>> m_sigmaMap;  ///< 探测器本征分辨率缓存
-    std::vector<int> m_seedTrackerIDs;  ///< 当前事件的种子探测器ID
+    std::vector<int> m_seedTrackerIDs;                    ///< 当前事件的种子探测器ID
 };

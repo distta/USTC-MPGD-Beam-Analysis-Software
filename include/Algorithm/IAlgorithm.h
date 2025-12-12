@@ -11,6 +11,7 @@ using json = nlohmann::json;
 
 // 前向声明，避免循环依赖
 class Detector;
+class DetectorFrame;
 
 /**
  * @brief 算法基础接口
@@ -59,6 +60,18 @@ class IAlgorithm {
      * @return 探测器指针，如果未设置则返回nullptr
      */
     Detector* GetDetector() const { return m_detector; }
+
+    /**
+     * @brief 统一的算法处理接口
+     * @param frame DetectorFrame的引用，算法可通过此对象访问和修改数据
+     * @return 处理是否成功
+     * 
+     * 各算法子类根据自身职责实现该方法:
+     * - WaveformProcessor: 读取Raw数据，生成StripHit
+     * - ClusterBuilder: 读取StripHit，生成Cluster
+     * - ClusterReconstructor: 读取StripHit和Cluster，重建Cluster位置
+     */
+    virtual bool Process(DetectorFrame& frame) { return true; }
 
    protected:
     Detector* m_detector = nullptr;  ///< 拥有此算法的探测器指针

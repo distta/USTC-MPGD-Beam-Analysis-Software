@@ -1,6 +1,6 @@
 #include "Detector/DetectorFactory.h"
-#include "Detector/Planar.h"
 #include "Detector/Cylinder.h"
+#include "Detector/Planar.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -13,10 +13,6 @@ DetectorFactory& DetectorFactory::GetInstance() {
 }
 
 bool DetectorFactory::Initialize(const json& config) {
-    if (m_initialized) {
-        cerr << "[DetectorFactory] Warning: Already initialized. Clearing previous detectors." << endl;
-        Clear();
-    }
 
     if (!config.contains("detectors")) {
         cerr << "[DetectorFactory] Error: No 'detectors' field in config" << endl;
@@ -34,12 +30,11 @@ bool DetectorFactory::Initialize(const json& config) {
                     throw runtime_error("Duplicate detector ID: " + to_string(id));
                 }
                 m_detectors[id] = detector;
-                cout << "[DetectorFactory] Created detector: " << detector->GetName() 
+                cout << "[DetectorFactory] Created detector: " << detector->GetName()
                      << " (ID=" << id << ", Type=" << detConfig.value("type", "planar") << ")" << endl;
             }
         }
 
-        m_initialized = true;
         cout << "[DetectorFactory] Successfully initialized " << m_detectors.size() << " detectors" << endl;
         return true;
 
@@ -99,8 +94,19 @@ vector<shared_ptr<Detector>> DetectorFactory::GetDetectorsByRole(Detector::Role 
     return result;
 }
 
+vector<int> DetectorFactory::GetDetectorIDsByRole(Detector::Role role) const {
+    vector<int> result;
+    for (const auto& [id, det] : m_detectors) {
+        if ((role == Detector::Role::Tracker && det->isTracker()) ||
+            (role == Detector::Role::DUT && det->isDUT()) ||
+            (role == Detector::Role::Ignored && !det->isTracker() && !det->isDUT())) {
+            result.push_back(id);
+        }
+    }
+    return result;
+}
+
 void DetectorFactory::Clear() {
     m_detectors.clear();
-    m_initialized = false;
     cout << "[DetectorFactory] Cleared all detectors" << endl;
 }

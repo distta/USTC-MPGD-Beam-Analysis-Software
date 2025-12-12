@@ -21,8 +21,8 @@ class WaveformConfig : public AlgorithmConfig {
    public:
     std::string mode = "Default";
     double cfdFraction = 0.1;
-    double noiseThreshold = 60.0;
-    double saturationLevel = 1800.0;
+    double noiseThreshold = 100.0;
+    double saturationLevel = 2000.0;
     double timePitch = 25.0;
 
     // 实现AlgorithmConfig接口
@@ -49,8 +49,8 @@ class WaveformConfig : public AlgorithmConfig {
 class ClusterConfig : public AlgorithmConfig {
    public:
     int maxGap = 0;              // 最大间隙
-    int minClusterSize = 2;      // 最小聚类大小
-    int maxClusterSize = 6;     // 最大聚类大小
+    int minClusterSize = 1;      // 最小聚类大小
+    int maxClusterSize = 10;      // 最大聚类大小
     double MaxChargeDiff = 0.4;  // 对于不同Cluster匹配最大电荷差
 
     void loadFrom(const json& config) override {
@@ -100,6 +100,7 @@ class ReconstructionConfig : public AlgorithmConfig {
 };
 
 struct planarConfig {
+    std::vector<int> readoutPlaneType= {0, 1};
     std::map<int, double> readoutPlaneAngle = {{0, 0}, {1, 90}};
     std::map<int, double> readoutPlanePitch = {{0, 0.4}, {1, 0.4}};
     std::map<int, int> readoutPlaneStripNumber = {{0, 256}, {1, 256}};

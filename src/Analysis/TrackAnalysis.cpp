@@ -1,5 +1,8 @@
 #include "Analysis/TrackAnalysis.h"
+#include "Config.h"
+#include "DataModel.h"
 #include "Detector/DetectorFactory.h"
+#include "Event/DetectorFrame.h"
 
 #include <TCanvas.h>
 #include <TF1.h>
@@ -22,63 +25,26 @@ using namespace std;
 Track FitTrack(const vector<GlobalHit>& hits);
 
 // 辅助函数: 获取残差范围(在AnalysisEngine.cpp中定义)
-auto GetRange = [](const std::vector<double>& v) {
-    if (v.size() < 3) return std::make_pair(0.0, 1.0);
-    const double k = 5;
+std::pair<double, double> GetRange(const std::vector<double>& v);
 
-    // 1st pass: raw mean / sigma
-    double sum1 = 0, sq1 = 0;
-    for (double x : v) sum1 += x;
-    double mean1 = sum1 / v.size();
+TrackAnalysis::TrackAnalysis(const string& outputDir)
+    : m_outputDir(outputDir) {
 
-    for (double x : v) sq1 += (x - mean1) * (x - mean1);
-    double sigma1 = std::sqrt(sq1 / v.size());
-
-    double low1 = mean1 - k * sigma1;
-    double high1 = mean1 + k * sigma1;
-
-    double sum2 = 0, sq2 = 0;
-    int n2 = 0;
-
-    for (double x : v) {
-        if (x >= low1 && x <= high1) {
-            sum2 += x;
-            n2++;
-        }
-    }
-
-    double mean2 = sum2 / n2;
-
-    for (double x : v) {
-        if (x >= low1 && x <= high1)
-            sq2 += (x - mean2) * (x - mean2);
-    }
-
-    double sigma2 = std::sqrt(sq2 / n2);
-
-    return std::make_pair(mean2 - k * sigma2, mean2 + k * sigma2);
-};
-
-TrackAnalysis::TrackAnalysis(const string& outputDir, const string& runID)
-    : m_outputDir(outputDir), m_runID(runID) {
-    
     // 从DetectorFactory获取所有Tracker探测器
     auto& factory = DetectorFactory::GetInstance();
     auto trackers = factory.GetDetectorsByRole(Detector::Role::Tracker);
-    
+
     for (const auto& tracker : trackers) {
         m_trackerIDs.push_back(tracker->GetID());
     }
-    
+
     sort(m_trackerIDs.begin(), m_trackerIDs.end());
-    
+
     cout << "[TrackAnalysis] Initialized with " << m_trackerIDs.size() << " trackers" << endl;
 }
 
-map<int, pair<double, double>> TrackAnalysis::ComputeTrackError(
-    const vector<Event>& events, 
-    TFile* file) {
-    
+map<int, pair<double, double>> TrackAnalysis::ComputeTrackError(const vector<Event>& events, TFile* file) {
+
     auto& factory = DetectorFactory::GetInstance();
     map<int, vector<double>> residX, residY;
 
@@ -87,7 +53,8 @@ map<int, pair<double, double>> TrackAnalysis::ComputeTrackError(
         vector<GlobalHit> hits;
         for (int tid : m_trackerIDs) {
             auto detector = factory.GetDetector(tid);
-            hits.push_back(detector->LocalToGlobal(e.recLocalHits.at(tid)[0]));
+            const LocalHit& hit = e.detectorFramesMap.at(tid)->LocalHits().at(0);
+            hits.push_back(detector->LocalToGlobal(hit.localPos));
         }
 
         Track t = FitTrack(hits);
@@ -96,7 +63,7 @@ map<int, pair<double, double>> TrackAnalysis::ComputeTrackError(
             int tid = m_trackerIDs[i];
             auto detector = factory.GetDetector(tid);
 
-            GlobalHit pred = detector->GetHitFromTrack(t);
+            GlobalHit pred = detector->CalcHitFromTrack(t);
             GlobalHit meas = hits[i];
 
             residX[tid].push_back(meas.X() - pred.X());
@@ -145,7 +112,7 @@ map<int, pair<double, double>> TrackAnalysis::ComputeTrackError(
 
 void TrackAnalysis::AlignTrackers(const vector<Event>& events) {
     auto& factory = DetectorFactory::GetInstance();
-    
+
     const int nParPerDet = 3;  // dx, dy, dRotZ
     const UInt_t nPar = (m_trackerIDs.size() - 1) * nParPerDet;
 
@@ -171,7 +138,7 @@ void TrackAnalysis::AlignTrackers(const vector<Event>& events) {
             vector<GlobalHit> hits;
             for (int tid : m_trackerIDs) {
                 auto detector = factory.GetDetector(tid);
-                hits.push_back(detector->LocalToGlobal(e.recLocalHits.at(tid)[0]));
+                hits.push_back(detector->LocalToGlobal(e.detectorFramesMap.at(tid)->LocalHits().at(0).localPos));
             }
 
             Track t = FitTrack(hits);
@@ -204,7 +171,7 @@ void TrackAnalysis::AlignTrackers(const vector<Event>& events) {
 
 pair<double, double> TrackAnalysis::ComputePredictionError(int targetDetID) {
     auto& factory = DetectorFactory::GetInstance();
-    
+
     // Seed tracker IDs
     const int seed1 = m_seedTrackerIDs[0];
     const int seed2 = m_seedTrackerIDs[1];
@@ -220,7 +187,7 @@ pair<double, double> TrackAnalysis::ComputePredictionError(int targetDetID) {
     auto det1 = factory.GetDetector(seed1);
     auto det2 = factory.GetDetector(seed2);
     auto detT = factory.GetDetector(targetDetID);
-    
+
     const double z1 = det1->GetPos().Z();
     const double z2 = det2->GetPos().Z();
     const double zt = detT->GetPos().Z();
@@ -246,12 +213,12 @@ pair<double, double> TrackAnalysis::ComputePredictionError(int targetDetID) {
 
 tuple<Track, map<int, int>, bool> TrackAnalysis::FindBestTrack(const Event& event) {
     auto& factory = DetectorFactory::GetInstance();
-    
+
     // 选择seed tracker, hit数量最小
     vector<pair<int, int>> hitCounts;  // (hitCount, trackerIndex)
     for (size_t i = 0; i < m_trackerIDs.size(); ++i) {
         int tid = m_trackerIDs[i];
-        int count = event.recLocalHits.at(tid).size();
+        int count = event.detectorFramesMap.at(tid)->LocalHits().size();
         hitCounts.push_back({count, i});
     }
 
@@ -263,8 +230,8 @@ tuple<Track, map<int, int>, bool> TrackAnalysis::FindBestTrack(const Event& even
 
     m_seedTrackerIDs = {seedTrackerId1, seedTrackerId2};
 
-    const auto& hits_seed1 = event.recLocalHits.at(seedTrackerId1);
-    const auto& hits_seed2 = event.recLocalHits.at(seedTrackerId2);
+    const auto& hits_seed1 = event.detectorFramesMap.at(seedTrackerId1)->LocalHits();
+    const auto& hits_seed2 = event.detectorFramesMap.at(seedTrackerId2)->LocalHits();
 
     auto det1 = factory.GetDetector(seedTrackerId1);
     auto det2 = factory.GetDetector(seedTrackerId2);
@@ -273,8 +240,8 @@ tuple<Track, map<int, int>, bool> TrackAnalysis::FindBestTrack(const Event& even
     for (size_t i1 = 0; i1 < hits_seed1.size(); ++i1) {
         for (size_t i2 = 0; i2 < hits_seed2.size(); ++i2) {
 
-            GlobalHit globalHit1 = det1->LocalToGlobal(hits_seed1[i1]);
-            GlobalHit globalHit2 = det2->LocalToGlobal(hits_seed2[i2]);
+            GlobalHit globalHit1 = det1->LocalToGlobal(hits_seed1[i1].localPos);
+            GlobalHit globalHit2 = det2->LocalToGlobal(hits_seed2[i2].localPos);
 
             Track currentTrack = FitTrack({globalHit1, globalHit2});
 
@@ -291,25 +258,24 @@ tuple<Track, map<int, int>, bool> TrackAnalysis::FindBestTrack(const Event& even
                 if (tid == seedTrackerId1 || tid == seedTrackerId2) continue;
 
                 auto detector = factory.GetDetector(tid);
-                
+
                 // 预测击中位置
-                GlobalHit predictedGlobal = detector->GetHitFromTrack(currentTrack);
+                GlobalHit predictedGlobal = detector->CalcHitFromTrack(currentTrack);
 
                 // 计算预测误差
                 auto [sigma_pred_X, sigma_pred_Y] = ComputePredictionError(tid);
 
                 // 寻找最近击中
-                const auto& hits_i = event.recLocalHits.at(tid);
+                const auto& hits_i = event.detectorFramesMap.at(tid)->LocalHits();
                 double minDist = numeric_limits<double>::infinity();
                 int bestIdx = -1;
 
                 for (size_t j = 0; j < hits_i.size(); ++j) {
-                    GlobalHit globalHit = detector->LocalToGlobal(hits_i[j]);
+                    GlobalHit globalHit = detector->LocalToGlobal(hits_i[j].localPos);
                     double resX = globalHit.X() - predictedGlobal.X();
                     double resY = globalHit.Y() - predictedGlobal.Y();
 
-                    double normDist = sqrt((resX / sigma_pred_X) * (resX / sigma_pred_X) + 
-                                          (resY / sigma_pred_Y) * (resY / sigma_pred_Y));
+                    double normDist = sqrt((resX / sigma_pred_X) * (resX / sigma_pred_X) + (resY / sigma_pred_Y) * (resY / sigma_pred_Y));
 
                     if (normDist < minDist) {
                         minDist = normDist;
@@ -331,9 +297,9 @@ tuple<Track, map<int, int>, bool> TrackAnalysis::FindBestTrack(const Event& even
                 for (size_t i = 0; i < m_trackerIDs.size(); ++i) {
                     int tid = m_trackerIDs[i];
                     int hitIdx = hitIndices[tid];
-                    LocalHit localHit = event.recLocalHits.at(tid)[hitIdx];
+                    LocalHit localHit = event.detectorFramesMap.at(tid)->LocalHits().at(hitIdx);
                     auto detector = factory.GetDetector(tid);
-                    GlobalHit globalHit = detector->LocalToGlobal(localHit);
+                    GlobalHit globalHit = detector->LocalToGlobal(localHit.localPos);
                     allGlobalHits.push_back(globalHit);
                 }
 
@@ -349,7 +315,8 @@ tuple<Track, map<int, int>, bool> TrackAnalysis::FindBestTrack(const Event& even
 
 void TrackAnalysis::RunTrackerAlign(const vector<Event>& events, TFile* file) {
     auto& factory = DetectorFactory::GetInstance();
-    
+    const auto& trackers = factory.GetDetectorsByRole(Detector::Role::Tracker);
+
     cout << "[TrackerAlign] Perform tracker alignment? (y/n): ";
 
     char choice;
@@ -362,17 +329,20 @@ void TrackAnalysis::RunTrackerAlign(const vector<Event>& events, TFile* file) {
     vector<Event> single;
     single.reserve(events.size());
 
-    for (const auto& e : events) {
+    for (const auto& evt : events) {
         bool ok = true;
-        for (int tid : m_trackerIDs) {
-            if (e.recLocalHits.at(tid).size() != 1) {
-                ok = false;
-                break;
+        for (auto& det : trackers) {
+            int id = det->GetID();
+            for (int type : det->getConfig().readoutPlaneType) {
+                if (evt.detectorFramesMap.at(id)->Clusters(type).size() != 1) {
+                    ok = false;
+                    break;
+                }
             }
         }
-        if (ok) single.push_back(e);
+        if (ok) single.push_back(evt);
     }
-
+    cout << "[TrackerAlign] Found " << single.size() << " single-hit events." << endl;
     if (single.size() < 20) {
         cerr << "[Alignment] WARNING: Too few single-hit events: " << single.size() << endl;
     }
@@ -382,14 +352,14 @@ void TrackAnalysis::RunTrackerAlign(const vector<Event>& events, TFile* file) {
 
     map<int, vector<double>> resX, resY;
 
-    for (const auto& e : single) {
+    for (const auto& evt : single) {
         auto refDet = factory.GetDetector(refID);
-        auto ref = refDet->LocalToGlobal(e.recLocalHits.at(refID)[0]);
+        auto ref = refDet->LocalToGlobal(evt.detectorFramesMap.at(refID)->LocalHits().at(0).localPos);
 
         for (size_t i = 1; i < m_trackerIDs.size(); ++i) {
             int tid = m_trackerIDs[i];
             auto detector = factory.GetDetector(tid);
-            auto hit = detector->LocalToGlobal(e.recLocalHits.at(tid)[0]);
+            auto hit = detector->LocalToGlobal(evt.detectorFramesMap.at(tid)->LocalHits().at(0).localPos);
             resX[tid].push_back(hit.X() - ref.X());
             resY[tid].push_back(hit.Y() - ref.Y());
         }
@@ -443,7 +413,7 @@ void TrackAnalysis::RunTrackerAlign(const vector<Event>& events, TFile* file) {
         vector<GlobalHit> hits;
         for (int tid : m_trackerIDs) {
             auto detector = factory.GetDetector(tid);
-            hits.push_back(detector->LocalToGlobal(e.recLocalHits.at(tid)[0]));
+            hits.push_back(detector->LocalToGlobal(e.detectorFramesMap.at(tid)->LocalHits().at(0).localPos));
         }
 
         Track t = FitTrack(hits);
@@ -451,7 +421,7 @@ void TrackAnalysis::RunTrackerAlign(const vector<Event>& events, TFile* file) {
         for (size_t i = 0; i < m_trackerIDs.size(); ++i) {
             int tid = m_trackerIDs[i];
             auto detector = factory.GetDetector(tid);
-            auto pred = detector->GetHitFromTrack(t);
+            auto pred = detector->CalcHitFromTrack(t);
             auto meas = hits[i];
 
             double dx = meas.X() - pred.X();

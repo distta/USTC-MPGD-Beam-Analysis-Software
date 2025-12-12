@@ -1,62 +1,82 @@
 #include "algorithms/ClusterBuilder.h"
 #include "AlgorithmFactory.h"
 #include "Detector/Detector.h"
+#include "DetectorFrame.h"
 #include <algorithm>
 #include <limits>
 
 REGISTER_ALGORITHM("ClusterBuilder", ClusterBuilder)
 
-std::vector<RecCluster> ClusterBuilder::BuildClusters(const std::map<int, std::vector<StripHit>>& stripHitsByType) {
-    // Step 1: 对每个type的StripHit进行聚类
-    std::map<int, std::vector<Cluster>> clustersByType;
+bool ClusterBuilder::Process(DetectorFrame& frame) {
+    const auto& stripHits = frame.StripHits();
+    if (stripHits.empty()) return false;
 
-    for (const auto& [type, stripHits] : stripHitsByType) {
-        clustersByType[type] = buildClustersForType(stripHits, type);
-    }
+    // 调用内部的BuildClusters方法
+    auto clusters = BuildClusters(stripHits);
 
-    // Step 2: 匹配不同type的Cluster
-    return matchClusters(clustersByType);
+    // 将结果写入frame
+    auto& frameClusters = frame.GetMutableClusters();
+    frameClusters = std::move(clusters);
+
+    return !frameClusters.empty();
 }
 
-std::vector<Cluster> ClusterBuilder::buildClustersForType(const std::vector<StripHit>& stripHits, int type) {
+std::vector<Cluster> ClusterBuilder::BuildClusters(const std::vector<StripHit>& stripHits) {
     std::vector<Cluster> clusters;
     if (stripHits.empty()) return clusters;
 
-    // 按stripID排序
-    std::vector<StripHit> sortedHits = stripHits;
-    std::sort(sortedHits.begin(), sortedHits.end(),
-              [](const StripHit& a, const StripHit& b) { return a.stripID < b.stripID; });
+    // 单次扫描有序的stripHits，根据type和stripID的连续性识别聚类边界
+    std::vector<int> currentGroupIndices;  // 存储当前cluster中的StripHit全局索引
+    int currentType = stripHits[0].type;
 
-    // 聚类：连续的stripID（允许maxGap间隙）聚成一个cluster
-    std::vector<StripHit> currentGroup;
-    currentGroup.push_back(sortedHits.front());
+    for (size_t i = 0; i < stripHits.size(); ++i) {
+        const auto& currentHit = stripHits[i];
+        if (!currentHit.isValid) continue;
+        // std::cout << "StripHit ID: " << currentHit.ID << ", type: " << currentHit.type << ", isValid: " << currentHit.isValid << std::endl;
+        // 检查是否需要结束当前cluster
+        bool shouldEndCluster = false;
 
-    for (size_t i = 1; i < sortedHits.size(); ++i) {
-        if (sortedHits[i].stripID <= sortedHits[i - 1].stripID + 1 + m_config.maxGap) {
-            if (sortedHits[i].isValid)
-                currentGroup.push_back(sortedHits[i]);
-        } else {
-            // 完成一个cluster
+        if (!currentGroupIndices.empty()) {
+            const auto& prevHit = stripHits[currentGroupIndices.back()];
+
+            // 条件1：type变化
+            if (currentHit.type != currentType) {
+                shouldEndCluster = true;
+            }
+            // 条件2：stripID不连续（超过maxGap）
+            else if (currentHit.ID > prevHit.ID + 1 + m_config.maxGap) {
+                shouldEndCluster = true;
+            }
+        }
+
+        if (shouldEndCluster) {
+            // 完成当前cluster
             Cluster cluster;
-            cluster.type = type;
-            cluster.strips = currentGroup;
+            cluster.type = currentType;
+            cluster.stripHitIndices = currentGroupIndices;
 
-            if (processCluster(cluster)) {
+            if (processCluster(cluster, stripHits)) {
                 clusters.push_back(std::move(cluster));
             }
 
-            currentGroup.clear();
-            currentGroup.push_back(sortedHits[i]);
+            // 开始新cluster
+            currentGroupIndices.clear();
+            currentType = currentHit.type;
+        }
+
+        // 将当前StripHit加入聚类（只加入有效的）
+        if (currentHit.isValid) {
+            currentGroupIndices.push_back(static_cast<int>(i));
         }
     }
 
     // 处理最后一个cluster
-    if (!currentGroup.empty()) {
+    if (!currentGroupIndices.empty()) {
         Cluster cluster;
-        cluster.type = type;
-        cluster.strips = currentGroup;
+        cluster.type = currentType;
+        cluster.stripHitIndices = currentGroupIndices;
 
-        if (processCluster(cluster)) {
+        if (processCluster(cluster, stripHits)) {
             clusters.push_back(std::move(cluster));
         }
     }
@@ -64,14 +84,14 @@ std::vector<Cluster> ClusterBuilder::buildClustersForType(const std::vector<Stri
     return clusters;
 }
 
-bool ClusterBuilder::processCluster(Cluster& cluster) {
-    if (cluster.strips.empty()) return false;
+bool ClusterBuilder::processCluster(Cluster& cluster, const std::vector<StripHit>& stripHits) {
+    if (cluster.stripHitIndices.empty()) return false;
 
     // 计算size和range
-    cluster.size = cluster.strips.size();
+    cluster.size = cluster.stripHitIndices.size();
 
-    int minID = cluster.strips.front().stripID;
-    int maxID = cluster.strips.back().stripID;
+    int minID = stripHits[cluster.stripHitIndices.front()].ID;
+    int maxID = stripHits[cluster.stripHitIndices.back()].ID;
     cluster.range = maxID - minID + 1;
 
     // 过滤：检查cluster大小
@@ -83,9 +103,16 @@ bool ClusterBuilder::processCluster(Cluster& cluster) {
     cluster.charge = 0.0;
     cluster.maxAmp = 0.0;
     cluster.time = std::numeric_limits<double>::max();
+    double sumPos = 0.0;
+    double sumCharge = 0.0;
 
-    for (const auto& strip : cluster.strips) {
+    for (int idx : cluster.stripHitIndices) {
+        const auto& strip = stripHits[idx];
+
         cluster.charge += strip.charge;
+        sumCharge += strip.charge;
+        sumPos += strip.ID * strip.charge;  // 电荷加权位置
+
         if (strip.amp > cluster.maxAmp) {
             cluster.maxAmp = strip.amp;
         }
@@ -94,93 +121,11 @@ bool ClusterBuilder::processCluster(Cluster& cluster) {
         }
     }
 
-    // 初始化matchID为-1（未匹配）
-    cluster.matchID = -1;
+    // 计算质心
+    cluster.centroid = (sumCharge > 0) ? sumPos / sumCharge : 0.0;
 
     // 初始化pos为0（需要由ClusterReconstructor重建）
     cluster.pos = 0.0;
 
     return true;
-}
-
-std::vector<RecCluster> ClusterBuilder::matchClusters(std::map<int, std::vector<Cluster>>& clustersByType) {
-    std::vector<RecCluster> recClusters;
-
-    // 如果只有一个type，直接转换
-    int matchCount = 0;
-    if (m_detector->getConfig().readoutPlanePitch.size() == 1) {
-        for (auto& cluster : clustersByType.begin()->second) {
-            RecCluster rec;
-            cluster.matchID = matchCount;
-            rec.push_back(cluster);
-            recClusters.push_back(rec);
-            matchCount++;
-        }
-        return recClusters;
-    }
-
-    // 多type匹配（如X-Y匹配）
-    // 简化版本：基于电荷差进行匹配
-    std::vector<int> types;
-    for (const auto& [type, _] : clustersByType) {
-        types.push_back(type);
-    }
-
-    if (types.size() == 2) {
-
-        if (m_detector->isTracker()) {
-            for (auto& cluster : clustersByType[types[0]]) {
-                for (auto& cluster1 : clustersByType[types[1]]) {
-                    RecCluster rec;
-                    cluster.matchID = matchCount;
-                    cluster1.matchID = matchCount;
-                    rec.push_back(cluster);
-                    rec.push_back(cluster1);
-                    recClusters.push_back(rec);
-                    matchCount++;
-                }
-            }
-            return recClusters;
-        }
-        // 双type匹配
-        auto& clusters0 = clustersByType[types[0]];
-        auto& clusters1 = clustersByType[types[1]];
-
-        std::vector<bool> used0(clusters0.size(), false);
-        std::vector<bool> used1(clusters1.size(), false);
-
-        int matchCount = 0;
-        for (size_t i = 0; i < clusters0.size(); ++i) {
-            if (used0[i]) continue;
-
-            double minChargeDiff = std::numeric_limits<double>::max();
-            int bestMatch = -1;
-
-            for (size_t j = 0; j < clusters1.size(); ++j) {
-                if (used1[j]) continue;
-
-                double chargeDiff = abs(clusters0[i].charge / clusters1[j].charge - 1.2);
-                if (chargeDiff < minChargeDiff && chargeDiff < m_config.MaxChargeDiff) {
-                    minChargeDiff = chargeDiff;
-                    bestMatch = j;
-                }
-            }
-
-            if (bestMatch != -1) {
-                // 找到匹配
-                RecCluster rec;
-                clusters0[i].matchID = matchCount;
-                clusters1[bestMatch].matchID = matchCount;
-                rec.push_back(clusters0[i]);
-                rec.push_back(clusters1[bestMatch]);
-                recClusters.push_back(rec);
-                matchCount++;
-
-                used0[i] = true;
-                used1[bestMatch] = true;
-            }
-        }
-    }
-
-    return recClusters;
 }

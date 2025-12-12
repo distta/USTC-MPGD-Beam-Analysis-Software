@@ -1,8 +1,8 @@
 #pragma once
 
 #include "Algorithm/IAlgorithm.h"
-#include "DataModel.h"
-
+#include "Config.h"
+#include "Event/DataModel.h"
 #include <map>
 
 class Detector {
@@ -36,35 +36,27 @@ class Detector {
     const planarConfig& getConfig() const { return m_config; }
 
     // Coordinate Transform
-    GlobalHit LocalToGlobal(const LocalHit& aLocalHit) const;
-    LocalHit GlobalToLocal(const GlobalHit& aGlobalHit) const;
+    TVector3 LocalToGlobal(const TVector3& localPos) const;
+    TVector3 GlobalToLocal(const TVector3& globalPos) const;
 
     // Specific Detector Geometry
-    virtual GlobalHit GetHitFromTrack(const Track& track) const = 0;
-    virtual LocalHit GetLocalHitFromCluster(const RecCluster& cluster) const = 0;
-
-    // Algorithms: rawData->recHits->localHits
-    void Reconstruct();
-
-    // Data Interfaces
-    void SetRawData(const std::vector<RawData>& rawData) { m_rawData = rawData; }
-    void AddRawData(const RawData& raw) { m_rawData.push_back(raw); }
-    void AddRecCluster(const RecCluster& cluster) { m_recClusters.push_back(cluster); }
-    const std::vector<RawData>& GetRawData() const { return m_rawData; }
-    const std::vector<RecCluster>& GetRecClusters() const { return m_recClusters; }
-    const std::vector<LocalHit>& GetLocalHits() const { return m_localHits; }
-    const int GetNumOfHits() const { return m_localHits.size(); }
-    const std::map<int, std::vector<StripHit>>& GetStripHits() const { return m_StripHits; }
+    virtual TVector3 CalcHitFromTrack(const Track& track) const = 0;
+    virtual std::vector<LocalHit> CalcLocalHitsFromClusters(const std::vector<Cluster>& clusters) const = 0;
 
     // 算法相关接口
     template <typename T>
-    std::shared_ptr<T> GetAlgorithm(const std::string& name) const;
+    std::shared_ptr<T> GetAlgorithm(const std::string& name) const {
+        auto it = m_algorithms.find(name);
+        if (it == m_algorithms.end()) {
+            throw std::runtime_error("Algorithm '" + name + "' not found in detector " + m_name);
+        }
+        auto algo = it->second;
 
-    void ClearData() {
-        m_rawData.clear();
-        m_recClusters.clear();
-        m_localHits.clear();
-        m_StripHits.clear();
+        auto casted = std::dynamic_pointer_cast<T>(algo);
+        if (!casted) {
+            throw std::runtime_error("Algorithm type mismatch for: " + name);
+        }
+        return casted;
     }
 
    protected:
@@ -72,11 +64,6 @@ class Detector {
     TVector3 m_rot;
     TVector3 m_alignPos = TVector3(0, 0, 0);
     TVector3 m_alignRot = TVector3(0, 0, 0);
-
-    std::vector<RawData> m_rawData;
-    std::vector<RecCluster> m_recClusters;
-    std::vector<LocalHit> m_localHits;
-    std::map<int, std::vector<StripHit>> m_StripHits;
 
     // 算法实例
     std::map<std::string, std::shared_ptr<IAlgorithm>> m_algorithms;

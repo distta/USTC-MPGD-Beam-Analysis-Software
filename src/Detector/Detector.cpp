@@ -98,9 +98,9 @@ TMatrixD RotationMatrixZYX(const TVector3& rot) {
     return R;
 }
 
-GlobalHit Detector::LocalToGlobal(const LocalHit& lh) const {
+TVector3 Detector::LocalToGlobal(const TVector3& localPos) const {
     TMatrixD R = RotationMatrixZYX(GetRot());
-    TVector3 p = TVector3(lh.x(), lh.y(), lh.z());
+    TVector3 p = localPos;
 
     TVector3 global(
         R(0, 0) * p.X() + R(0, 1) * p.Y() + R(0, 2) * p.Z(),
@@ -110,11 +110,11 @@ GlobalHit Detector::LocalToGlobal(const LocalHit& lh) const {
     return global + GetPos();
 }
 
-LocalHit Detector::GlobalToLocal(const GlobalHit& gh) const {
+TVector3 Detector::GlobalToLocal(const TVector3& globalPos) const {
     TMatrixD R = RotationMatrixZYX(GetRot());
     TMatrixD Rinv(TMatrixD::kTransposed, R);
 
-    TVector3 p = TVector3(gh.x(), gh.y(), gh.z()) - GetPos();
+    TVector3 p = TVector3(globalPos.x(), globalPos.y(), globalPos.z()) - GetPos();
 
     TVector3 local(
         Rinv(0, 0) * p.X() + Rinv(0, 1) * p.Y() + Rinv(0, 2) * p.Z(),
@@ -122,50 +122,4 @@ LocalHit Detector::GlobalToLocal(const GlobalHit& gh) const {
         Rinv(2, 0) * p.X() + Rinv(2, 1) * p.Y() + Rinv(2, 2) * p.Z());
 
     return local;
-}
-
-void Detector::Reconstruct() {
-    if (m_rawData.empty()) {
-        return;
-    }
-
-    // 阶段1：波形处理 RawData -> StripHit
-    auto waveformProc = GetAlgorithm<WaveformProcessor>("WaveformProcessor");
-
-    for (const auto& raw : m_rawData) {
-        m_StripHits[raw.type].push_back(waveformProc->ProcessWaveform(raw));
-    }
-
-    // 阶段2：聚类 StripHit -> Cluster
-    auto clusterBuilder = GetAlgorithm<ClusterBuilder>("ClusterBuilder");
-    m_recClusters = clusterBuilder->BuildClusters(m_StripHits);
-
-    // 阶段3：位置重建 修改Cluster的pos
-    auto clusterRecon = GetAlgorithm<ClusterReconstructor>("ClusterReconstructor");
-    for (auto& RecCluster : m_recClusters) {
-        for (auto& cluster : RecCluster) {
-            clusterRecon->ReconstructPosition(cluster);
-        }
-    }
-
-    // 转换RecCluster为LocalHit
-    for (auto& RecCluster : m_recClusters) {
-        m_localHits.push_back(GetLocalHitFromCluster(RecCluster));
-    }
-}
-
-template <typename T>
-std::shared_ptr<T> Detector::GetAlgorithm(const std::string& name) const {
-
-    auto it = m_algorithms.find(name);
-    if (it == m_algorithms.end()) {
-        throw std::runtime_error("Algorithm '" + name + "' not found in detector " + m_name);
-    }
-    auto algo = it->second;
-
-    auto casted = std::dynamic_pointer_cast<T>(algo);
-    if (!casted) {
-        throw std::runtime_error("Algorithm type mismatch for: " + name);
-    }
-    return casted;
 }

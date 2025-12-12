@@ -20,6 +20,8 @@ endif()
 
 set(SOURCES
     src/main.cpp
+    src/Event/DetectorFrame.cpp
+    src/Event/EventDisplay.cpp
     src/Detector/Detector.cpp
     src/Detector/Planar.cpp
     src/Detector/Cylinder.cpp
@@ -31,7 +33,6 @@ set(SOURCES
     src/Analysis/AnalysisEngine.cpp
     src/Analysis/RawDataParser.cpp
     src/Analysis/TrackAnalysis.cpp
-    src/EventDisplay/EventDisplay.cpp
 )
 
 add_executable(BeamAnalysis ${SOURCES})
@@ -40,6 +41,7 @@ target_include_directories(BeamAnalysis PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Algorithm
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Detector
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/Event
     ${CMAKE_CURRENT_SOURCE_DIR}/include/EventDisplay
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Analysis
     ${ROOT_INCLUDE_DIRS}
@@ -52,9 +54,9 @@ target_link_libraries(BeamAnalysis
 )
 
 # 头文件和 LinkDef
-set(DI_HDR ${CMAKE_CURRENT_SOURCE_DIR}/include/DataModel.h)
+set(DI_HDR ${CMAKE_CURRENT_SOURCE_DIR}/include/Event/DataModel.h)
 set(LINKDEF  ${CMAKE_CURRENT_SOURCE_DIR}/include/LinkDef.h)
 
-ROOT_GENERATE_DICTIONARY(BeamAnalysis_dict ${CMAKE_CURRENT_SOURCE_DIR}/include/DataModel.h 
+ROOT_GENERATE_DICTIONARY(BeamAnalysis_dict ${CMAKE_CURRENT_SOURCE_DIR}/include/Event/DataModel.h 
                         MODULE BeamAnalysis 
                         LINKDEF ${LINKDEF})

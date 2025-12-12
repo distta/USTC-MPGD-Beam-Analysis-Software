@@ -45,33 +45,46 @@ bool RawDataParser::Initialize() {
     return true;
 }
 
-bool RawDataParser::LoadEvent(int eventID) {
+std::unordered_map<int, std::vector<RawData>> RawDataParser::LoadEvent(int eventID) {
+    std::unordered_map<int, std::vector<RawData>> result;
+
     if (!m_tree) {
-        std::cerr << "[RawDataParser] TTree not initialized" << std::endl;
-        return false;
+        std::cerr << "[RawDataParser] ERROR: TTree not initialized\n";
+        return result;
     }
 
     if (eventID < 0 || eventID >= GetTotalEvents()) {
-        std::cerr << "[RawDataParser] Invalid event index: " << eventID << " is out of range [0, " << GetTotalEvents() - 1 << "]" << std::endl;
-        return false;
+        std::cerr << "[RawDataParser] ERROR: Invalid event index "
+                  << eventID << "\n";
+        return result;
     }
 
+    // ---- Load TTree Entry ----
     m_tree->GetEntry(eventID);
 
+    const size_t nHits = m_apv_id->size();
+    result.reserve(16);
+
     auto& factory = DetectorFactory::GetInstance();
-    auto& detectors = factory.GetAllDetectors();
+    const auto& detectors = factory.GetAllDetectors();
 
-    for (size_t j = 0; j < m_apv_id->size(); ++j) {
+    // ---- Loop all APV hits ----
+    for (size_t j = 0; j < nHits; ++j) {
+
         auto [detID, stripID, type] = MapBoardChannel(
-            (*m_apv_id)[j], (*m_apv_ch)[j], (*m_mm_strip)[j]);
+            (*m_apv_id)[j],
+            (*m_apv_ch)[j],
+            (*m_mm_strip)[j]);
 
-        if (detectors.find(detID) == detectors.end()) continue;
+        if (detectors.find(detID) == detectors.end())
+            continue;
 
         RawData raw{stripID, type, (*m_apv_q)[j]};
-        detectors.at(detID)->AddRawData(raw);
+
+        result[detID].push_back(std::move(raw));
     }
 
-    return true;
+    return result;
 }
 
 // 硬件映射常量
@@ -115,6 +128,56 @@ std::tuple<int, int, int> RawDataParser::MapBoardChannel(unsigned int boardID, u
     //     stripID = 128 - channelID;
     // else if (boardID == 14)
     //     stripID = 384 - channelID;
+    // else if (boardID == 15)
+    //     stripID = 128 - channelID;
+
+    // 1934
+    // if (boardID == 12)
+    //     stripID = 256 - channelID;
+    // else if (boardID == 13)
+    //     stripID = 128 - channelID;
+    // else if (boardID == 14)
+    //     stripID = 256 - channelID;
+    // else if (boardID == 15)
+    //     stripID = 128 - channelID;
+
+    // 1741
+    // if (boardID == 12)
+    //     stripID = 256 - channelID;
+    // else if (boardID == 13)
+    //     stripID = 128 - channelID;
+    // else if (boardID == 14)
+    //     stripID = 1 + channelID;
+    // else if (boardID == 15)
+    //     stripID = 129 + channelID;
+
+    // 1754
+    if (boardID == 12)
+        stripID = 256 - channelID;
+    else if (boardID == 13)
+        stripID = 128 - channelID;
+    else if (boardID == 14)
+        stripID = 256 - channelID;
+    else if (boardID == 15)
+        stripID = 128 - channelID;
+
+    // 1942
+    // if (boardID == 12)
+    //     stripID = 129 + channelID;
+    // else if (boardID == 13)
+    //     stripID = 385 + channelID;
+    // else if (boardID == 14)
+    //     stripID = 384 - channelID;
+    // else if (boardID == 15)
+    //     stripID = 128 - channelID;
+
+    // 1959
+    // if (boardID == 12)
+    //     stripID = channelID;
+    // else if (boardID == 13)
+    //     stripID = 128 + channelID;
+    // else if (boardID == 14)
+    //     stripID = 256 - channelID;
     // else if (boardID == 15)
     //     stripID = 128 - channelID;
 

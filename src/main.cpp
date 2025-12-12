@@ -1,5 +1,5 @@
 #include "AnalysisEngine.h"
-#include "EventDisplay/EventDisplayManager.h"
+#include "Event/EventDisplayManager.h"  
 #include <iostream>
 #include <string>
 
@@ -54,10 +54,11 @@ int main(int argc, char* argv[]) {
             } else if (choice == 2) {
                 engine.RunDUTAnalysis();
             } else if (choice == 3) {
+                std::cout << "Event Display Mode not implemented yet." << std::endl;
                 EventDisplayManager edm(rawDir, resultDir, runID);
                 if (!edm.Initialize()) {
                     std::cerr << "Failed to init EventDisplayManager\n";
-                    continue;  // 不退出，回到菜单
+                    continue;
                 }
                 edm.RunInteractive();
             } else if (choice == 0) {

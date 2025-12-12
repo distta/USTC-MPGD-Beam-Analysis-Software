@@ -6,16 +6,12 @@
 
 #pragma once
 
+#include "DataModel.h"
 #include <TFile.h>
 #include <TTree.h>
-#include <map>
-#include <memory>
 #include <string>
 #include <tuple>
 #include <vector>
-
-#include "DataModel.h"
-#include "Detector/Detector.h"
 
 class RawDataParser {
    public:
@@ -24,7 +20,7 @@ class RawDataParser {
 
     bool Initialize();
 
-    bool LoadEvent(int eventID);
+    std::unordered_map<int, std::vector<RawData>> LoadEvent(int eventID);
 
     Long64_t GetTotalEvents() const { return m_numOfEvents; };
 

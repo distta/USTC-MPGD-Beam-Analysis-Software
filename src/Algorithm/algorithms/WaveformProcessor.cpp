@@ -1,11 +1,37 @@
 #include "algorithms/WaveformProcessor.h"
 #include "AlgorithmFactory.h"
+#include "DetectorFrame.h"
 #include <TF1.h>
 #include <TGraph.h>
 #include <algorithm>
 #include <cmath>
 
 REGISTER_ALGORITHM("WaveformProcessor", WaveformProcessor)
+
+bool WaveformProcessor::Process(DetectorFrame& frame) {
+    const auto& rawData = frame.Raw();
+    if (rawData.empty()) return false;
+
+    auto& stripHits = frame.GetMutableStripHits();
+    stripHits.clear();
+    stripHits.reserve(rawData.size());
+
+    // 处理每个RawData，生成StripHit
+    for (size_t i = 0; i < rawData.size(); ++i) {
+        StripHit sh = ProcessWaveform(rawData[i]);
+        sh.rawIndices = static_cast<int>(i);
+        stripHits.push_back(sh);
+    }
+
+    // 排序：首先按type升序，相同type内按stripID升序
+    std::sort(stripHits.begin(), stripHits.end(),
+              [](const StripHit& a, const StripHit& b) {
+                  if (a.type != b.type) return a.type < b.type;
+                  return a.ID < b.ID;
+              });
+
+    return true;
+}
 
 StripHit WaveformProcessor::ProcessWaveform(const RawData& rawData) {
     if (m_config.mode == "Fit") {
@@ -21,7 +47,7 @@ StripHit WaveformProcessor::processWaveformLeadingEdgeFit(const RawData& rawData
 
     StripHit stripData;
     stripData.isValid = true;
-    stripData.stripID = rawData.stripID;
+    stripData.ID = rawData.stripID;
     stripData.type = rawData.type;
 
     if (nSamples == 0) {
@@ -50,7 +76,7 @@ StripHit WaveformProcessor::processWaveformLeadingEdgeFit(const RawData& rawData
     }
 
     // 阈值以下，无有效信号
-    if (firstOverTh == -1) {
+    if (peakAmp < noiseTh || peakAmp > m_config.saturationLevel) {
         stripData.isValid = false;
     }
 
@@ -78,7 +104,7 @@ StripHit WaveformProcessor::processWaveformLeadingEdgeFit(const RawData& rawData
     // 4. 计算目标Y值
     const double fitMin = riseFunc.GetMinimum(fitStart, fitEnd);
     const double fitMax = riseFunc.GetMaximum(fitStart, fitEnd);
-    const double targetY = m_config.cfdFraction * riseFunc.GetParameter(0) + riseFunc.GetParameter(1);
+    double targetY = m_config.cfdFraction * riseFunc.GetParameter(0) + riseFunc.GetParameter(1);
     double fitTime;
 
     if (targetY < fitMin || targetY > fitMax) {
@@ -87,7 +113,7 @@ StripHit WaveformProcessor::processWaveformLeadingEdgeFit(const RawData& rawData
         fitTime = riseFunc.GetX(targetY, fitStart, fitEnd);
     }
 
-    if (fitTime < 50 & fitTime > 350)
+    if (fitTime < 2 || fitTime > 16)
         stripData.isValid = false;
 
     // 5. 计算拟合时间
@@ -114,7 +140,7 @@ StripHit WaveformProcessor::processWaveformDefault(const RawData& rawData) {
 
     StripHit stripData;
     stripData.isValid = true;
-    stripData.stripID = rawData.stripID;
+    stripData.ID = rawData.stripID;
     stripData.type = rawData.type;
 
     if (nSamples == 0) {
@@ -156,7 +182,7 @@ StripHit WaveformProcessor::processWaveformDefault(const RawData& rawData) {
         stripData.isValid = false;
     }
 
-    // 计算基线
+    // 计算基线!!!!
     double baseline = 0.0;
     size_t baselineSamples = std::min<size_t>(5, nSamples);
     double bsum = 0;

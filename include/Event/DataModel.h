@@ -1,13 +1,10 @@
 #pragma once
 
-#include "Algorithm/Config.h"
 #include "TVector3.h"
-#include <iostream>
 #include <map>
-#include <nlohmann/json.hpp>
+#include <memory>
 
-using json = nlohmann::json;
-
+class DetectorFrame;
 
 struct RawData {
     int stripID;             // 读出板编号
@@ -16,8 +13,9 @@ struct RawData {
 };
 
 struct StripHit {
-    int stripID;  // 条号
-    int type;     // 读出条类型 (X, Y, U/V…)
+    int ID;    // 条号
+    int type;  // 读出条类型 (X, Y, U/V…)
+    int rawIndices;
 
     // ---- 提取的关键量 ----
     double amp;       // 峰值 - baseline
@@ -36,21 +34,24 @@ struct StripHit {
 
 struct Cluster {
     int type;  // 属于X/Y/U/V 哪个方向
-    int matchID;
-    std::vector<StripHit> strips;  // 参与聚类的条
+    std::vector<int> stripHitIndices;  // StripHit在DetectorFrame::m_stripHits中的全局索引
 
     // ---- 聚类整体量 ----
     int size;       // 聚类条数
     int range;      // 聚类范围 (最大ID - 最小ID)
     double charge;  // 聚类总电荷
     double maxAmp;
-    double time;  // 聚类时间 (最早)
-    double pos;   // cluster重建位置
+    double time;      // 聚类时间 (最早)
+    double centroid;  // 聚类重心
+    double pos;       // cluster重建位置
 };
 
 typedef TVector3 GlobalHit;
-typedef TVector3 LocalHit;
-typedef std::vector<Cluster> RecCluster;
+
+struct LocalHit {
+    TVector3 localPos;
+    std::vector<int> clusterIndices;
+};
 
 // 径迹数据结构
 struct Track {
@@ -63,8 +64,6 @@ struct Track {
 
 struct Event {
     int eventID;
-    std::map<int, std::vector<LocalHit>> recLocalHits;     // detID -> LocalHits
-    std::map<int, std::vector<RecCluster>> recClusters;    // detID -> RecClusters
+    std::map<int, std::shared_ptr<DetectorFrame>> detectorFramesMap;
     Track track;
 };
- 
