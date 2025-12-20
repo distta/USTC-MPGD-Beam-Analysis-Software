@@ -43,6 +43,11 @@ bool DetectorFrame::TransformToGlobal() {
     return true;
 }
 
+bool DetectorFrame::Process(double t0) {
+    this->t0 = t0;
+    return AnalyzeRaw() && Clustering() && Reconstruct() && TransformToGlobal();
+}
+
 bool DetectorFrame::Process() {
     return AnalyzeRaw() && Clustering() && Reconstruct() && TransformToGlobal();
 }

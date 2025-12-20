@@ -39,7 +39,6 @@ class WaveformProcessor : public IAlgorithm {
     // 统一接口: 处理DetectorFrame中的所有RawData
     bool Process(DetectorFrame& frame) override;
 
-    // 保留旧接口以保证兼容性
     StripHit ProcessWaveform(const RawData& rawData);
 
    private:
@@ -48,6 +47,7 @@ class WaveformProcessor : public IAlgorithm {
     // 私有处理方法
     StripHit processWaveformDefault(const RawData& rawData);
     StripHit processWaveformLeadingEdgeFit(const RawData& rawData);
+    StripHit processWaveformMode1(const RawData& rawData);
 };
 
 #endif  // WAVEFORM_PROCESSOR_H

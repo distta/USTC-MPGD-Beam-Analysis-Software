@@ -113,7 +113,7 @@ StripHit WaveformProcessor::processWaveformLeadingEdgeFit(const RawData& rawData
         fitTime = riseFunc.GetX(targetY, fitStart, fitEnd);
     }
 
-    if (fitTime < 2 || fitTime > 16)
+    if (fitTime < 0 || fitTime > 16)
         stripData.isValid = false;
 
     // 5. 计算拟合时间
@@ -238,4 +238,7 @@ StripHit WaveformProcessor::processWaveformDefault(const RawData& rawData) {
     stripData.isSaturated = (peakAmp > m_config.saturationLevel);
 
     return stripData;
+}
+
+StripHit WaveformProcessor::processWaveformMode1(const RawData& rawData) {
 }

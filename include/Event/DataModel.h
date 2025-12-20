@@ -33,7 +33,7 @@ struct StripHit {
 };
 
 struct Cluster {
-    int type;  // 属于X/Y/U/V 哪个方向
+    int type;                          // 属于X/Y/U/V 哪个方向
     std::vector<int> stripHitIndices;  // StripHit在DetectorFrame::m_stripHits中的全局索引
 
     // ---- 聚类整体量 ----
@@ -66,4 +66,5 @@ struct Event {
     int eventID;
     std::map<int, std::shared_ptr<DetectorFrame>> detectorFramesMap;
     Track track;
+    double t0;
 };

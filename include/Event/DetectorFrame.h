@@ -15,6 +15,7 @@ class DetectorFrame {
     void SetRawData(const std::vector<RawData>& raw) { m_raw = raw; }
     void AddRawData(const RawData& raw) { m_raw.push_back(raw); }
 
+    double GetT0() const { return t0; }
     const std::vector<RawData>& Raw() const { return m_raw; }
     const std::vector<StripHit>& StripHits() const { return m_stripHits; }
     const std::vector<Cluster>& Clusters() const { return m_clusters; }
@@ -55,6 +56,7 @@ class DetectorFrame {
         return &m_raw[sh.rawIndices];
     }
 
+    bool Process(double t0);
     bool Process();
 
     // Extract StripHit Info from raw Data
@@ -78,6 +80,7 @@ class DetectorFrame {
     const Detector& det() const { return m_det; }
 
    private:
+    double t0;
     //   Raw Level (from DAQ)
     std::vector<RawData> m_raw;
 

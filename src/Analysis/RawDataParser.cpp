@@ -102,6 +102,15 @@ std::tuple<int, int, int> RawDataParser::MapBoardChannel(unsigned int boardID, u
     int stripID = static_cast<int>(mm_strip);
 
     // 1726
+    // if (boardID == 12)
+    //     stripID = channelID + 1;
+    // else if (boardID == 13)
+    //     stripID = 129 + channelID;
+    // else if (boardID == 14)
+    //     stripID = 256 - channelID;
+    // else if (boardID == 15)
+    //     stripID = 128 - channelID;
+
     if (boardID == 12)
         stripID = channelID + 1;
     else if (boardID == 13)
@@ -111,75 +120,18 @@ std::tuple<int, int, int> RawDataParser::MapBoardChannel(unsigned int boardID, u
     else if (boardID == 15)
         stripID = 128 - channelID;
 
-    // 1774配置的特殊映射
-    // if (boardID == 12)
-    //     stripID = 384 - channelID;
-    // else if (boardID == 13)
-    //     stripID = 128 - channelID;
-    // else if (boardID == 14)
-    //     stripID = 129 + channelID;
-    // else if (boardID == 15)
-    //     stripID = 385 + channelID;
-
-    // 1813
-    // if (boardID == 12)
-    //     stripID = 384 - channelID;
-    // else if (boardID == 13)
-    //     stripID = 128 - channelID;
-    // else if (boardID == 14)
-    //     stripID = 384 - channelID;
-    // else if (boardID == 15)
-    //     stripID = 128 - channelID;
-
-    // 1934
-    // if (boardID == 12)
-    //     stripID = 256 - channelID;
-    // else if (boardID == 13)
-    //     stripID = 128 - channelID;
-    // else if (boardID == 14)
-    //     stripID = 256 - channelID;
-    // else if (boardID == 15)
-    //     stripID = 128 - channelID;
-
-    // 1741
-    // if (boardID == 12)
-    //     stripID = 256 - channelID;
-    // else if (boardID == 13)
-    //     stripID = 128 - channelID;
-    // else if (boardID == 14)
-    //     stripID = 1 + channelID;
-    // else if (boardID == 15)
-    //     stripID = 129 + channelID;
-
-    // 1754
-    if (boardID == 12)
-        stripID = 256 - channelID;
-    else if (boardID == 13)
-        stripID = 128 - channelID;
-    else if (boardID == 14)
-        stripID = 256 - channelID;
-    else if (boardID == 15)
-        stripID = 128 - channelID;
-
-    // 1942
-    // if (boardID == 12)
-    //     stripID = 129 + channelID;
-    // else if (boardID == 13)
-    //     stripID = 385 + channelID;
-    // else if (boardID == 14)
-    //     stripID = 384 - channelID;
-    // else if (boardID == 15)
-    //     stripID = 128 - channelID;
-
-    // 1959
-    // if (boardID == 12)
-    //     stripID = channelID;
-    // else if (boardID == 13)
-    //     stripID = 128 + channelID;
-    // else if (boardID == 14)
-    //     stripID = 256 - channelID;
-    // else if (boardID == 15)
-    //     stripID = 128 - channelID;
+    // 1978
+    // if (boardID == 14) {
+    //     if (channelID % 2 == 0)
+    //         stripID = channelID + 2;
+    //     else
+    //         stripID = channelID;
+    // } else if (boardID == 15) {
+    //     if (channelID % 2 == 0)
+    //         stripID = 130 + channelID;
+    //     else
+    //         stripID = 128 + channelID;
+    // }
 
     return {detID, stripID, type};
 }

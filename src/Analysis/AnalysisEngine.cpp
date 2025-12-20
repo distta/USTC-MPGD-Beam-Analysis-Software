@@ -108,7 +108,7 @@ std::pair<double, double> GetRange(const std::vector<double>& v) {
 
 double DUTStatistics::CalculateMean(const std::vector<double>& values) {
     if (values.empty()) return 0.0;
-    
+
     double sum = 0.0;
     for (double val : values) {
         sum += val;
@@ -118,7 +118,7 @@ double DUTStatistics::CalculateMean(const std::vector<double>& values) {
 
 double DUTStatistics::CalculateRMS(const std::vector<double>& values) {
     if (values.empty()) return 0.0;
-    
+
     double mean = CalculateMean(values);
     double sumSq = 0.0;
     for (double val : values) {
@@ -129,31 +129,31 @@ double DUTStatistics::CalculateRMS(const std::vector<double>& values) {
 
 std::pair<int, int> DUTStatistics::GetBinIndices(double predX, double predY) const {
     const auto& binning = m_config.binning;
-    
-    if (predX < binning.predX_min || predX > binning.predX_max || 
+
+    if (predX < binning.predX_min || predX > binning.predX_max ||
         predY < binning.predY_min || predY > binning.predY_max) {
         return {-1, -1};
     }
-    
-    int binX = static_cast<int>((predX - binning.predX_min) / 
-                                 (binning.predX_max - binning.predX_min) * binning.nBinsX);
-    int binY = static_cast<int>((predY - binning.predY_min) / 
-                                 (binning.predY_max - binning.predY_min) * binning.nBinsY);
-    
+
+    int binX = static_cast<int>((predX - binning.predX_min) /
+                                (binning.predX_max - binning.predX_min) * binning.nBinsX);
+    int binY = static_cast<int>((predY - binning.predY_min) /
+                                (binning.predY_max - binning.predY_min) * binning.nBinsY);
+
     // 处理边界情况
     if (binX >= binning.nBinsX) binX = binning.nBinsX - 1;
     if (binY >= binning.nBinsY) binY = binning.nBinsY - 1;
-    
+
     return {binX, binY};
 }
 
-void DUTStatistics::AddBinData(int dutID, int binX, int binY, 
-                                bool hasValidHit, double resX, double resY) {
+void DUTStatistics::AddBinData(int dutID, int binX, int binY,
+                               bool hasValidHit, double resX, double resY) {
     if (binX < 0 || binY < 0) return;
-    
+
     auto& binData = m_binDataMap[dutID][{binX, binY}];
     binData.totalEvents++;
-    
+
     if (hasValidHit) {
         binData.hitEvents++;
         binData.resX_values.push_back(resX);
@@ -259,7 +259,7 @@ void AnalysisEngine::RunTrackAnalysis() {
 
             detEvt->SetRawData(rawHits[det->GetID()]);
 
-            if (!detEvt->Process()) {
+            if (!detEvt->Process(evt.t0)) {
                 validEvent = false;
                 break;
             }
@@ -334,8 +334,8 @@ void AnalysisEngine::RunTrackAnalysis() {
             clusters = detFrame->Clusters();
             const LocalHit& localHit = detFrame->LocalHits()[hitIdx];
 
-            for(auto cluster:clusters)
-             t0Vec.push_back(cluster.time);
+            for (auto cluster : clusters)
+                t0Vec.push_back(cluster.time);
 
             auto detector = factory.GetDetector(tid);
             TVector3 predG = detector->CalcHitFromTrack(bestTrack);
@@ -403,8 +403,10 @@ void AnalysisEngine::RunDUTAnalysis() {
 
     Int_t eventID;
     Track* track = nullptr;
+    double sigTime;
     trackTree->SetBranchAddress("eventID", &eventID);
     trackTree->SetBranchAddress("track", &track);
+    trackTree->SetBranchAddress("t0", &sigTime);
 
     cout << "\nProcessing DUT data..." << endl;
     m_events.clear();
@@ -420,14 +422,14 @@ void AnalysisEngine::RunDUTAnalysis() {
         auto rawHits = m_parser->LoadEvent(eventID);
         if (rawHits.empty()) continue;
 
-        Event evt{.eventID = int(eventID), .track = *track};
+        Event evt{.eventID = int(eventID), .track = *track, .t0 = sigTime};
 
         for (auto& det : duts) {
             const int id = det->GetID();
             auto detEvt = std::make_shared<DetectorFrame>(*det);
             detEvt->SetRawData(rawHits[det->GetID()]);
 
-            detEvt->Process();
+            detEvt->Process(evt.t0);
 
             evt.detectorFramesMap[id] = std::move(detEvt);
         }
@@ -461,7 +463,7 @@ void AnalysisEngine::RunDUTAnalysis() {
     std::vector<Int_t> clusterIndices;
     std::vector<StripHit> stripHits;
     std::vector<Cluster> clusters;
-    
+
     // 定义新增分支
     Int_t hitFlag;
     Cluster clusterX, clusterY;
@@ -479,13 +481,19 @@ void AnalysisEngine::RunDUTAnalysis() {
     tDut->Branch("clusterIndices", &clusterIndices);
     tDut->Branch("stripHits", &stripHits);
     tDut->Branch("clusters", &clusters);
-    
+
     // 注册新增分支
     tDut->Branch("hitFlag", &hitFlag);
     tDut->Branch("clusterX", &clusterX);
     tDut->Branch("clusterY", &clusterY);
     tDut->Branch("stripHitsX", &stripHitsX);
     tDut->Branch("stripHitsY", &stripHitsY);
+
+    TH2D cor("cor", "Correlation;X;Y", 100, -2, 2, 100, -100, 100);
+
+    TH1D resYHisto("resYHisto", "Residual Y;Residual Y;Counts", 100, -0.3, 0.3);
+    vector<double> resYValues;
+    double nevt = 0;
 
     for (auto& det : duts) {
         int id = det->GetID();
@@ -497,12 +505,15 @@ void AnalysisEngine::RunDUTAnalysis() {
             TVector3 predL = det->GlobalToLocal(predG);
             predX = predL.X();
             predY = predL.Y();
+            // if (predY < 55 || predY > 80 || predX < -30 || predX > -15) continue;
+            // if (predY < 60 || predY > 80 || predX < 30 || predX > 50) continue;
 
-            if (!analysisConfig.IsInValidRange(predX, predY)) continue;
+            nevt++;
+            // if (!analysisConfig.IsInValidRange(predX, predY)) continue;
 
             // 获取bin索引
             auto [binX, binY] = statistics.GetBinIndices(predX, predY);
-            
+
             auto frameIt = evt.detectorFramesMap.find(id);
             if (frameIt != evt.detectorFramesMap.end()) {
                 const auto& detFrame = frameIt->second;
@@ -515,26 +526,35 @@ void AnalysisEngine::RunDUTAnalysis() {
                     // 复用CalcuDutResidual查找最佳匹配cluster并计算残差
                     LocalHit localHit = CalcuDutResidual(det, clusters, predL, resX, resY);
                     const auto& clusterIdx = localHit.clusterIndices;
-                    
+
                     // 提取clusterX和clusterY
                     int idxX = clusterIdx[0];
                     int idxY = clusterIdx[1];
-                    
+
                     clusterX = (idxX >= 0) ? clusters[idxX] : CreateInvalidCluster(DUTAnalysisConfig::kTypeX);
                     clusterY = (idxY >= 0) ? clusters[idxY] : CreateInvalidCluster(DUTAnalysisConfig::kTypeY);
-                    
+
                     // 计算hitX和hitY
                     hitX = localHit.localPos.X();
                     hitY = localHit.localPos.Y();
-                    
+
                     // 设置hitFlag
                     bool hasX = (idxX >= 0);
                     bool hasY = (idxY >= 0);
-                    if (hasX && hasY) hitFlag = 3;
-                    else if (hasX) hitFlag = 1;
-                    else if (hasY) hitFlag = 2;
-                    else hitFlag = 0;
-                    
+                    if (hasX && hasY)
+                        hitFlag = 3;
+                    else if (hasX)
+                        hitFlag = 1;
+                    else if (hasY)
+                        hitFlag = 2;
+                    else
+                        hitFlag = 0;
+
+                    if (hitFlag == 3) {
+                        resYHisto.Fill(resY);
+                        resYValues.push_back(resY);
+                    }
+
                     // 提取stripHitsX
                     stripHitsX.clear();
                     if (hasX) {
@@ -544,24 +564,25 @@ void AnalysisEngine::RunDUTAnalysis() {
                             }
                         }
                     }
-                    
+
                     // 提取stripHitsY
                     stripHitsY.clear();
                     if (hasY) {
                         for (int idx : clusterY.stripHitIndices) {
                             if (idx >= 0 && idx < static_cast<int>(stripHits.size())) {
                                 stripHitsY.push_back(stripHits[idx]);
+                                cor.Fill(stripHits[idx].ID * 0.4 - hitY, (2.5 + (stripHits[idx].ID * 0.4 - hitY) / tan(20. / 180 * TMath::Pi())) / 0.021 - stripHits[idx].time);
                             }
                         }
                     }
-                    
+
                     // 填充clusterIndices（兼容性）
                     clusterIndices = {idxX, idxY};
-                    
+
                     // 累积分区统计（不进行5sigma筛选，直接收集残差）
                     bool hasValidHit = hasX && hasY;  // 仅判断是否有X和Y cluster
                     statistics.AddBinData(dutID, binX, binY, hasValidHit, resX, resY);
-                    
+
                 } else {
                     // 无cluster时设置默认值
                     clusterX = CreateInvalidCluster(DUTAnalysisConfig::kTypeX);
@@ -573,7 +594,7 @@ void AnalysisEngine::RunDUTAnalysis() {
                     resX = resY = 0;
                     clusterIndices = {-1, -1};
                     hitFlag = 0;
-                    
+
                     // 累积总事件数
                     statistics.AddBinData(dutID, binX, binY, false, 0, 0);
                 }
@@ -597,17 +618,55 @@ void AnalysisEngine::RunDUTAnalysis() {
     }
 
     tDut->Write();
-    
+    cor.Fit("pol3");
+    cor.Write();
+
+    resYHisto.Fit("gaus", "Q");
+    resYHisto.Write();
+    double resYMean = resYHisto.GetFunction("gaus")->GetParameter(1);
+    double resYSigma = resYHisto.GetFunction("gaus")->GetParameter(2);
+    cout << "Residual Y Mean: " << resYMean << ", Sigma: " << resYSigma << endl;
+
+    TF1* dogaus = new TF1("dogaus", "gaus(0)+gaus(3)", -1, 1);
+    dogaus->SetParameters(resYHisto.GetFunction("gaus")->GetParameter(0),
+                          resYMean,
+                          resYSigma,
+                          resYHisto.GetFunction("gaus")->GetParameter(0) / 50,
+                          resYMean,
+                          resYSigma * 4);
+    resYHisto.Fit(dogaus, "Q");
+    resYHisto.Write();
+    cout << "Double Gaussian Fit Parameters:" << endl;
+    cout << "  Narrow Mean: " << dogaus->GetParameter(1) << ", Sigma: " << dogaus->GetParameter(2) << endl;
+    cout << "  Wide Mean: " << dogaus->GetParameter(4) << ", Sigma: " << dogaus->GetParameter(5) << endl;
+    double f1 = dogaus->GetParameter(0);
+    double f2 = dogaus->GetParameter(3);
+    cout << sqrt(f1 / (f1 + f2) * dogaus->GetParameter(2) * dogaus->GetParameter(2) + f2 / (f1 + f2) * dogaus->GetParameter(5) * dogaus->GetParameter(5)) << endl;
+
+    double resYSigma_core = dogaus->GetParameter(2);
+    double resYSigma_tail = dogaus->GetParameter(5);
+    double n_core = 0;
+    double n_tail = 0;
+    for (double resY : resYValues) {
+        if (std::abs(resY - resYMean) < 3 * resYSigma_core) {
+            n_core++;
+        }
+        if (std::abs(resY - resYMean) < 3 * resYSigma_tail) {
+            n_tail++;
+        }
+    }
+    cout << "Core Efficiency : " << n_core / nevt << " Tail Efficiency : " << n_tail / nevt << endl;
+
     // ======== 创建EfficiencyTree ========
     cout << "\nCalculating efficiency statistics..." << endl;
     TTree* tEff = new TTree("EfficiencyTree", "Efficiency data");
-    
+
     const auto& binning = analysisConfig.binning;
     Int_t eff_dutID, eff_binX, eff_binY;
     Double_t eff_predX_center, eff_predY_center;
     Int_t eff_totalEvents, eff_hitEvents;
     Double_t efficiency, efficiency_error;
-    
+
     tEff->Branch("dutID", &eff_dutID);
     tEff->Branch("binX", &eff_binX);
     tEff->Branch("binY", &eff_binY);
@@ -617,18 +676,18 @@ void AnalysisEngine::RunDUTAnalysis() {
     tEff->Branch("hitEvents", &eff_hitEvents);
     tEff->Branch("efficiency", &efficiency);
     tEff->Branch("efficiency_error", &efficiency_error);
-    
-    TH2D* hEff2D = new TH2D("Efficiency2D", "2D Efficiency;predX (mm);predY (mm);Efficiency", 
-                             binning.nBinsX, binning.predX_min, binning.predX_max, 
-                             binning.nBinsY, binning.predY_min, binning.predY_max);
+
+    TH2D* hEff2D = new TH2D("Efficiency2D", "2D Efficiency;predX (mm);predY (mm);Efficiency",
+                            binning.nBinsX, binning.predX_min, binning.predX_max,
+                            binning.nBinsY, binning.predY_min, binning.predY_max);
     TH2D* hEvents2D = new TH2D("Events2D", "2D Events;predX (mm);predY (mm);Events",
                                binning.nBinsX, binning.predX_min, binning.predX_max,
                                binning.nBinsY, binning.predY_min, binning.predY_max);
-    
+
     const auto& binDataMap = statistics.GetBinDataMap();
     double binWidthX = (binning.predX_max - binning.predX_min) / binning.nBinsX;
     double binWidthY = (binning.predY_max - binning.predY_min) / binning.nBinsY;
-    
+
     struct BinQuality {
         int dutID, binX, binY;
         int events;
@@ -636,7 +695,7 @@ void AnalysisEngine::RunDUTAnalysis() {
         double score;
     };
     std::vector<BinQuality> qualityList;
-    
+
     for (const auto& [dutID_key, binMap] : binDataMap) {
         for (const auto& [binPair, binData] : binMap) {
             eff_dutID = dutID_key;
@@ -645,32 +704,32 @@ void AnalysisEngine::RunDUTAnalysis() {
             eff_totalEvents = binData.totalEvents;
             eff_predX_center = binning.predX_min + (eff_binX + 0.5) * binWidthX;
             eff_predY_center = binning.predY_min + (eff_binY + 0.5) * binWidthY;
-            
+
             eff_hitEvents = 0;
             double resolutionXY = 0;
             if (!binData.resX_values.empty()) {
                 auto [xMin, xMax] = GetRange(binData.resX_values);
                 auto [yMin, yMax] = GetRange(binData.resY_values);
-                
+
                 TH1D hTempX("hTempX", "", 100, xMin, xMax);
                 TH1D hTempY("hTempY", "", 100, yMin, yMax);
                 for (double val : binData.resX_values) hTempX.Fill(val);
                 for (double val : binData.resY_values) hTempY.Fill(val);
-                
+
                 hTempX.Fit("gaus", "Q0");
                 hTempY.Fit("gaus", "Q0");
                 TF1* fitX = hTempX.GetFunction("gaus");
                 TF1* fitY = hTempY.GetFunction("gaus");
-                
+
                 double meanX = fitX ? fitX->GetParameter(1) : (xMin + xMax) / 2;
                 double sigmaX = fitX ? fitX->GetParameter(2) : (xMax - xMin) / 10;
                 double meanY = fitY ? fitY->GetParameter(1) : (yMin + yMax) / 2;
                 double sigmaY = fitY ? fitY->GetParameter(2) : (yMax - yMin) / 10;
-                
+
                 double cutX = DUTAnalysisConfig::kSigmaFactor * sigmaX;
                 double cutY = DUTAnalysisConfig::kSigmaFactor * sigmaY;
                 resolutionXY = std::sqrt(sigmaX * sigmaX + sigmaY * sigmaY);
-                
+
                 for (size_t i = 0; i < binData.resX_values.size(); ++i) {
                     double resX = binData.resX_values[i], resY = binData.resY_values[i];
                     if (std::abs(resX - meanX) < cutX && std::abs(resY - meanY) < cutY) eff_hitEvents++;
@@ -678,66 +737,63 @@ void AnalysisEngine::RunDUTAnalysis() {
             } else {
                 eff_hitEvents = binData.hitEvents;
             }
-            
+
             efficiency = eff_totalEvents > 0 ? static_cast<double>(eff_hitEvents) / eff_totalEvents : 0;
             efficiency_error = eff_totalEvents > 0 ? std::sqrt(efficiency * (1 - efficiency) / eff_totalEvents) : 0;
-            
+
             tEff->Fill();
             hEff2D->SetBinContent(eff_binX + 1, eff_binY + 1, efficiency);
             hEvents2D->SetBinContent(eff_binX + 1, eff_binY + 1, eff_totalEvents);
-            
-            if (eff_totalEvents > 50 && efficiency > 0.8 && resolutionXY > 0 && resolutionXY < 0.5) {
+
+            if (eff_totalEvents > 1000) {
                 double score = eff_totalEvents * efficiency / resolutionXY;
                 qualityList.push_back({eff_dutID, eff_binX, eff_binY, eff_totalEvents, efficiency, resolutionXY, score});
             }
         }
     }
-    
-    std::sort(qualityList.begin(), qualityList.end(), 
+
+    std::sort(qualityList.begin(), qualityList.end(),
               [](const BinQuality& a, const BinQuality& b) { return a.score > b.score; });
-    
-    int nOutput = std::min(10, (int)qualityList.size());
-    cout << "Saving " << nOutput << " best residual histograms..." << endl;
-    
-    for (int i = 0; i < nOutput; ++i) {
+
+    for (int i = 0; i < qualityList.size(); ++i) {
         const auto& bq = qualityList[i];
         auto it1 = binDataMap.find(bq.dutID);
         if (it1 == binDataMap.end()) continue;
         auto it2 = it1->second.find({bq.binX, bq.binY});
         if (it2 == it1->second.end()) continue;
-        
+
         const auto& binData = it2->second;
         auto [xMin, xMax] = GetRange(binData.resX_values);
         auto [yMin, yMax] = GetRange(binData.resY_values);
-        
+
         TH1D hResX(Form("Residual_DUT%d_X_Bin%02d%02d", bq.dutID, bq.binX, bq.binY),
-                  Form("DUT%d Bin[%d,%d] ResX (Evt=%d Eff=%.2f);Residual X (mm);Entries", 
-                       bq.dutID, bq.binX, bq.binY, bq.events, bq.efficiency),
-                  100, xMin, xMax);
+                   Form("DUT%d Bin[%d,%d] ResX (Evt=%d Eff=%.2f);Residual X (mm);Entries",
+                        bq.dutID, bq.binX, bq.binY, bq.events, bq.efficiency),
+                   100, xMin, xMax);
         TH1D hResY(Form("Residual_DUT%d_Y_Bin%02d%02d", bq.dutID, bq.binX, bq.binY),
-                  Form("DUT%d Bin[%d,%d] ResY (Evt=%d Eff=%.2f);Residual Y (mm);Entries",
-                       bq.dutID, bq.binX, bq.binY, bq.events, bq.efficiency),
-                  100, yMin, yMax);
-        
+                   Form("DUT%d Bin[%d,%d] ResY (Evt=%d Eff=%.2f);Residual Y (mm);Entries",
+                        bq.dutID, bq.binX, bq.binY, bq.events, bq.efficiency),
+                   100, yMin, yMax);
+
         for (double val : binData.resX_values) hResX.Fill(val);
         for (double val : binData.resY_values) hResY.Fill(val);
-        
+
         hResX.Fit("gaus", "Q");
         hResY.Fit("gaus", "Q");
-        
+
         hResX.Write();
         hResY.Write();
     }
-    
+
     tEff->Write();
     hEff2D->Write();
     hEvents2D->Write();
-    
+
     cout << "Calculating resolution statistics..." << endl;
     TTree* tRes = new TTree("ResolutionTree", "Resolution data");
     Int_t res_dutID, res_binX, res_binY, res_nHits;
     Double_t res_predX_center, res_predY_center, resX_mean, resX_RMS, resY_mean, resY_RMS;
-    
+
     tRes->Branch("dutID", &res_dutID);
     tRes->Branch("binX", &res_binX);
     tRes->Branch("binY", &res_binY);
@@ -748,53 +804,53 @@ void AnalysisEngine::RunDUTAnalysis() {
     tRes->Branch("resX_RMS", &resX_RMS);
     tRes->Branch("resY_mean", &resY_mean);
     tRes->Branch("resY_RMS", &resY_RMS);
-    
+
     TH2D* hResX2D = new TH2D("ResolutionX2D", "X Resolution 2D;predX (mm);predY (mm);Resolution (mm)",
                              binning.nBinsX, binning.predX_min, binning.predX_max,
                              binning.nBinsY, binning.predY_min, binning.predY_max);
     TH2D* hResY2D = new TH2D("ResolutionY2D", "Y Resolution 2D;predX (mm);predY (mm);Resolution (mm)",
                              binning.nBinsX, binning.predX_min, binning.predX_max,
                              binning.nBinsY, binning.predY_min, binning.predY_max);
-    
+
     for (const auto& [dutID_key, binMap] : binDataMap) {
         for (const auto& [binPair, binData] : binMap) {
             if (binData.resX_values.empty()) continue;
-            
+
             res_dutID = dutID_key;
             res_binX = binPair.first;
             res_binY = binPair.second;
             res_nHits = binData.resX_values.size();
             res_predX_center = binning.predX_min + (res_binX + 0.5) * binWidthX;
             res_predY_center = binning.predY_min + (res_binY + 0.5) * binWidthY;
-            
+
             auto [xMin, xMax] = GetRange(binData.resX_values);
             auto [yMin, yMax] = GetRange(binData.resY_values);
-            
+
             TH1D hTempX("hTempX", "", 100, xMin, xMax);
             TH1D hTempY("hTempY", "", 100, yMin, yMax);
             for (double val : binData.resX_values) hTempX.Fill(val);
             for (double val : binData.resY_values) hTempY.Fill(val);
-            
+
             hTempX.Fit("gaus", "Q0");
             hTempY.Fit("gaus", "Q0");
             TF1* fitX = hTempX.GetFunction("gaus");
             TF1* fitY = hTempY.GetFunction("gaus");
-            
+
             resX_mean = fitX ? fitX->GetParameter(1) : (xMin + xMax) / 2;
             resX_RMS = fitX ? fitX->GetParameter(2) : (xMax - xMin) / 10;
             resY_mean = fitY ? fitY->GetParameter(1) : (yMin + yMax) / 2;
             resY_RMS = fitY ? fitY->GetParameter(2) : (yMax - yMin) / 10;
-            
+
             tRes->Fill();
             hResX2D->SetBinContent(res_binX + 1, res_binY + 1, resX_RMS);
             hResY2D->SetBinContent(res_binX + 1, res_binY + 1, resY_RMS);
         }
     }
-    
+
     tRes->Write();
     hResX2D->Write();
     hResY2D->Write();
-    
+
     fDut->Close();
     delete fDut;
 
@@ -903,39 +959,38 @@ LocalHit AnalysisEngine::CalcuDutResidual(std::shared_ptr<Detector> detector, co
     const auto& config = detector->getConfig();
     const int typeX = DUTAnalysisConfig::kTypeX;
     const int typeY = DUTAnalysisConfig::kTypeY;
-    
-    // 从配置读取pitch值
-    double pitchX = config.readoutPlanePitch.at(typeX);
-    double pitchY = config.readoutPlanePitch.at(typeY);
 
     // X方向处理：找到最优cluster
     int bestClusterXIndex = -1;
     double minResX = std::numeric_limits<double>::infinity();
     double bestPosX = DUTAnalysisConfig::kInvalidValue;
-
-    for (size_t i = 0; i < clusters.size(); ++i) {
-        if (clusters[i].type == typeX) {
-            double currentResX = std::abs(clusters[i].pos * pitchX - predX);
-            if (currentResX < minResX) {
-                minResX = currentResX;
-                bestClusterXIndex = static_cast<int>(i);
-                bestPosX = clusters[i].pos * pitchX;
+    if (config.readoutPlanePitch.find(typeX) != config.readoutPlanePitch.end()) {
+        double pitchX = config.readoutPlanePitch.at(typeX);
+        for (size_t i = 0; i < clusters.size(); ++i) {
+            if (clusters[i].type == typeX) {
+                double currentResX = std::abs(clusters[i].pos * pitchX - predX);
+                if (currentResX < minResX) {
+                    minResX = currentResX;
+                    bestClusterXIndex = static_cast<int>(i);
+                    bestPosX = clusters[i].pos * pitchX;
+                }
             }
         }
     }
 
-    // Y方向处理：找到最优cluster
     int bestClusterYIndex = -1;
     double minResY = std::numeric_limits<double>::infinity();
     double bestPosY = DUTAnalysisConfig::kInvalidValue;
-
-    for (size_t i = 0; i < clusters.size(); ++i) {
-        if (clusters[i].type == typeY) {
-            double currentResY = std::abs(clusters[i].pos * pitchY - predY);
-            if (currentResY < minResY) {
-                minResY = currentResY;
-                bestClusterYIndex = static_cast<int>(i);
-                bestPosY = clusters[i].pos * pitchY;
+    if (config.readoutPlanePitch.find(typeY) != config.readoutPlanePitch.end()) {
+        double pitchY = config.readoutPlanePitch.at(typeY);
+        for (size_t i = 0; i < clusters.size(); ++i) {
+            if (clusters[i].type == typeY) {
+                double currentResY = std::abs(clusters[i].pos * pitchY - predY);
+                if (currentResY < minResY) {
+                    minResY = currentResY;
+                    bestClusterYIndex = static_cast<int>(i);
+                    bestPosY = clusters[i].pos * pitchY;
+                }
             }
         }
     }
@@ -991,6 +1046,10 @@ double AnalysisEngine::DUTChi2Objective(const double* par, const std::vector<Eve
         const auto& clusters = frameIt->second->Clusters();
         TVector3 predG = detector->CalcHitFromTrack(evt.track);
         TVector3 predL = detector->GlobalToLocal(predG);
+
+        double predX = predL.X();
+        double predY = predL.Y();
+        // if (predY < 55 || predY > 80 || predX < -30 || predX > -15) continue;
         // 调用新的CalcuDutResidual方法
         LocalHit localHit = CalcuDutResidual(detector, clusters, predL, residualX, residualY);
 

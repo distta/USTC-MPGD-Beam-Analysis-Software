@@ -18,18 +18,14 @@ bool ClusterReconstructor::Process(DetectorFrame& frame) {
 
     // 遍历每个Cluster，调用内部重建逻辑更新pos字段
     for (auto& cluster : clusters) {
-        ReconstructPosition(cluster, stripHits);
+        if (m_config.method == ReconstructionMethod::UTPC) {
+            reconstructUTPC(cluster, stripHits, 0);
+        } else {
+            reconstructChargeWeighted(cluster, stripHits);
+        }
     }
 
     return true;
-}
-
-void ClusterReconstructor::ReconstructPosition(Cluster& cluster, const std::vector<StripHit>& stripHits) {
-    if (m_config.method == ReconstructionMethod::UTPC) {
-        reconstructUTPC(cluster, stripHits);
-    } else {
-        reconstructChargeWeighted(cluster, stripHits);
-    }
 }
 
 void ClusterReconstructor::reconstructChargeWeighted(Cluster& cluster, const std::vector<StripHit>& stripHits) {
@@ -57,7 +53,7 @@ void ClusterReconstructor::reconstructChargeWeighted(Cluster& cluster, const std
     }
 }
 
-void ClusterReconstructor::reconstructUTPC(Cluster& cluster, const std::vector<StripHit>& stripHits) {
+void ClusterReconstructor::reconstructUTPC(Cluster& cluster, const std::vector<StripHit>& stripHits, double t0) {
     if (cluster.stripHitIndices.empty()) {
         cluster.pos = 0.0;
         return;
@@ -91,10 +87,11 @@ void ClusterReconstructor::reconstructUTPC(Cluster& cluster, const std::vector<S
     double gasGap = 5;
 
     static TF1 disCorFunc = TF1("fitFunc", "pol3", -2, 2);
-    disCorFunc.SetParameters(82.6668, -8.664, 7.29361, -21.4624);
+    disCorFunc.SetParameters(13.1876, 28.8876, -10.1506, 19.22);
 
-    static TF1 chCorFunc = TF1("chFitFunc", "pol5", 0, 1000);
-    chCorFunc.SetParameters(4.27534, -0.115551, 0.000690723, -1.56102e-06, 1.56769e-09, -5.79673e-13);
+    static TF1 TACorFun("TACorFun", "[0]+[1]/TMath::Power(x-[2],[3])", 0, 30);
+    TACorFun.SetParameters(0, 10.31123357358735, -1.971738638688841e-8, 1);
+
     // ccRecPos -= 5 * tan(lorentzAngle) * 0.5;
 
     std::vector<StripHit> modifiedStrips;
@@ -103,11 +100,11 @@ void ClusterReconstructor::reconstructUTPC(Cluster& cluster, const std::vector<S
         modifiedStrips.push_back(stripHits[idx]);
     }
 
-    // for (auto& strip : modifiedStrips) {
-    //     double disCor = disCorFunc.Eval((strip.ID - ccRecPos) * 0.4);
-    //     double chCor = strip.amp > 1000 ? chCorFunc.Eval(1000) : chCorFunc.Eval(strip.amp);
-    //     strip.time = strip.time - disCor - chCor;
-    // }
+    for (auto& strip : modifiedStrips) {
+        double dis = (strip.ID - ccRecPos) * 0.4;
+        double disCor = disCorFunc.Eval(dis);
+        strip.time = strip.time + disCor - t0;
+    }
 
     // ---------------------- 剔除时间骤降的坏点 ----------------------
     std::sort(modifiedStrips.begin(), modifiedStrips.end(),
@@ -146,7 +143,6 @@ void ClusterReconstructor::reconstructUTPC(Cluster& cluster, const std::vector<S
         track->SetPointError(index, 0, strip.timeError * velocity);
     }
 
-    track->AddPoint(ccRecPos, gasGap / 2);  // add CC point
     int index = track->GetN();
     track->SetPoint(index, ccRecPos, gasGap / 2);
     track->SetPointError(index, 0.3, 0);
