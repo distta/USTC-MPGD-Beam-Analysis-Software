@@ -1,7 +1,11 @@
-#include "AnalysisEngine.h"
-#include "Event/EventDisplayManager.h"  
+#include "Event/EventDisplayManager.h"
+#include "Script/Base/ScriptManager.h"
+#include <fstream>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <string>
+
+using json = nlohmann::json;
 
 void printUsage(const char* prog) {
     std::cout << "Usage: " << prog << " <run_id> [config_file]" << std::endl;
@@ -28,14 +32,19 @@ int main(int argc, char* argv[]) {
     std::string resultDir = "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/result";
 
     try {
-        AnalysisEngine engine(configFile, rawDir, resultDir, runID);
-        engine.Initialize();
+        // 创建ScriptManager，传入配置参数
+        ScriptManager scriptManager(configFile, rawDir, resultDir, runID);
+
+        // 初始化资源
+        if (!scriptManager.Initialize()) {
+            std::cerr << "Failed to initialize ScriptManager" << std::endl;
+            return 1;
+        }
 
         while (true) {
             std::cout << "\nSelect mode:" << std::endl;
-            std::cout << "  1) Track Analysis" << std::endl;
-            std::cout << "  2) DUT Analysis" << std::endl;
-            std::cout << "  3) Event Display Mode (DUT only)" << std::endl;
+            std::cout << "  1) Event Display Mode (DUT only)" << std::endl;
+            std::cout << "  2) Run Custom Scripts" << std::endl;
             std::cout << "  0) Exit" << std::endl;
             std::cout << "Choice: ";
 
@@ -50,10 +59,6 @@ int main(int argc, char* argv[]) {
             }
 
             if (choice == 1) {
-                engine.RunTrackAnalysis();
-            } else if (choice == 2) {
-                engine.RunDUTAnalysis();
-            } else if (choice == 3) {
                 std::cout << "Event Display Mode not implemented yet." << std::endl;
                 EventDisplayManager edm(rawDir, resultDir, runID);
                 if (!edm.Initialize()) {
@@ -61,6 +66,62 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
                 edm.RunInteractive();
+            } else if (choice == 2) {
+                // Run Custom Scripts
+                std::cout << "\n========================================" << std::endl;
+                std::cout << " Custom Scripts Execution" << std::endl;
+                std::cout << "========================================" << std::endl;
+
+                auto enabledScripts = scriptManager.GetEnabledScripts();
+
+                if (enabledScripts.empty()) {
+                    std::cout << "No enabled scripts found." << std::endl;
+                    continue;
+                }
+
+                // 显示可用脚本列表
+                std::cout << "\nAvailable Scripts:" << std::endl;
+                for (size_t i = 0; i < enabledScripts.size(); ++i) {
+                    const auto& script = enabledScripts[i];
+                    std::cout << "  [" << (i + 1) << "] " << script.name;
+                    if (!script.instance->GetDescription().empty()) {
+                        std::cout << " - " << script.instance->GetDescription();
+                    }
+                    std::cout << std::endl;
+                }
+                std::cout << "  [0] Return to main menu" << std::endl;
+
+                // 用户选择
+                std::cout << "\nSelect script to execute: ";
+                int scriptChoice;
+                std::cin >> scriptChoice;
+
+                if (std::cin.fail()) {
+                    std::cin.clear();
+                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                    std::cerr << "Invalid input!" << std::endl;
+                    continue;
+                }
+
+                if (scriptChoice == 0) {
+                    std::cout << "Returning to main menu..." << std::endl;
+                    continue;
+                }
+
+                if (scriptChoice < 1 || scriptChoice > static_cast<int>(enabledScripts.size())) {
+                    std::cerr << "Invalid choice!" << std::endl;
+                    continue;
+                }
+
+                // 执行选中的脚本
+                const auto& selectedScript = enabledScripts[scriptChoice - 1];
+                bool success = scriptManager.ExecuteScript(selectedScript.name);
+
+                if (success) {
+                    std::cout << "\nScript execution completed successfully." << std::endl;
+                } else {
+                    std::cerr << "\nScript execution failed." << std::endl;
+                }
             } else if (choice == 0) {
                 std::cout << "Exiting program..." << std::endl;
                 break;

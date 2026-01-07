@@ -1,7 +1,7 @@
 #pragma once
 
 #include "DataModel.h"
-#include "RawDataParser.h"
+#include "Script/Base/RawDataParser.h"
 #include "Detector/DetectorFactory.h"
 #include "TCanvas.h"
 

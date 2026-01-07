@@ -1,49 +1,226 @@
-#include "Analysis/TrackAnalysis.h"
-#include "Config.h"
-#include "DataModel.h"
+#include "Script/TrackAnalysisScript.h"
+#include "Algorithm/AnalysisUtils.h"
 #include "Detector/DetectorFactory.h"
+#include "Event/DataModel.h"
 #include "Event/DetectorFrame.h"
-
-#include <TCanvas.h>
-#include <TF1.h>
-#include <TFile.h>
-#include <TH1D.h>
+#include "Script/Base/RawDataParser.h"
+#include "Script/Base/ScriptFactory.h"
 
 #include "Math/Factory.h"
 #include "Math/Functor.h"
 #include "Math/Minimizer.h"
+#include <TF1.h>
+#include <TFile.h>
+#include <TH1D.h>
+#include <TTree.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <numeric>
 
 using namespace std;
+using AnalysisUtils::FitTrack;
+using AnalysisUtils::GetRange;
 
-// 全局辅助函数声明(在AnalysisEngine.cpp中定义)
-Track FitTrack(const vector<GlobalHit>& hits);
+void TrackAnalysisScript::LoadConfig(const json& config) {
+    m_saveValidationData = config.value("saveValidationData", true);
+    m_progressInterval = config.value("progressInterval", 10000);
+}
 
-// 辅助函数: 获取残差范围(在AnalysisEngine.cpp中定义)
-std::pair<double, double> GetRange(const std::vector<double>& v);
+void TrackAnalysisScript::Print() const {
+    cout << "TrackAnalysisScript Configuration:" << endl;
+    cout << "  Save Validation Data: " << (m_saveValidationData ? "Yes" : "No") << endl;
+    cout << "  Progress Interval: " << m_progressInterval << endl;
+}
 
-TrackAnalysis::TrackAnalysis(const string& outputDir)
-    : m_outputDir(outputDir) {
+bool TrackAnalysisScript::Execute() {
+    using Clock = chrono::high_resolution_clock;
+    auto t1 = Clock::now();
 
-    // 从DetectorFactory获取所有Tracker探测器
+    cout << "\n========================================" << endl;
+    cout << " Track Analysis Script" << endl;
+    cout << "========================================" << endl;
+
+    auto parser = GetParser();
+    if (!parser) {
+        cerr << "Error: Parser not set!" << endl;
+        return false;
+    }
+
     auto& factory = DetectorFactory::GetInstance();
-    auto trackers = factory.GetDetectorsByRole(Detector::Role::Tracker);
+    const auto trackers = factory.GetDetectorsByRole(Detector::Role::Tracker);
 
+    // 初始化m_trackerIDs
+    m_trackerIDs.clear();
     for (const auto& tracker : trackers) {
         m_trackerIDs.push_back(tracker->GetID());
     }
-
     sort(m_trackerIDs.begin(), m_trackerIDs.end());
+    cout << "[Track Analysis] Initialized with " << m_trackerIDs.size() << " trackers" << endl;
 
-    cout << "[TrackAnalysis] Initialized with " << m_trackerIDs.size() << " trackers" << endl;
+    const Long64_t total = parser->GetTotalEvents();
+    std::vector<Event> events;  // Script本地数据
+    events.reserve(total);
+
+    // Event Loop
+    cout << "\nProcessing events..." << endl;
+    for (Long64_t i = 0; i < total; ++i) {
+        if ((i % m_progressInterval) == 0 || i == total - 1) {
+            cout << "\r[Track Analysis] Processed " << (i + 1) << "/" << total << flush;
+        }
+
+        auto rawHits = parser->LoadEvent(i);
+        if (rawHits.empty())
+            continue;
+
+        Event evt{.eventID = int(i)};
+        bool validEvent = true;
+
+        for (auto& det : trackers) {
+            auto detEvt = make_shared<DetectorFrame>(*det);
+            detEvt->SetRawData(rawHits[det->GetID()]);
+
+            if (!detEvt->Process()) {
+                validEvent = false;
+                break;
+            }
+            const int id = det->GetID();
+            evt.detectorFramesMap[id] = move(detEvt);
+        }
+
+        if (validEvent)
+            events.push_back(move(evt));
+    }
+
+    cout << "\n[Track Analysis] Valid events: " << events.size() << endl;
+
+    if (events.empty()) {
+        cerr << "Error: No valid events!" << endl;
+        return false;
+    }
+
+    string trackFile = GetOutputDir() + "TrackInfo.root";
+    TFile* f = new TFile(trackFile.c_str(), "RECREATE");
+
+    // 直接调用私有方法
+    RunTrackerAlign(events, f);
+
+    f->cd();
+
+    // Track Tree
+    TTree* tTrack = new TTree("Tracks", "Track info");
+    Int_t eventID;
+    Track track;
+    double t0;
+    tTrack->Branch("eventID", &eventID);
+    tTrack->Branch("track", &track);
+    tTrack->Branch("t0", &t0);
+
+    // Validation Tree
+    TTree* tVal = nullptr;
+    Int_t detID;
+    Double_t resX, resY;
+    Double_t hitX, hitY;
+    vector<Int_t> clusterIndices;
+    vector<StripHit> stripHits;
+    vector<Cluster> clusters;
+
+    if (m_saveValidationData) {
+        tVal = new TTree("TrackerValidation", "Tracker QA");
+        tVal->Branch("eventID", &eventID);
+        tVal->Branch("detID", &detID);
+        tVal->Branch("resX", &resX);
+        tVal->Branch("resY", &resY);
+        tVal->Branch("hitX", &hitX);
+        tVal->Branch("hitY", &hitY);
+        tVal->Branch("clusterIndices", &clusterIndices);
+        tVal->Branch("stripHits", &stripHits);
+        tVal->Branch("clusters", &clusters);
+    }
+
+    int saved = 0;
+    int totalEvents = events.size();
+
+    cout << "\nSaving track data..." << endl;
+    for (Event& evt : events) {
+        vector<double> t0Vec;
+        auto [bestTrack, hitIndices, success] = FindBestTrack(evt);
+
+        if (!success)
+            continue;
+
+        if (m_saveValidationData) {
+            for (const auto& det : trackers) {
+                int tid = det->GetID();
+                detID = tid;
+
+                int hitIdx = hitIndices[tid];
+                const auto& detFrame = evt.detectorFramesMap[tid];
+
+                stripHits = detFrame->StripHits();
+                clusters = detFrame->Clusters();
+                const LocalHit& localHit = detFrame->LocalHits()[hitIdx];
+
+                for (auto cluster : clusters)
+                    t0Vec.push_back(cluster.time);
+
+                auto detector = factory.GetDetector(tid);
+                TVector3 predG = detector->CalcHitFromTrack(bestTrack);
+                TVector3 predL = detector->GlobalToLocal(predG);
+
+                hitX = localHit.localPos.X();
+                hitY = localHit.localPos.Y();
+                clusterIndices.clear();
+                clusterIndices = localHit.clusterIndices;
+
+                resX = hitX - predL.X();
+                resY = hitY - predL.Y();
+
+                tVal->Fill();
+            }
+        } else {
+            for (const auto& det : trackers) {
+                const auto& detFrame = evt.detectorFramesMap[det->GetID()];
+                for (auto cluster : detFrame->Clusters()) {
+                    t0Vec.push_back(cluster.time);
+                }
+            }
+        }
+
+        eventID = evt.eventID;
+        track = bestTrack;
+        // t0 = accumulate(t0Vec.begin(), t0Vec.end(), 0.0) / t0Vec.size();
+        t0 = t0Vec[0];
+        tTrack->Fill();
+        saved++;
+    }
+
+    tTrack->Write();
+    if (tVal) tVal->Write();
+    f->Close();
+    delete f;
+
+    cout << "[Track Analysis] Saved " << saved << " / " << totalEvents << " events" << endl;
+    cout << "Output: " << trackFile << endl;
+
+    auto t2 = Clock::now();
+    double sec = chrono::duration<double>(t2 - t1).count();
+
+    cout << "\n========================================" << endl;
+    cout << "Track Analysis Complete" << endl;
+    cout << "Time: " << fixed << setprecision(2) << sec << " seconds" << endl;
+    cout << "========================================" << endl;
+
+    return true;
 }
 
-map<int, pair<double, double>> TrackAnalysis::ComputeTrackError(const vector<Event>& events, TFile* file) {
+// ========== 从TrackAnalysis迁移的方法实现 ==========
+
+map<int, pair<double, double>> TrackAnalysisScript::ComputeTrackError(const vector<Event>& events, TFile* file) {
 
     auto& factory = DetectorFactory::GetInstance();
     map<int, vector<double>> residX, residY;
@@ -110,7 +287,7 @@ map<int, pair<double, double>> TrackAnalysis::ComputeTrackError(const vector<Eve
     return sigmas;
 }
 
-void TrackAnalysis::AlignTrackers(const vector<Event>& events) {
+void TrackAnalysisScript::AlignTrackers(const vector<Event>& events) {
     auto& factory = DetectorFactory::GetInstance();
 
     const int nParPerDet = 3;  // dx, dy, dRotZ
@@ -169,7 +346,7 @@ void TrackAnalysis::AlignTrackers(const vector<Event>& events) {
     delete minim;
 }
 
-pair<double, double> TrackAnalysis::ComputePredictionError(int targetDetID) {
+pair<double, double> TrackAnalysisScript::ComputePredictionError(int targetDetID) {
     auto& factory = DetectorFactory::GetInstance();
 
     // Seed tracker IDs
@@ -211,7 +388,7 @@ pair<double, double> TrackAnalysis::ComputePredictionError(int targetDetID) {
     return {sigmaPredX, sigmaPredY};
 }
 
-tuple<Track, map<int, int>, bool> TrackAnalysis::FindBestTrack(const Event& event) {
+tuple<Track, map<int, int>, bool> TrackAnalysisScript::FindBestTrack(const Event& event) {
     auto& factory = DetectorFactory::GetInstance();
 
     // 选择seed tracker, hit数量最小
@@ -313,7 +490,7 @@ tuple<Track, map<int, int>, bool> TrackAnalysis::FindBestTrack(const Event& even
     return {Track{}, std::map<int, int>(), false};
 }
 
-void TrackAnalysis::RunTrackerAlign(const vector<Event>& events, TFile* file) {
+void TrackAnalysisScript::RunTrackerAlign(const vector<Event>& events, TFile* file) {
     auto& factory = DetectorFactory::GetInstance();
     const auto& trackers = factory.GetDetectorsByRole(Detector::Role::Tracker);
 
@@ -455,3 +632,5 @@ void TrackAnalysis::RunTrackerAlign(const vector<Event>& events, TFile* file) {
 
     cout << "\n[Tracker Alignment] done." << endl;
 }
+
+REGISTER_SCRIPT("TrackAnalysis", TrackAnalysisScript);

@@ -30,9 +30,14 @@ set(SOURCES
     src/Algorithm/algorithms/WaveformProcessor.cpp
     src/Algorithm/algorithms/ClusterBuilder.cpp
     src/Algorithm/algorithms/ClusterReconstructor.cpp
-    src/Analysis/AnalysisEngine.cpp
-    src/Analysis/RawDataParser.cpp
-    src/Analysis/TrackAnalysis.cpp
+    src/Algorithm/AnalysisUtils.cpp
+    src/Script/Base/RawDataParser.cpp
+    src/Script/Base/ScriptFactory.cpp
+    src/Script/Base/ScriptManager.cpp
+    src/Script/ExampleScript.cpp
+    src/Script/TrackAnalysisScript.cpp
+    src/Script/DUTAnalysisScript.cpp
+    src/Script/ChannelNoiseScript.cpp
 )
 
 add_executable(BeamAnalysis ${SOURCES})
@@ -43,7 +48,7 @@ target_include_directories(BeamAnalysis PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Detector
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Event
     ${CMAKE_CURRENT_SOURCE_DIR}/include/EventDisplay
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/Analysis
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/Script
     ${ROOT_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR} 
 )

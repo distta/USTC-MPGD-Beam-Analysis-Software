@@ -100,11 +100,11 @@ void ClusterReconstructor::reconstructUTPC(Cluster& cluster, const std::vector<S
         modifiedStrips.push_back(stripHits[idx]);
     }
 
-    for (auto& strip : modifiedStrips) {
-        double dis = (strip.ID - ccRecPos) * 0.4;
-        double disCor = disCorFunc.Eval(dis);
-        strip.time = strip.time + disCor - t0;
-    }
+    // for (auto& strip : modifiedStrips) {
+    //     double dis = (strip.ID - ccRecPos) * 0.4;
+    //     double disCor = disCorFunc.Eval(dis);
+    //     strip.time = strip.time + disCor - t0;
+    // }
 
     // ---------------------- 剔除时间骤降的坏点 ----------------------
     std::sort(modifiedStrips.begin(), modifiedStrips.end(),

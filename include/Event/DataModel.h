@@ -23,6 +23,7 @@ struct StripHit {
     int peakTime;     // 峰值时间 (采样点索引)
     double time;      // 信号时间 (前沿拟合+CFD)
     double riseTime;  // 上升时间 (10%-90%)
+    double width;     // 信号宽度
 
     // ---- 误差信息 ----
     double timeError;  // 时间误差

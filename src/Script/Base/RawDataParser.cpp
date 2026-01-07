@@ -1,5 +1,5 @@
 
-#include "RawDataParser.h"
+#include "Script/Base/RawDataParser.h"
 #include "Detector/DetectorFactory.h"
 #include <array>
 #include <iostream>
@@ -101,20 +101,11 @@ std::tuple<int, int, int> RawDataParser::MapBoardChannel(unsigned int boardID, u
     int detID = (rawDataIndex / 2) + 1;
     int stripID = static_cast<int>(mm_strip);
 
-    // 1726
-    // if (boardID == 12)
-    //     stripID = channelID + 1;
-    // else if (boardID == 13)
-    //     stripID = 129 + channelID;
-    // else if (boardID == 14)
-    //     stripID = 256 - channelID;
-    // else if (boardID == 15)
-    //     stripID = 128 - channelID;
-
+    // 1884
     if (boardID == 12)
-        stripID = channelID + 1;
+        stripID = 256 - channelID;
     else if (boardID == 13)
-        stripID = 129 + channelID;
+        stripID = 128 - channelID;
     else if (boardID == 14)
         stripID = 256 - channelID;
     else if (boardID == 15)
