@@ -103,23 +103,32 @@ void EventDisplayManager::RunInteractive() {
         std::cin >> idx;
         if (idx == -1) break;
 
-        // 查找对应的TrackEntry
-        auto it = std::find_if(m_trackEntries.begin(), m_trackEntries.end(),
-                               [idx](const TrackEntry& te) { return te.eventID == idx; });
-
-        if (it == m_trackEntries.end()) {
+        std::vector<const TrackEntry*> matches;
+        for (const auto& entry : m_trackEntries)
+            if (entry.eventID == idx) matches.push_back(&entry);
+        if (matches.empty()) {
             std::cerr << "未找到 event ID " << idx << std::endl;
             continue;
         }
-
-        if (!ProcessEntry(*it)) {
-            std::cerr << "[EventDisplay] ProcessEntry 失败 for event " << it->eventID << std::endl;
+        size_t trackIndex = 0;
+        if (matches.size() > 1) {
+            std::cout << "该事件有 " << matches.size() << " 条轨迹，请选择 [0-"
+                      << matches.size() - 1 << "]: ";
+            std::cin >> trackIndex;
+            if (trackIndex >= matches.size()) {
+                std::cerr << "无效的轨迹编号" << std::endl;
+                continue;
+            }
+        }
+        const auto& selected = *matches[trackIndex];
+        if (!ProcessEntry(selected)) {
+            std::cerr << "[EventDisplay] ProcessEntry 失败 for event " << selected.eventID << std::endl;
             continue;
         }
-        std::cout << "[EventDisplay] 已生成 DUT overview for event " << it->eventID << std::endl;
+        std::cout << "[EventDisplay] 已生成 DUT overview for event " << selected.eventID << std::endl;
 
         // 波形查询循环
-        QueryWaveforms(*it);
+        QueryWaveforms(selected);
     }
 }
 
@@ -317,7 +326,7 @@ void EventDisplayManager::DrawDUTOverview(int eventID, std::shared_ptr<Detector>
         std::map<int, double> stripAmp, stripTime;
         for (const auto& sh : hits) {
             stripAmp[sh.ID] = sh.amp;
-            stripTime[sh.ID] = sh.time * TIME_SCALE;
+            stripTime[sh.ID] = (sh.time - 81) * TIME_SCALE;
         }
 
         // 幅度直方图 (左Y轴)

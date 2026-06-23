@@ -25,60 +25,58 @@ std::vector<Cluster> ClusterBuilder::BuildClusters(const std::vector<StripHit>& 
     std::vector<Cluster> clusters;
     if (stripHits.empty()) return clusters;
 
-    // 单次扫描有序的stripHits，根据type和stripID的连续性识别聚类边界
-    std::vector<int> currentGroupIndices;  // 存储当前cluster中的StripHit全局索引
-    int currentType = stripHits[0].type;
+    std::vector<int> currentGroupIndices;
+    int currentType = -1;
+    bool initialized = false;
 
     for (size_t i = 0; i < stripHits.size(); ++i) {
+
         const auto& currentHit = stripHits[i];
+
         if (!currentHit.isValid) continue;
-        // std::cout << "StripHit ID: " << currentHit.ID << ", type: " << currentHit.type << ", isValid: " << currentHit.isValid << std::endl;
-        // 检查是否需要结束当前cluster
+
+        if (!initialized) {
+            currentType = currentHit.type;
+            initialized = true;
+        }
+
         bool shouldEndCluster = false;
 
         if (!currentGroupIndices.empty()) {
+
             const auto& prevHit = stripHits[currentGroupIndices.back()];
 
-            // 条件1：type变化
             if (currentHit.type != currentType) {
                 shouldEndCluster = true;
-            }
-            // 条件2：stripID不连续（超过maxGap）
-            else if (currentHit.ID > prevHit.ID + 1 + m_config.maxGap) {
+            } else if (currentHit.ID > prevHit.ID + 1 + m_config.maxGap) {
                 shouldEndCluster = true;
             }
         }
 
         if (shouldEndCluster) {
-            // 完成当前cluster
+
             Cluster cluster;
             cluster.type = currentType;
             cluster.stripHitIndices = currentGroupIndices;
 
-            if (processCluster(cluster, stripHits)) {
+            if (processCluster(cluster, stripHits))
                 clusters.push_back(std::move(cluster));
-            }
 
-            // 开始新cluster
             currentGroupIndices.clear();
             currentType = currentHit.type;
         }
 
-        // 将当前StripHit加入聚类（只加入有效的）
-        if (currentHit.isValid) {
-            currentGroupIndices.push_back(static_cast<int>(i));
-        }
+        currentGroupIndices.push_back(i);
     }
 
-    // 处理最后一个cluster
     if (!currentGroupIndices.empty()) {
+
         Cluster cluster;
         cluster.type = currentType;
         cluster.stripHitIndices = currentGroupIndices;
 
-        if (processCluster(cluster, stripHits)) {
+        if (processCluster(cluster, stripHits))
             clusters.push_back(std::move(cluster));
-        }
     }
 
     return clusters;
@@ -109,7 +107,7 @@ bool ClusterBuilder::processCluster(Cluster& cluster, const std::vector<StripHit
     for (int idx : cluster.stripHitIndices) {
         const auto& strip = stripHits[idx];
 
-        cluster.charge += strip.charge;
+        cluster.charge += strip.amp;
         sumCharge += strip.charge;
         sumPos += strip.ID * strip.charge;  // 电荷加权位置
 

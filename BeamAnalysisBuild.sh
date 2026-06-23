@@ -7,6 +7,8 @@ set -e
 
 echo "=== BeamAnalysis 项目构建 ==="
 
+source /software/STCF/OSCAR/2.6.0/bashrc.sh
+
 # source /home/qxhuang/software/root-6.36.04/build/bin/thisroot.sh
 
 # 检查ROOT环境

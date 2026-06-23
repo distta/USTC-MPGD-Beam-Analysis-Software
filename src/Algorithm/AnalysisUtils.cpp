@@ -50,7 +50,7 @@ Track FitTrack(const vector<TVector3>& hits) {
 
 std::pair<double, double> GetRange(const std::vector<double>& v) {
     if (v.size() < 3) return std::make_pair(0.0, 1.0);
-    const double k = 5;
+    const double k = 4;
 
     // -----------------------------
     // 1st pass: raw mean / sigma

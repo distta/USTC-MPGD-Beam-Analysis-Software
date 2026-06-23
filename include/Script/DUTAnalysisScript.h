@@ -3,10 +3,14 @@
 #ifndef DUT_ANALYSIS_SCRIPT_H
 #define DUT_ANALYSIS_SCRIPT_H
 
-#include "Script/Base/IScript.h"
 #include "Event/DataModel.h"
-#include <string>
+#include "Script/Base/IScript.h"
+#include "TF1.h"
+#include "TFile.h"
+#include "TH1D.h"
+
 #include <map>
+#include <string>
 #include <vector>
 
 // DUT分析配置类（从AnalysisEngine迁移）
@@ -46,69 +50,44 @@ class DUTAnalysisConfig {
     }
 };
 
-// 分区统计数据（从AnalysisEngine迁移）
-struct BinData {
-    int totalEvents = 0;
-    int hitEvents = 0;
-    std::vector<double> resX_values;
-    std::vector<double> resY_values;
-};
-
-// DUT统计辅助类（从AnalysisEngine迁移）
-class DUTStatistics {
-   public:
-    DUTStatistics(const DUTAnalysisConfig& config) : m_config(config) {}
-
-    // 获取bin索引
-    std::pair<int, int> GetBinIndices(double predX, double predY) const;
-
-    // 添加统计数据
-    void AddBinData(int dutID, int binX, int binY,
-                    bool hasValidHit, double resX, double resY);
-
-    // 获取所有分区数据
-    const std::map<int, std::map<std::pair<int, int>, BinData>>& GetBinDataMap() const {
-        return m_binDataMap;
-    }
-
-    // 清空统计数据
-    void Clear() { m_binDataMap.clear(); }
-
-   private:
-    DUTAnalysisConfig m_config;
-    std::map<int, std::map<std::pair<int, int>, BinData>> m_binDataMap;
-};
-
-/**
- * @brief DUT Analysis Script
- * 
- * 执行DUT探测器分析，基于Track信息计算残差和效率，
- * 生成DUTInfo.root输出文件
- */
 class DUTAnalysisScript : public IScript {
-public:
+   public:
     DUTAnalysisScript() = default;
     ~DUTAnalysisScript() override = default;
 
     std::string GetName() const override { return "DUTAnalysisScript"; }
-    
-    std::string GetDescription() const override { 
-        return "DUT efficiency and residual analysis"; 
+
+    std::string GetDescription() const override {
+        return "DUT efficiency and residual analysis";
     }
 
     void LoadConfig(const json& config) override;
     void Print() const override;
     bool Execute() override;
 
-private:
+   private:
     // 配置参数
     bool m_runAlignment;
     bool m_saveNoiseData;
+    bool m_saveEfficiencyMap = true;
     int m_progressInterval;
     int m_maxEvents;
+    int m_effXBins = 8;
+    int m_effYBins = 7;
+    int m_effMinEntriesPerBin = 1;
+    std::vector<int> m_effExcludedXBins;
+    std::vector<int> m_effExcludedYBins;
+    double m_effXMin = 10.0;
+    double m_effXMax = 90.0;
+    double m_effYMin = 10.0;
+    double m_effYMax = 45.0;
+    double m_effMatchRadius = 2.0;
 
-    // 私有静态方法
+    // 私有方法
     static Cluster CreateInvalidCluster(int type);
+
+    // 设置残差直方图格式
+    void SetResidualHistogramStyle(TH1D* hist, TF1* fitFunc, const std::string& axis);
 };
 
-#endif // DUT_ANALYSIS_SCRIPT_H
+#endif  // DUT_ANALYSIS_SCRIPT_H

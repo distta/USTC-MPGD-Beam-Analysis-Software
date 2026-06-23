@@ -38,8 +38,15 @@ bool ScriptManager::Initialize() {
         return false;
     }
 
-    // 构造原始数据文件路径
+    // A canonical input can be selected explicitly. Keep the historical
+    // run<ID>.root convention as the fallback.
     std::string rawFile = m_rawDir + "/run" + m_runID + ".root";
+    if (m_config.contains("input") && m_config["input"].contains("file")) {
+        rawFile = m_config["input"]["file"].get<std::string>();
+        const std::string token = "{run_id}";
+        if (const auto position = rawFile.find(token); position != std::string::npos)
+            rawFile.replace(position, token.size(), m_runID);
+    }
 
     std::cout << "Config file: " << m_configFile << std::endl;
     std::cout << "Raw file   : " << rawFile << std::endl;

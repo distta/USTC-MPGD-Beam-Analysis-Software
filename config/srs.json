@@ -1,0 +1,7 @@
+{
+  "conversion": {
+    "type": "SRS",
+    "input": "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/raw/run1704.root",
+    "output": "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/converted/run1704.root"
+  }
+}

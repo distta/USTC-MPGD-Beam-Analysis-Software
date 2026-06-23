@@ -1,5 +1,7 @@
 #include "Event/EventDisplayManager.h"
+#include "Input/ConverterFactory.h"
 #include "Script/Base/ScriptManager.h"
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
@@ -9,6 +11,7 @@ using json = nlohmann::json;
 
 void printUsage(const char* prog) {
     std::cout << "Usage: " << prog << " <run_id> [config_file]" << std::endl;
+    std::cout << "       " << prog << " convert <conversion_config> [output.root]" << std::endl;
     std::cout << "  run_id     : Run ID (e.g., 1813)" << std::endl;
     std::cout << "  config_file: Config path (default: config/config.json)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
@@ -19,17 +22,50 @@ void printUsage(const char* prog) {
     std::cout << "  Results  : result/<run_id>/" << std::endl;
 }
 
+int runConversion(int argc, char* argv[]) {
+    if (argc < 3) {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    std::ifstream input(argv[2]);
+    if (!input) {
+        std::cerr << "Cannot open conversion config: " << argv[2] << std::endl;
+        return 1;
+    }
+    json config;
+    input >> config;
+    const json& conversion = config.contains("conversion") ? config["conversion"] : config;
+    const std::string type = conversion.value("type", "");
+    const std::string output = argc > 3 ? argv[3] : conversion.value("output", "");
+    if (type.empty() || output.empty()) {
+        std::cerr << "Conversion config requires type and output" << std::endl;
+        return 1;
+    }
+
+    auto converter = ConverterFactory::Create(type);
+    if (!converter) {
+        std::cerr << "Unknown converter type: " << type << std::endl;
+        return 1;
+    }
+    return converter->Convert(conversion, output) ? 0 : 1;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         printUsage(argv[0]);
         return 1;
     }
 
+    if (std::string(argv[1]) == "convert") return runConversion(argc, argv);
+
     std::string runID = argv[1];
     std::string configFile = argc > 2 ? argv[2] : "config.json";
-    configFile = "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/config/" + configFile;
-    std::string rawDir = "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/raw";
-    std::string resultDir = "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/result";
+    if (!std::filesystem::exists(configFile))
+        configFile = "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/config/" + configFile;
+    // std::string rawDir = "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/raw";
+    std::string rawDir = "/home/qxhuang/fs/ustcfs/workarea/BeamResult_LHCb/converted";
+    std::string resultDir = "/home/qxhuang/fs/ustcfs/workarea/BeamResult_LHCb/LHCB/result";
 
     try {
         // 创建ScriptManager，传入配置参数

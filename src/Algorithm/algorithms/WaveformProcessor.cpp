@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 
 REGISTER_ALGORITHM("WaveformProcessor", WaveformProcessor)
 
@@ -96,8 +97,8 @@ StripHit WaveformProcessor::processWaveformLeadingEdgeFit(const RawData& rawData
     // 3. 拟合
     static TF1 riseFunc("riseFunc", "[0]/(1+exp(-(x-[2])/[3]))+[1]", -5, 30);
     riseFunc.SetParameters(peakAmp, 0, (peakTime + firstOverTh) * 0.5, 15);
-    riseFunc.SetParLimits(1, -30, 30);
-    riseFunc.SetParLimits(0, peakAmp - 50, peakAmp + 50);
+    // riseFunc.SetParLimits(1, -30, 30);
+    // riseFunc.SetParLimits(0, peakAmp - 50, peakAmp + 50);
 
     const double fitStart = std::max(0.0, static_cast<double>(firstOverTh) - 5);
     const double fitEnd = std::min(static_cast<double>(nSamples - 1), peakTime + 1.0);
@@ -119,7 +120,7 @@ StripHit WaveformProcessor::processWaveformLeadingEdgeFit(const RawData& rawData
         fitTime = riseFunc.GetX(targetY, fitStart, fitEnd);
     }
 
-    if (fitTime < 0 || fitTime > 28)
+    if (fitTime * m_config.timePitch < m_config.timeWindowStart || fitTime * m_config.timePitch > m_config.timeWindowEnd)
         stripData.isValid = false;
 
     // 5. 计算拟合时间
@@ -155,89 +156,79 @@ StripHit WaveformProcessor::processWaveformDefault(const RawData& rawData) {
     }
 
     const int noiseTh = m_config.noiseThreshold;
-    static const double weights[5] = {0.25, 0.5, 1.0, 0.5, 0.25};
-    std::vector<double> smooth(nSamples, 0.0);
-
-    // 平滑滤波
-    for (size_t i = 0; i < nSamples; ++i) {
-        double sumw = 0;
-        double s = 0;
-        for (int m = -2; m <= 2; ++m) {
-            int idx = static_cast<int>(i) + m;
-            if (idx >= 0 && idx < static_cast<int>(nSamples)) {
-                double w = weights[m + 2];
-                s += w * static_cast<double>(waveform[idx]);
-                sumw += w;
-            }
-        }
-        smooth[i] = (sumw > 0) ? (s / sumw) : 0.0;
-    }
 
     // 找峰值
-    double peakAmpD = -1.0;
-    int peakIdx = -1;
+    int peakAmp = 0, peakTime = 0, inducedCharge = 0;
+    int firstOverTh = -1, lastOverTh = -1;
+
+    double baseline = 0.0;
+    // size_t baselineSamples = std::min<size_t>(5, nSamples);
+    // double bsum = 0;
+    // for (size_t i = 0; i < baselineSamples; ++i) bsum += waveform[i];
+    // baseline = bsum / baselineSamples;
+
     for (size_t i = 0; i < nSamples; ++i) {
-        if (smooth[i] > peakAmpD) {
-            peakAmpD = smooth[i];
-            peakIdx = static_cast<int>(i);
+        const int amp = waveform[i] - baseline;
+
+        if (amp > peakAmp) {
+            peakAmp = amp;
+            peakTime = static_cast<int>(i);
+        }
+
+        if (amp > noiseTh) {
+            if (firstOverTh == -1) firstOverTh = static_cast<int>(i);
+            lastOverTh = static_cast<int>(i);
+            inducedCharge += amp - baseline;
         }
     }
-    int peakAmp = static_cast<int>(std::round(peakAmpD));
+
+    // 阈值以下，无有效信号
+    if (peakAmp < noiseTh || peakAmp > m_config.saturationLevel) {
+        stripData.isValid = false;
+    }
 
     if (peakAmp < m_config.noiseThreshold) {
         stripData.isValid = false;
     }
 
-    // 计算基线!!!!
-    double baseline = 0.0;
-    size_t baselineSamples = std::min<size_t>(5, nSamples);
-    double bsum = 0;
-    for (size_t i = 0; i < baselineSamples; ++i) bsum += waveform[i];
-    baseline = bsum / baselineSamples;
-
     // 计算电荷
-    double inducedCharge = 0.0;
     for (size_t i = 0; i < nSamples; ++i) {
-        if (waveform[i] > baseline) {
-            inducedCharge += (waveform[i] - baseline);
+        if (waveform[i] > noiseTh) {
+            inducedCharge += (waveform[i] - noiseTh);
         }
     }
 
-    // CFD时间提取
-    double targetY = baseline + m_config.cfdFraction * (peakAmpD - baseline);
-    double minSmooth = *std::min_element(smooth.begin(), smooth.end());
-    double maxSmooth = *std::max_element(smooth.begin(), smooth.end());
-
-    if (targetY < minSmooth || targetY > maxSmooth) {
-        stripData.isValid = false;
-    }
-
-    // 找穿越点
+    // Constant-fraction leading-edge time with sample-to-sample interpolation.
+    const double targetY = baseline + m_config.cfdFraction * peakAmp;
     int crossingIdx = -1;
-    for (int i = 1; i <= peakIdx; ++i) {
-        if (smooth[i] >= targetY && smooth[i - 1] < targetY) {
+    for (int i = 1; i <= peakTime; ++i) {
+        if (waveform[i - 1] < targetY && waveform[i] >= targetY) {
             crossingIdx = i;
             break;
         }
     }
 
-    if (crossingIdx == -1) {
+    double fitTime = std::numeric_limits<double>::quiet_NaN();
+    if (crossingIdx < 0) {
         stripData.isValid = false;
+    } else {
+        const double y1 = waveform[crossingIdx - 1];
+        const double y2 = waveform[crossingIdx];
+        if (y2 == y1) {
+            stripData.isValid = false;
+        } else {
+            fitTime = (crossingIdx - 1) + (targetY - y1) / (y2 - y1);
+        }
     }
 
-    // 线性插值
-    double fitTime = 0.0;
-    if (stripData.isValid) {
-        double y1 = smooth[crossingIdx - 1];
-        double y2 = smooth[crossingIdx];
-        double frac = (targetY - y1) / (y2 - y1);
-        fitTime = (crossingIdx - 1) + frac;
-    }
+    if (stripData.isValid &&
+        (fitTime * m_config.timePitch < m_config.timeWindowStart ||
+         fitTime * m_config.timePitch > m_config.timeWindowEnd))
+        stripData.isValid = false;
 
-    // 填充结果
-    stripData.amp = peakAmp - baseline;
+    stripData.amp = peakAmp;
     stripData.charge = inducedCharge;
-    stripData.peakTime = peakIdx * m_config.timePitch;
+    stripData.peakTime = peakTime * m_config.timePitch;
     stripData.time = fitTime * m_config.timePitch;
     stripData.riseTime = 0;
     stripData.timeError = 0;

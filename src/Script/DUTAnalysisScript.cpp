@@ -1,41 +1,133 @@
 #include "Script/DUTAnalysisScript.h"
+#include "Algorithm/AnalysisUtils.h"
 #include "Detector/DetectorFactory.h"
 #include "Event/DataModel.h"
 #include "Event/DetectorFrame.h"
+#include "Script/Base/RawDataParser.h"
 #include "Script/Base/ScriptFactory.h"
 #include "Script/Base/ScriptManager.h"
-#include "Script/Base/RawDataParser.h"
 
 #include "Math/Factory.h"
 #include "Math/Functor.h"
 #include "Math/Minimizer.h"
+#include <TCanvas.h>
+#include <TF1.h>
 #include <TFile.h>
 #include <TH1D.h>
 #include <TH2D.h>
+#include <TLatex.h>
+#include <TLegend.h>
 #include <TMath.h>
+#include <TPad.h>
+#include <TStyle.h>
 #include <TTree.h>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <set>
 
 using namespace std;
 
 void RunDUTAlign(const std::vector<Event>& events, std::shared_ptr<Detector> detector, int detID);
 LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<Cluster>& clusters, const TVector3& predL, double& residualX, double& residualY);
 double DUTChi2Objective(const double* par, const std::vector<Event>& events, std::shared_ptr<Detector> detector, int detID);
+struct ResidualAnalysisResult {
+    double sigma68 = 0;
+    double sigmaFit = 0;
+    double sigmaFitError = 0;
+    double mean = 0;
+    double efficiency = 0;  // valid reconstruction / total events
+    double eff3S = 0;
+    double eff5S = 0;
+    double eff1mm = 0;  // |residual| < 1 mm
+};
+
+ResidualAnalysisResult AnalyzeResidualSequence(const std::vector<double>& residuals, TFile* outputFile, const std::string& histName);
+
+struct EfficiencyMapResult {
+    int totalTracks = 0;
+    int matchedHits = 0;
+    int validBins = 0;
+    double globalEfficiency = 0.0;
+    double binMean = 0.0;
+    double binRMS = 0.0;
+    double rmsNonUniformity = 0.0;
+    double peakToPeakNonUniformity = 0.0;
+    double minBinEfficiency = 0.0;
+    double maxBinEfficiency = 0.0;
+};
+
+bool ContainsBin(const std::vector<int>& bins, int bin) {
+    return std::find(bins.begin(), bins.end(), bin) != bins.end();
+}
+
+bool IsExcludedEfficiencyBin(const std::vector<int>& excludedXBins,
+                             const std::vector<int>& excludedYBins,
+                             int binX, int binY) {
+    return ContainsBin(excludedXBins, binX) || ContainsBin(excludedYBins, binY);
+}
 
 void DUTAnalysisScript::LoadConfig(const json& config) {
     m_runAlignment = config.value("runAlignment", true);
     m_saveNoiseData = config.value("saveNoiseData", true);
+    m_saveEfficiencyMap = config.value("saveEfficiencyMap", true);
     m_progressInterval = config.value("progressInterval", 1000);
     m_maxEvents = config.value("maxEvents", -1);
+
+    const json effCfg = config.value("efficiencyMap", json::object());
+    m_effXMin = effCfg.value("xMin", m_effXMin);
+    m_effXMax = effCfg.value("xMax", m_effXMax);
+    m_effYMin = effCfg.value("yMin", m_effYMin);
+    m_effYMax = effCfg.value("yMax", m_effYMax);
+    m_effXBins = effCfg.value("xBins", m_effXBins);
+    m_effYBins = effCfg.value("yBins", m_effYBins);
+    m_effMatchRadius = effCfg.value("matchRadius", m_effMatchRadius);
+    m_effMinEntriesPerBin = effCfg.value("minEntriesPerBin", m_effMinEntriesPerBin);
+    m_effExcludedXBins = effCfg.value("excludeXBins", std::vector<int>{});
+    m_effExcludedYBins = effCfg.value("excludeYBins", std::vector<int>{});
+
+    if (m_effXBins <= 0) m_effXBins = 1;
+    if (m_effYBins <= 0) m_effYBins = 1;
+    if (m_effMinEntriesPerBin <= 0) m_effMinEntriesPerBin = 1;
+    if (m_effXMax < m_effXMin) std::swap(m_effXMax, m_effXMin);
+    if (m_effYMax < m_effYMin) std::swap(m_effYMax, m_effYMin);
+    if (m_effXMax == m_effXMin) m_effXMax = m_effXMin + 1.0;
+    if (m_effYMax == m_effYMin) m_effYMax = m_effYMin + 1.0;
+
+    auto cleanExcludedBins = [](std::vector<int>& bins, int maxBin) {
+        bins.erase(std::remove_if(bins.begin(), bins.end(),
+                                  [maxBin](int bin) { return bin < 1 || bin > maxBin; }),
+                   bins.end());
+        std::sort(bins.begin(), bins.end());
+        bins.erase(std::unique(bins.begin(), bins.end()), bins.end());
+    };
+    cleanExcludedBins(m_effExcludedXBins, m_effXBins);
+    cleanExcludedBins(m_effExcludedYBins, m_effYBins);
 }
 
 void DUTAnalysisScript::Print() const {
     cout << "DUTAnalysisScript Configuration:" << endl;
     cout << "  Run Alignment: " << (m_runAlignment ? "Yes" : "No") << endl;
     cout << "  Save Noise Data: " << (m_saveNoiseData ? "Yes" : "No") << endl;
+    cout << "  Save Efficiency Map: " << (m_saveEfficiencyMap ? "Yes" : "No") << endl;
+    cout << "  Efficiency Region X: [" << m_effXMin << ", " << m_effXMax << "] mm, bins=" << m_effXBins << endl;
+    cout << "  Efficiency Region Y: [" << m_effYMin << ", " << m_effYMax << "] mm, bins=" << m_effYBins << endl;
+    cout << "  Efficiency Match Radius: " << m_effMatchRadius << " mm" << endl;
+    cout << "  Efficiency Min Entries/Bin: " << m_effMinEntriesPerBin << endl;
+    if (!m_effExcludedXBins.empty() || !m_effExcludedYBins.empty()) {
+        cout << "  Efficiency Excluded X bins:";
+        for (int bin : m_effExcludedXBins) cout << " " << bin;
+        if (m_effExcludedXBins.empty()) cout << " none";
+        cout << endl;
+        cout << "  Efficiency Excluded Y bins:";
+        for (int bin : m_effExcludedYBins) cout << " " << bin;
+        if (m_effExcludedYBins.empty()) cout << " none";
+        cout << endl;
+    }
     cout << "  Progress Interval: " << m_progressInterval << endl;
     cout << "  Max Events: " << (m_maxEvents > 0 ? to_string(m_maxEvents) : "All") << endl;
 }
@@ -106,6 +198,7 @@ bool DUTAnalysisScript::Execute() {
         double sum2 = 0.0;
     };
     map<pair<int, int>, NoiseStat> noiseStats;
+    std::set<int> noiseProcessedEvents;
 
     if (m_saveNoiseData) {
         noiseTree = new TTree("Noise", "Per-strip noise samples");
@@ -135,7 +228,7 @@ bool DUTAnalysisScript::Execute() {
             detEvt->Process(evt.t0);
             evt.detectorFramesMap[id] = std::move(detEvt);
 
-            if (m_saveNoiseData) {
+            if (m_saveNoiseData && noiseProcessedEvents.insert(eventID).second) {
                 noise_eventID = eventID;
                 for (const auto& raw : evt.detectorFramesMap[id]->Raw()) {
                     noise_stripID = raw.stripID;
@@ -167,7 +260,6 @@ bool DUTAnalysisScript::Execute() {
 
     // 初始化配置和统计
     DUTAnalysisConfig analysisConfig;
-    DUTStatistics statistics(analysisConfig);
 
     cout << "\nSaving DUT results..." << endl;
 
@@ -231,7 +323,25 @@ bool DUTAnalysisScript::Execute() {
     tDut->Branch("stripHitsX", &stripHitsX);
     tDut->Branch("stripHitsY", &stripHitsY);
 
-    // 填充DUT数据
+    const vector<double> BadChannelVec[2] = {{113, 114, 128},
+                                             {316}};
+    // 检查cluster及其周围是否有坏道
+    auto hasBadChannel = [&](const Cluster& cluster, const vector<StripHit>& hits, int detID, int type) -> bool {
+        for (int idx : cluster.stripHitIndices) {
+            int stripID = hits[idx].ID;
+            int type = hits[idx].type;
+            // 检查当前条及相邻条
+            for (int offset = -1; offset <= 1; ++offset) {
+                // double sigma = parser->GetSigma(detID, type, stripID + offset);
+                // if (sigma > kBadChannelThreshold) return true;
+                int id = stripID + offset;
+                if (find(BadChannelVec[type].begin(), BadChannelVec[type].end(), id) != BadChannelVec[type].end())
+                    return true;
+            }
+        }
+        return false;
+    };
+
     for (auto& det : duts) {
         int id = det->GetID();
         for (auto& evt : events) {
@@ -242,6 +352,12 @@ bool DUTAnalysisScript::Execute() {
             TVector3 predL = det->GlobalToLocal(predG);
             predX = predL.X();
             predY = predL.Y();
+
+            if (predY < m_effYMin || predY > m_effYMax) continue;
+            // if (predY < 60 || predY > 66) continue;
+            // if (predX > 70 || predX < 55) continue;
+            if (predY < 0 || predY > 20) continue;
+            if (predX > m_effXMax || predX < m_effXMin) continue;
 
             auto frameIt = evt.detectorFramesMap.find(id);
             if (frameIt != evt.detectorFramesMap.end()) {
@@ -257,8 +373,28 @@ bool DUTAnalysisScript::Execute() {
                     int idxX = clusterIdx[0];
                     int idxY = clusterIdx[1];
 
+                    // 检查坏道：如果cluster中或周围有坏道，跳过该事例
+                    bool skipEvent = false;
+                    // if (idxY >= 0 && hasBadChannel(clusters[idxY], stripHits, id, 1)) skipEvent = true;
+                    // if (idxX >= 0 && hasBadChannel(clusters[idxX], stripHits, id, 0)) skipEvent = true;
+                    if (skipEvent) continue;
+
                     clusterX = (idxX >= 0) ? clusters[idxX] : CreateInvalidCluster(DUTAnalysisConfig::kTypeX);
                     clusterY = (idxY >= 0) ? clusters[idxY] : CreateInvalidCluster(DUTAnalysisConfig::kTypeY);
+
+                    // 填充stripHitsX/Y
+                    stripHitsX.clear();
+                    stripHitsY.clear();
+                    if (idxX >= 0) {
+                        for (int idx : clusterX.stripHitIndices) {
+                            stripHitsX.push_back(stripHits[idx]);
+                        }
+                    }
+                    if (idxY >= 0) {
+                        for (int idx : clusterY.stripHitIndices) {
+                            stripHitsY.push_back(stripHits[idx]);
+                        }
+                    }
 
                     hitX = localHit.localPos.X();
                     hitY = localHit.localPos.Y();
@@ -276,9 +412,6 @@ bool DUTAnalysisScript::Execute() {
 
                     clusterIndices = clusterIdx;
 
-                    auto [binX, binY] = statistics.GetBinIndices(predX, predY);
-                    bool hasValidHit = (idxX >= 0 && idxY >= 0);
-                    statistics.AddBinData(id, binX, binY, hasValidHit, resX, resY);
                 } else {
                     clusterX = CreateInvalidCluster(DUTAnalysisConfig::kTypeX);
                     clusterY = CreateInvalidCluster(DUTAnalysisConfig::kTypeY);
@@ -288,9 +421,6 @@ bool DUTAnalysisScript::Execute() {
                     resY = DUTAnalysisConfig::kInvalidValue;
                     hitFlag = 0;
                     clusterIndices.clear();
-
-                    auto [binX, binY] = statistics.GetBinIndices(predX, predY);
-                    statistics.AddBinData(id, binX, binY, false, 0, 0);
                 }
             }
 
@@ -299,6 +429,212 @@ bool DUTAnalysisScript::Execute() {
     }
 
     tDut->Write();
+
+    TTree* tEffSummary = nullptr;
+    Int_t eff_dutID = 0;
+    Int_t eff_totalTracks = 0;
+    Int_t eff_matchedHits = 0;
+    Int_t eff_validBins = 0;
+    Double_t eff_global = 0.0;
+    Double_t eff_binMean = 0.0;
+    Double_t eff_binRMS = 0.0;
+    Double_t eff_rmsNonUniformity = 0.0;
+    Double_t eff_peakToPeakNonUniformity = 0.0;
+    Double_t eff_minBin = 0.0;
+    Double_t eff_maxBin = 0.0;
+
+    if (m_saveEfficiencyMap) {
+        tEffSummary = new TTree("EfficiencySummary", "DUT binned efficiency summary");
+        tEffSummary->Branch("dutID", &eff_dutID);
+        tEffSummary->Branch("totalTracks", &eff_totalTracks);
+        tEffSummary->Branch("matchedHits", &eff_matchedHits);
+        tEffSummary->Branch("validBins", &eff_validBins);
+        tEffSummary->Branch("globalEfficiency", &eff_global);
+        tEffSummary->Branch("binMean", &eff_binMean);
+        tEffSummary->Branch("binRMS", &eff_binRMS);
+        tEffSummary->Branch("rmsNonUniformity", &eff_rmsNonUniformity);
+        tEffSummary->Branch("peakToPeakNonUniformity", &eff_peakToPeakNonUniformity);
+        tEffSummary->Branch("minBinEfficiency", &eff_minBin);
+        tEffSummary->Branch("maxBinEfficiency", &eff_maxBin);
+    }
+
+    for (auto& det : duts) {
+        int id = det->GetID();
+
+        // 收集残差数据用于GetRange
+        vector<double> resX_vec, resY_vec;
+        int nTotal = 0, n2D1mm = 0;
+        tDut->SetBranchAddress("dutID", &dutID);
+        tDut->SetBranchAddress("predX", &predX);
+        tDut->SetBranchAddress("predY", &predY);
+        tDut->SetBranchAddress("resX", &resX);
+        tDut->SetBranchAddress("resY", &resY);
+        tDut->SetBranchAddress("hitFlag", &hitFlag);
+
+        TH2D* hEffDen = nullptr;
+        TH2D* hEffNum = nullptr;
+        if (m_saveEfficiencyMap) {
+            hEffDen = new TH2D(Form("hEffDen_DUT%d", id),
+                               Form("DUT %d efficiency denominator;Predicted local X [mm];Predicted local Y [mm];Tracks", id),
+                               m_effXBins, m_effXMin, m_effXMax,
+                               m_effYBins, m_effYMin, m_effYMax);
+            hEffNum = new TH2D(Form("hEffNum_DUT%d", id),
+                               Form("DUT %d efficiency numerator;Predicted local X [mm];Predicted local Y [mm];Matched hits", id),
+                               m_effXBins, m_effXMin, m_effXMax,
+                               m_effYBins, m_effYMin, m_effYMax);
+        }
+
+        EfficiencyMapResult effMap;
+        Long64_t nEntries_dut = tDut->GetEntries();
+        for (Long64_t i = 0; i < nEntries_dut; ++i) {
+            tDut->GetEntry(i);
+            if (dutID == id) {
+                resX_vec.push_back(resX);
+                resY_vec.push_back(resY);
+                nTotal++;
+
+                const bool validResidual = std::isfinite(resX) && std::isfinite(resY) &&
+                                           resX != DUTAnalysisConfig::kInvalidValue &&
+                                           resY != DUTAnalysisConfig::kInvalidValue;
+                const bool matched2D = hitFlag == 3 && validResidual &&
+                                       std::sqrt(resX * resX + resY * resY) < m_effMatchRadius;
+                if (matched2D) n2D1mm++;
+
+                if (m_saveEfficiencyMap &&
+                    predX >= m_effXMin && predX <= m_effXMax &&
+                    predY >= m_effYMin && predY <= m_effYMax) {
+                    const int binX = hEffDen->GetXaxis()->FindBin(predX);
+                    const int binY = hEffDen->GetYaxis()->FindBin(predY);
+                    if (IsExcludedEfficiencyBin(m_effExcludedXBins, m_effExcludedYBins, binX, binY)) {
+                        continue;
+                    }
+
+                    hEffDen->Fill(predX, predY);
+                    effMap.totalTracks++;
+
+                    if (matched2D) {
+                        hEffNum->Fill(predX, predY);
+                        effMap.matchedHits++;
+                    }
+                }
+            }
+        }
+        auto resultX = AnalyzeResidualSequence(resX_vec, fDut, Form("hResX_DUT%d", id));
+        auto resultY = AnalyzeResidualSequence(resY_vec, fDut, Form("hResY_DUT%d", id));
+
+        double eff2D = (nTotal > 0) ? double(n2D1mm) / nTotal : 0.0;
+
+        if (m_saveEfficiencyMap) {
+            TH2D* hEffMap = static_cast<TH2D*>(hEffNum->Clone(Form("hEffMap_DUT%d", id)));
+            hEffMap->SetTitle(Form("DUT %d binned efficiency;Hit X [mm];Hit Y [mm];Efficiency", id));
+            hEffMap->Divide(hEffNum, hEffDen, 1.0, 1.0, "B");
+            hEffMap->SetStats(0);
+            hEffMap->SetMinimum(0.0);
+            hEffMap->SetMaximum(1.0);
+
+            std::vector<double> binEfficiencies;
+            double minEff = std::numeric_limits<double>::infinity();
+            double maxEff = -std::numeric_limits<double>::infinity();
+
+            for (int bx = 1; bx <= m_effXBins; ++bx) {
+                for (int by = 1; by <= m_effYBins; ++by) {
+                    if (IsExcludedEfficiencyBin(m_effExcludedXBins, m_effExcludedYBins, bx, by)) continue;
+
+                    const double den = hEffDen->GetBinContent(bx, by);
+                    if (den < m_effMinEntriesPerBin) continue;
+
+                    const double eff = hEffMap->GetBinContent(bx, by);
+                    binEfficiencies.push_back(eff);
+                    minEff = std::min(minEff, eff);
+                    maxEff = std::max(maxEff, eff);
+                }
+            }
+
+            effMap.globalEfficiency = effMap.totalTracks > 0 ? double(effMap.matchedHits) / effMap.totalTracks : 0.0;
+            effMap.validBins = static_cast<int>(binEfficiencies.size());
+
+            if (!binEfficiencies.empty()) {
+                for (double eff : binEfficiencies) effMap.binMean += eff;
+                effMap.binMean /= binEfficiencies.size();
+
+                for (double eff : binEfficiencies) {
+                    const double diff = eff - effMap.binMean;
+                    effMap.binRMS += diff * diff;
+                }
+                effMap.binRMS = std::sqrt(effMap.binRMS / binEfficiencies.size());
+                effMap.minBinEfficiency = minEff;
+                effMap.maxBinEfficiency = maxEff;
+
+                if (effMap.binMean > 0.0) {
+                    effMap.rmsNonUniformity = effMap.binRMS / effMap.binMean;
+                    effMap.peakToPeakNonUniformity = (maxEff - minEff) / (2.0 * effMap.binMean);
+                }
+            }
+
+            hEffDen->Write();
+            hEffNum->Write();
+            hEffMap->Write();
+
+            TCanvas* cEff = new TCanvas(Form("cEffMap_DUT%d", id),
+                                        Form("DUT %d binned efficiency", id),
+                                        900, 700);
+            cEff->SetRightMargin(0.15);
+            hEffMap->Draw("COLZ TEXT");
+            cEff->Write();
+
+            eff_dutID = id;
+            eff_totalTracks = effMap.totalTracks;
+            eff_matchedHits = effMap.matchedHits;
+            eff_validBins = effMap.validBins;
+            eff_global = effMap.globalEfficiency;
+            eff_binMean = effMap.binMean;
+            eff_binRMS = effMap.binRMS;
+            eff_rmsNonUniformity = effMap.rmsNonUniformity;
+            eff_peakToPeakNonUniformity = effMap.peakToPeakNonUniformity;
+            eff_minBin = effMap.minBinEfficiency;
+            eff_maxBin = effMap.maxBinEfficiency;
+            tEffSummary->Fill();
+        }
+
+        // Compact aligned table for terminal output.
+        if (id == duts.front()->GetID()) {
+            printf("\n%-5s %8s %10s %10s %9s %10s %10s %9s %9s",
+                   "DUT", "Events", "Xres[um]", "Xerr[um]", "Xeff[%]",
+                   "Yres[um]", "Yerr[um]", "Yeff[%]", "2Deff[%]");
+            if (m_saveEfficiencyMap) {
+                printf(" %9s %11s %12s %12s %6s",
+                       "Map[%]", "BinMean[%]", "RMSuni[%]", "P2Puni[%]", "Bins");
+            }
+            printf("\n");
+            printf("%-5s %8s %10s %10s %9s %10s %10s %9s %9s",
+                   "-----", "--------", "----------", "----------", "---------",
+                   "----------", "----------", "---------", "---------");
+            if (m_saveEfficiencyMap) {
+                printf(" %9s %11s %12s %12s %6s",
+                       "---------", "-----------", "------------", "------------", "------");
+            }
+            printf("\n");
+        }
+
+        printf("%-5d %8d %10.1f %10.1f %9.2f %10.1f %10.1f %9.2f %9.2f",
+               id, nTotal,
+               resultX.sigmaFit * 1000, resultX.sigmaFitError * 1000, resultX.eff1mm * 100,
+               resultY.sigmaFit * 1000, resultY.sigmaFitError * 1000, resultY.eff1mm * 100,
+               eff2D * 100);
+        if (m_saveEfficiencyMap) {
+            printf(" %9.2f %11.2f %12.2f %12.2f %6d",
+                   effMap.globalEfficiency * 100,
+                   effMap.binMean * 100,
+                   effMap.rmsNonUniformity * 100,
+                   effMap.peakToPeakNonUniformity * 100,
+                   effMap.validBins);
+        }
+        printf("\n");
+    }
+
+    fDut->cd();
+    if (tEffSummary) tEffSummary->Write();
+
     fDut->Close();
     delete fDut;
 
@@ -395,11 +731,10 @@ LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<
         double pitchX = config.readoutPlanePitch.at(typeX);
         for (size_t i = 0; i < clusters.size(); ++i) {
             if (clusters[i].type == typeX) {
-                double currentResX = std::abs(clusters[i].pos * pitchX - predX);
+                double currentResX = std::abs(clusters[i].centroid * pitchX - predX);
                 if (currentResX < minResX) {
                     minResX = currentResX;
                     bestClusterXIndex = static_cast<int>(i);
-                    bestPosX = clusters[i].pos * pitchX;
                 }
             }
         }
@@ -412,11 +747,10 @@ LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<
         double pitchY = config.readoutPlanePitch.at(typeY);
         for (size_t i = 0; i < clusters.size(); ++i) {
             if (clusters[i].type == typeY) {
-                double currentResY = std::abs(clusters[i].pos * pitchY - predY);
+                double currentResY = std::abs(clusters[i].centroid * pitchY - predY);
                 if (currentResY < minResY) {
                     minResY = currentResY;
                     bestClusterYIndex = static_cast<int>(i);
-                    bestPosY = clusters[i].pos * pitchY;
                 }
             }
         }
@@ -426,17 +760,19 @@ LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<
     LocalHit localHit;
 
     if (bestClusterXIndex != -1) {
-        residualX = bestPosX - predX;
+        double pitchX = config.readoutPlanePitch.at(typeX);
+        residualX = clusters[bestClusterXIndex].pos * pitchX - predX;
     } else {
         bestPosX = DUTAnalysisConfig::kInvalidValue;
-        residualX = 0;
+        residualX = DUTAnalysisConfig::kInvalidValue;
     }
 
     if (bestClusterYIndex != -1) {
-        residualY = bestPosY - predY;
+        double pitchY = config.readoutPlanePitch.at(typeY);
+        residualY = clusters[bestClusterYIndex].pos * pitchY - predY;
     } else {
         bestPosY = DUTAnalysisConfig::kInvalidValue;
-        residualY = 0;
+        residualY = DUTAnalysisConfig::kInvalidValue;
     }
 
     localHit.localPos.SetXYZ(bestPosX, bestPosY, 0);
@@ -476,7 +812,10 @@ double DUTChi2Objective(const double* par, const std::vector<Event>& events, std
 
         double predX = predL.X();
         double predY = predL.Y();
-        // if (predY < 55 || predY > 80 || predX < -30 || predX > -15) continue;
+
+        // if (predY < 10 || predY > 50) continue;
+        // if (predX < 60 & predX > 40) continue;
+        // if (predX > 90) continue;
         // 调用新的CalcuDutResidual方法
         LocalHit localHit = CalcuDutResidual(detector, clusters, predL, residualX, residualY);
 
@@ -490,44 +829,6 @@ double DUTChi2Objective(const double* par, const std::vector<Event>& events, std
     return (nEvents > 0) ? chi2 / nEvents : 1e9;
 }
 
-// ========== DUTStatistics方法实现 ==========
-
-std::pair<int, int> DUTStatistics::GetBinIndices(double predX, double predY) const {
-    const auto& binning = m_config.binning;
-
-    if (predX < binning.predX_min || predX > binning.predX_max ||
-        predY < binning.predY_min || predY > binning.predY_max) {
-        return {-1, -1};
-    }
-
-    int binX = static_cast<int>((predX - binning.predX_min) /
-                                (binning.predX_max - binning.predX_min) * binning.nBinsX);
-    int binY = static_cast<int>((predY - binning.predY_min) /
-                                (binning.predY_max - binning.predY_min) * binning.nBinsY);
-
-    // 处理边界情况
-    if (binX >= binning.nBinsX) binX = binning.nBinsX - 1;
-    if (binY >= binning.nBinsY) binY = binning.nBinsY - 1;
-
-    return {binX, binY};
-}
-
-void DUTStatistics::AddBinData(int dutID, int binX, int binY,
-                               bool hasValidHit, double resX, double resY) {
-    if (binX < 0 || binY < 0) return;
-
-    auto& binData = m_binDataMap[dutID][{binX, binY}];
-    binData.totalEvents++;
-
-    if (hasValidHit) {
-        binData.hitEvents++;
-        binData.resX_values.push_back(resX);
-        binData.resY_values.push_back(resY);
-    }
-}
-
-// ========== DUTAnalysisScript静态方法实现 ==========
-
 Cluster DUTAnalysisScript::CreateInvalidCluster(int type) {
     Cluster invalidCluster;
     invalidCluster.type = type;
@@ -540,6 +841,223 @@ Cluster DUTAnalysisScript::CreateInvalidCluster(int type) {
     invalidCluster.pos = DUTAnalysisConfig::kInvalidValue;
     invalidCluster.stripHitIndices.clear();
     return invalidCluster;
+}
+
+ResidualAnalysisResult AnalyzeResidualSequence(const std::vector<double>& rawRes, TFile* outputFile, const std::string& histName) {
+
+    double rangeSigma = 3.0;
+    int bins = 100;
+    bool drawPlots = true;
+
+    gStyle->SetOptStat(0);
+    gStyle->SetOptFit(0);
+
+    ResidualAnalysisResult result;
+    if (rawRes.empty() || !outputFile) return result;
+
+    std::vector<double> residuals;
+    for (double res : rawRes) {
+        if (abs(res) < 5)
+            residuals.push_back(res);
+    }
+    if (residuals.empty()) return result;
+
+    const int totalEvents = rawRes.size();
+    const int N = residuals.size();
+    /* ================= Units ================= */
+    const double unit = 1.0;  //
+
+    /* ================= Basic statistics ================= */
+    double mean = 0.0;
+    for (double r : residuals) mean += r * unit;
+    mean /= N;
+
+    double rms = 0.0;
+    for (double r : residuals) {
+        const double x = r * unit - mean;
+        rms += x * x;
+    }
+    rms = std::sqrt(rms / N);
+
+    std::sort(residuals.begin(), residuals.end());
+
+    auto quantile = [&](double q) {
+        int idx = std::lround(q * (residuals.size() - 1));
+        return residuals[idx];
+    };
+
+    double q16 = quantile(0.16);
+    double q50 = quantile(0.50);
+    double q84 = quantile(0.84);
+
+    double sigma68 = 0.5 * (q84 - q16);
+
+    const double xmin = mean - rangeSigma * rms;
+    const double xmax = mean + rangeSigma * rms;
+
+    outputFile->cd();
+
+    /* ================= Histogram ================= */
+    TH1D* hist = new TH1D(histName.c_str(), (histName + ";Residual[mm];Events").c_str(), bins, xmin, xmax);
+
+    for (double r : residuals)
+        hist->Fill(r * unit);
+
+    hist->SetLineColor(kBlack);
+    hist->SetMarkerStyle(20);
+    hist->SetMarkerSize(0.8);
+    // hist->Scale(1.0 / hist->Integral("width"));
+
+    TLatex* title = new TLatex(0.12, 0.82, "**Experiment**Preliminary");
+    title->SetNDC();
+    title->SetTextSize(0.04);
+    title->SetTextFont(62);
+    hist->GetListOfFunctions()->Add(title);
+
+    /* ====================================================
+     *  Single Gaussian
+     * ==================================================== */
+    TF1* fSingle = new TF1("fSingle", "gaus", xmin, xmax);
+    fSingle->SetLineColor(kRed);
+    fSingle->SetLineWidth(2);
+
+    hist->Fit(fSingle, "QR");
+
+    const double muS = fSingle->GetParameter(1);
+    const double sigS = fSingle->GetParameter(2);
+
+    int n3S = 0, n5S = 0, n3mm = 0, n1mm = 0;
+    for (double r : residuals) {
+        const double x = r * unit;
+        if (std::fabs(x - muS) < 3 * sigS) n3S++;
+        if (std::fabs(x - muS) < 5 * sigS) n5S++;
+        if (std::fabs(x - muS) < 0.5) n3mm++;
+        if (std::fabs(x - muS) < 1.0) n1mm++;
+    }
+
+    const double eff3S = double(n3S) / totalEvents;
+    const double eff5S = double(n5S) / totalEvents;
+    const double eff3mm = double(n3mm) / totalEvents;
+    const double eff1mm = double(n1mm) / totalEvents;
+
+    TLegend* legSingle = new TLegend(0.55, 0.55, 0.88, 0.88);
+    legSingle->SetBorderSize(1);
+    legSingle->SetFillColor(kWhite);
+    legSingle->SetTextFont(42);
+    legSingle->SetTextSize(0.027);
+    legSingle->SetTextAlign(12);
+
+    legSingle->AddEntry(fSingle, "Single Gaussian Fit", "l");
+    legSingle->AddEntry((TObject*)0, Form("#sigma_{68} = %.4f mm", sigma68), "");
+    legSingle->AddEntry((TObject*)0, Form("RMS (|x|<5 mm) = %.4f mm", rms), "");
+    legSingle->AddEntry((TObject*)0, Form("#mu = %.4f #pm %.4f mm", muS, fSingle->GetParError(1)), "");
+    legSingle->AddEntry((TObject*)0, Form("#sigma = %.4f #pm %.4f mm", sigS, fSingle->GetParError(2)), "");
+    // legSingle->AddEntry((TObject*)0, Form("Eff(|x|<3#sigma) = %.2f%%", eff3S * 100), "");
+    // legSingle->AddEntry((TObject*)0, Form("Eff(|x|<5#sigma) = %.2f%%", eff5S * 100), "");
+    // legSingle->AddEntry((TObject*)0, Form("Eff(|x|<1 mm) = %.2f%%", eff1mm * 100), "");
+
+    /* ---------- Single Gaussian canvas ---------- */
+    if (drawPlots) {
+        TCanvas* cSingle =
+            new TCanvas((histName + "Single").c_str(), ("Residual - " + histName + " Single Gaussian").c_str(), 800, 600);
+
+        hist->Draw("E");
+        fSingle->Draw("same");
+        // legSingle->Draw();
+
+        cSingle->Write();
+    }
+
+    /* ====================================================
+     *  Double Gaussian
+     * ==================================================== */
+    TF1* fDouble = new TF1(
+        "fDouble",
+        "[0]*TMath::Gaus(x,[1],[2],true) + "
+        "[3]*TMath::Gaus(x,[4],[5],true)",
+        xmin, xmax);
+
+    fDouble->SetParameters(
+        0.7 * hist->GetMaximum(), muS, 0.8 * sigS, 0.3 * hist->GetMaximum(), muS, 2.5 * sigS);
+
+    // fDouble->SetParLimits(2, 0.2 * sigS, 2.0 * sigS);
+    // fDouble->SetParLimits(4, 1.5 * sigS, 10.0 * sigS);
+
+    fDouble->SetLineColor(kRed);
+    fDouble->SetLineWidth(2);
+
+    hist->Fit(fDouble, "RQ");
+
+    const double A1 = fDouble->GetParameter(0);
+    const double mu1 = fDouble->GetParameter(1);
+    const double sig1 = fDouble->GetParameter(2);
+
+    const double A2 = fDouble->GetParameter(3);
+    const double mu2 = fDouble->GetParameter(4);
+    const double sig2 = fDouble->GetParameter(5);
+
+    const double w1 = A1 / (A1 + A2);
+    const double w2 = A2 / (A1 + A2);
+
+    const double sigmaEff =
+        sqrt(w1 * sig1 * sig1 +
+             w2 * sig2 * sig2 +
+             w1 * w2 * (mu1 - mu2) * (mu1 - mu2));
+
+    int n5Tail = 0;
+    for (double r : residuals) {
+        const double x = r * unit;
+        if (std::fabs(x - mu1) < 5 * sig2) n5Tail++;
+    }
+
+    const double eff5Tail = double(n5Tail) / totalEvents;
+
+    TLegend* legDouble = new TLegend(0.60, 0.55, 0.88, 0.88);
+    legDouble->SetBorderSize(1);
+    legDouble->SetFillColor(kWhite);
+    legDouble->SetTextFont(42);
+    legDouble->SetTextSize(0.027);
+    legDouble->SetTextAlign(12);
+
+    legDouble->AddEntry(fDouble, "Double Gaussian Fit", "l");
+    legDouble->AddEntry((TObject*)0, Form("Std Dev = %.4f mm", rms), "");
+    legDouble->AddEntry((TObject*)0, Form("#mu_{core} = %.4f #pm %.4f mm", muS, fSingle->GetParError(1)), "");
+    legDouble->AddEntry((TObject*)0,
+                        Form("#sigma_{core} = %.4f #pm %.4f mm", sig1, fDouble->GetParError(2)), "");
+    legDouble->AddEntry((TObject*)0, Form("#mu_{tail} = %.4f #pm %.4f mm", mu2, fDouble->GetParError(4)), "");
+    legDouble->AddEntry((TObject*)0,
+                        Form("#sigma_{tail} = %.4f #pm %.4f mm", sig2, fDouble->GetParError(5)), "");
+    legDouble->AddEntry((TObject*)0,
+                        Form("Tail fraction = %.3f", w2), "");
+    legDouble->AddEntry((TObject*)0,
+                        Form("#sigma_{eff} = %.4f mm", sigmaEff), "");
+    legDouble->AddEntry((TObject*)0,
+                        Form("Eff(|x|<5#sigma_{tail}) = %.2f%%",
+                             eff5Tail * 100),
+                        "");
+
+    /* ---------- Double Gaussian canvas ---------- */
+    if (drawPlots) {
+        TCanvas* cDouble =
+            new TCanvas((histName + "Double").c_str(), ("Residual - " + histName + " Double Gaussian").c_str(), 800, 600);
+
+        hist->Draw("E");
+        fDouble->Draw("same");
+        legDouble->Draw();
+        cDouble->Write();
+    }
+
+    // Fill result struct
+    result.sigma68 = sigma68;
+    result.sigmaFit = sigS;
+    result.sigmaFitError = fSingle->GetParError(2);
+    result.mean = muS;
+    result.efficiency = double(N) / totalEvents;
+    result.eff3S = eff3S;
+    result.eff5S = eff5S;
+    result.eff1mm = eff1mm;
+
+    return result;
 }
 
 REGISTER_SCRIPT("DUTAnalysis", DUTAnalysisScript);

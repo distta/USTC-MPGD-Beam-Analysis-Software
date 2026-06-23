@@ -20,10 +20,12 @@ class AlgorithmConfig {
 class WaveformConfig : public AlgorithmConfig {
    public:
     std::string mode = "Default";
-    double cfdFraction = 0.1;
+    double cfdFraction = 0.2;
     double noiseThreshold = 100.0;
     double saturationLevel = 2000.0;
     double timePitch = 25.0;
+    double timeWindowStart = -50;
+    double timeWindowEnd = 500.0;
 
     // 实现AlgorithmConfig接口
     void loadFrom(const json& config) override {
@@ -33,6 +35,8 @@ class WaveformConfig : public AlgorithmConfig {
         if (cfg->contains("noiseThreshold")) noiseThreshold = (*cfg)["noiseThreshold"];
         if (cfg->contains("saturationLevel")) saturationLevel = (*cfg)["saturationLevel"];
         if (cfg->contains("timePitch")) timePitch = (*cfg)["timePitch"];
+        if (cfg->contains("timeWindowStart")) timeWindowStart = (*cfg)["timeWindowStart"];
+        if (cfg->contains("timeWindowEnd")) timeWindowEnd = (*cfg)["timeWindowEnd"];
     }
 
     void print() const override {
@@ -50,7 +54,7 @@ class ClusterConfig : public AlgorithmConfig {
    public:
     int maxGap = 0;              // 最大间隙
     int minClusterSize = 1;      // 最小聚类大小
-    int maxClusterSize = 10;      // 最大聚类大小
+    int maxClusterSize = 10;     // 最大聚类大小
     double MaxChargeDiff = 0.4;  // 对于不同Cluster匹配最大电荷差
 
     void loadFrom(const json& config) override {
@@ -73,6 +77,7 @@ class ClusterConfig : public AlgorithmConfig {
 enum class ReconstructionMethod {
     ChargeWeighted,  // 电荷加权
     UTPC,            // UTPC算法
+    RawUTPC          // raw UTPC算法
 };
 
 // ========== 重建配置 ==========
@@ -87,6 +92,8 @@ class ReconstructionConfig : public AlgorithmConfig {
             std::string methodStr = (*cfg)["method"];
             if (methodStr == "UTPC") {
                 method = ReconstructionMethod::UTPC;
+            } else if (methodStr == "rawUTPC") {
+                method = ReconstructionMethod::RawUTPC;
             } else {
                 method = ReconstructionMethod::ChargeWeighted;
             }
@@ -100,7 +107,7 @@ class ReconstructionConfig : public AlgorithmConfig {
 };
 
 struct planarConfig {
-    std::vector<int> readoutPlaneType= {0, 1};
+    std::vector<int> readoutPlaneType = {0, 1};
     std::map<int, double> readoutPlaneAngle = {{0, 0}, {1, 90}};
     std::map<int, double> readoutPlanePitch = {{0, 0.4}, {1, 0.4}};
     std::map<int, int> readoutPlaneStripNumber = {{0, 256}, {1, 256}};

@@ -45,6 +45,7 @@ class ClusterReconstructor : public IAlgorithm {
     // 不同的重建方法（以stripID为单位）
     void reconstructChargeWeighted(Cluster& cluster, const std::vector<StripHit>& stripHits);
     void reconstructUTPC(Cluster& cluster, const std::vector<StripHit>& stripHits, double t0);
+    void reconstructRawUTPC(Cluster& cluster, const std::vector<StripHit>& stripHits, double t0);
 };
 
 #endif  // CLUSTER_RECONSTRUCTOR_H

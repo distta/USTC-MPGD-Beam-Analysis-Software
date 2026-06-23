@@ -18,6 +18,8 @@ if(NOT Eigen3_FOUND)
     message(FATAL_ERROR "Eigen3 not found!")
 endif()
 
+find_package(Threads REQUIRED)
+
 set(SOURCES
     src/main.cpp
     src/Event/DetectorFrame.cpp
@@ -31,11 +33,19 @@ set(SOURCES
     src/Algorithm/algorithms/ClusterBuilder.cpp
     src/Algorithm/algorithms/ClusterReconstructor.cpp
     src/Algorithm/AnalysisUtils.cpp
+    src/Algorithm/TrackReconstruction.cpp
+    src/Algorithm/TrackerAlignment.cpp
+    src/Algorithm/TrackPerformance.cpp
+    src/Input/ChannelMap.cpp
+    src/Input/ConverterFactory.cpp
+    src/Input/BTAPVDatConverter.cpp
+    src/Input/SRSRootConverter.cpp
     src/Script/Base/RawDataParser.cpp
     src/Script/Base/ScriptFactory.cpp
     src/Script/Base/ScriptManager.cpp
     src/Script/ExampleScript.cpp
     src/Script/TrackAnalysisScript.cpp
+    src/Script/TimeResolutionScript.cpp
     src/Script/DUTAnalysisScript.cpp
     src/Script/ChannelNoiseScript.cpp
 )
@@ -48,6 +58,7 @@ target_include_directories(BeamAnalysis PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Detector
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Event
     ${CMAKE_CURRENT_SOURCE_DIR}/include/EventDisplay
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/Input
     ${CMAKE_CURRENT_SOURCE_DIR}/include/Script
     ${ROOT_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR} 
@@ -55,6 +66,7 @@ target_include_directories(BeamAnalysis PRIVATE
 
 target_link_libraries(BeamAnalysis
     ${ROOT_LIBRARIES}
+    Threads::Threads
     stdc++fs
 )
 

@@ -6,6 +6,8 @@
       "enabled": true,
       "config": {
         "saveValidationData": true,
+        "performanceHistograms": true,
+        "residualHistogramRange": 2.0,
         "progressInterval": 10000
       }
     },
@@ -16,6 +18,19 @@
       "config": {
         "runAlignment": true,
         "saveNoiseData": true,
+        "saveEfficiencyMap": true,
+        "efficiencyMap": {
+          "xMin": 10.0,
+          "xMax": 90.0,
+          "xBins": 8,
+          "yMin": 10.0,
+          "yMax": 45.0,
+          "yBins": 7,
+          "matchRadius": 2.0,
+          "minEntriesPerBin": 1,
+          "excludeXBins": [],
+          "excludeYBins": []
+        },
         "progressInterval": 1000,
         "maxEvents": -1
       }
@@ -27,6 +42,21 @@
       "config": {
         "message": "Hello from ExampleScript!",
         "eventLimit": 100
+      }
+    },
+    {
+      "name": "Time Resolution Analysis",
+      "type": "TimeResolution",
+      "enabled": false,
+      "config": {
+        "csvDirectory": "/path/to/lecroy/csv",
+        "triggerThreshold": 1.0,
+        "eventThreshold": 0.5,
+        "eventBits": 16,
+        "timingCacheFile": "OscilloscopeTimingCache.root",
+        "rebuildTimingCache": false,
+        "histogramBins": 160,
+        "maxWaveformFiles": -1
       }
     },
     {
