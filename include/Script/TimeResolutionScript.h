@@ -17,7 +17,7 @@ class TimeResolutionScript : public IScript {
     std::string m_csvDirectory;
     std::string m_trackFile;
     std::string m_outputFile = "TimeResolution.root";
-    std::string m_timingCacheFile = "OscilloscopeTimingCache.root";
+    std::string m_dataCacheFile = "OscilloscopeDataCache.root";
     std::string m_waveformDiagnosticFile = "WaveformDiagnostics.root";
     bool m_rebuildTimingCache = false;
     bool m_writeWaveformDiagnostics = false;

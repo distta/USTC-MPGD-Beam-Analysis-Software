@@ -29,13 +29,14 @@ set(SOURCES
     src/Detector/Cylinder.cpp
     src/Detector/DetectorFactory.cpp
     src/Algorithm/AlgorithmFactory.cpp
-    src/Algorithm/algorithms/WaveformProcessor.cpp
-    src/Algorithm/algorithms/ClusterBuilder.cpp
-    src/Algorithm/algorithms/ClusterReconstructor.cpp
+    src/Algorithm/Analyzer/WaveformProcessor.cpp
+    src/Algorithm/Oscilloscope/OscilloscopeDataProcessor.cpp
+    src/Algorithm/Analyzer/ClusterBuilder.cpp
+    src/Algorithm/Analyzer/ClusterReconstructor.cpp
     src/Algorithm/AnalysisUtils.cpp
-    src/Algorithm/TrackReconstruction.cpp
-    src/Algorithm/TrackerAlignment.cpp
-    src/Algorithm/TrackPerformance.cpp
+    src/Algorithm/Track/TrackReconstruction.cpp
+    src/Algorithm/Track/TrackerAlignment.cpp
+    src/Algorithm/Track/TrackPerformance.cpp
     src/Input/ChannelMap.cpp
     src/Input/ConverterFactory.cpp
     src/Input/BTAPVDatConverter.cpp
@@ -47,7 +48,6 @@ set(SOURCES
     src/Script/TrackAnalysisScript.cpp
     src/Script/TimeResolutionScript.cpp
     src/Script/DUTAnalysisScript.cpp
-    src/Script/ChannelNoiseScript.cpp
 )
 
 add_executable(BeamAnalysis ${SOURCES})

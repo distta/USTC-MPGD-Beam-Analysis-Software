@@ -68,7 +68,6 @@ class DUTAnalysisScript : public IScript {
    private:
     // 配置参数
     bool m_runAlignment;
-    bool m_saveNoiseData;
     bool m_saveEfficiencyMap = true;
     int m_progressInterval;
     int m_maxEvents;

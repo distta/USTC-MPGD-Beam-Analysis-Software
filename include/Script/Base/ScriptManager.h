@@ -39,10 +39,12 @@ public:
      * @brief 构造函数
      * @param configFile 配置文件路径
      * @param rawDir 原始数据目录
+     * @param convertedDir 标准ROOT数据目录
      * @param resultDir 结果输出目录
      * @param runID 运行ID
      */
     ScriptManager(const std::string& configFile, const std::string& rawDir,
+                  const std::string& convertedDir,
                   const std::string& resultDir, const std::string& runID);
     ~ScriptManager() = default;
 
@@ -103,6 +105,7 @@ private:
     json m_config;                            ///< 全局配置对象
     std::string m_configFile;                 ///< 配置文件路径
     std::string m_rawDir;                     ///< 原始数据目录
+    std::string m_convertedDir;               ///< 标准ROOT数据目录
     std::string m_resultDir;                  ///< 结果输出目录
     std::string m_runID;                      ///< 运行ID
     std::string m_outputDir;                  ///< 完整输出路径

@@ -27,8 +27,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <map>
-#include <set>
+#include <unordered_map>
 
 using namespace std;
 
@@ -73,7 +72,6 @@ bool IsExcludedEfficiencyBin(const std::vector<int>& excludedXBins,
 
 void DUTAnalysisScript::LoadConfig(const json& config) {
     m_runAlignment = config.value("runAlignment", true);
-    m_saveNoiseData = config.value("saveNoiseData", true);
     m_saveEfficiencyMap = config.value("saveEfficiencyMap", true);
     m_progressInterval = config.value("progressInterval", 1000);
     m_maxEvents = config.value("maxEvents", -1);
@@ -112,7 +110,6 @@ void DUTAnalysisScript::LoadConfig(const json& config) {
 void DUTAnalysisScript::Print() const {
     cout << "DUTAnalysisScript Configuration:" << endl;
     cout << "  Run Alignment: " << (m_runAlignment ? "Yes" : "No") << endl;
-    cout << "  Save Noise Data: " << (m_saveNoiseData ? "Yes" : "No") << endl;
     cout << "  Save Efficiency Map: " << (m_saveEfficiencyMap ? "Yes" : "No") << endl;
     cout << "  Efficiency Region X: [" << m_effXMin << ", " << m_effXMax << "] mm, bins=" << m_effXBins << endl;
     cout << "  Efficiency Region Y: [" << m_effYMin << ", " << m_effYMax << "] mm, bins=" << m_effYBins << endl;
@@ -169,7 +166,28 @@ bool DUTAnalysisScript::Execute() {
     Int_t eventID;
     Track* track = nullptr;
     double sigTime;
+
+    // Tracks contains one row per reconstructed track.  Count event IDs using
+    // only the lightweight scalar branch first, then analyze exactly-one-track
+    // events in the full pass below.
+    trackTree->SetBranchStatus("*", false);
+    trackTree->SetBranchStatus("eventID", true);
     trackTree->SetBranchAddress("eventID", &eventID);
+    const Long64_t totalTrackEntries = trackTree->GetEntries();
+    std::unordered_map<int, int> tracksPerEvent;
+    tracksPerEvent.reserve(static_cast<size_t>(totalTrackEntries));
+    for (Long64_t i = 0; i < totalTrackEntries; ++i) {
+        trackTree->GetEntry(i);
+        ++tracksPerEvent[eventID];
+    }
+
+    Long64_t singleTrackEvents = 0;
+    for (const auto& [id, count] : tracksPerEvent) {
+        (void)id;
+        if (count == 1) ++singleTrackEvents;
+    }
+
+    trackTree->SetBranchStatus("*", true);
     trackTree->SetBranchAddress("track", &track);
     trackTree->SetBranchAddress("t0", &sigTime);
 
@@ -177,10 +195,10 @@ bool DUTAnalysisScript::Execute() {
     std::vector<Event> events;  // Script本地数据
 
     int processed = 0;
-    Long64_t nEntries = trackTree->GetEntries();
-    if (m_maxEvents > 0 && nEntries > m_maxEvents) {
-        nEntries = m_maxEvents;
-    }
+
+    cout << "  Track entries: " << totalTrackEntries
+         << ", unique events: " << tracksPerEvent.size()
+         << ", single-track events: " << singleTrackEvents << endl;
 
     const auto& duts = factory.GetDetectorsByRole(Detector::Role::DUT);
 
@@ -188,33 +206,17 @@ bool DUTAnalysisScript::Execute() {
     TFile* fDut = new TFile(dutFile.c_str(), "RECREATE");
     TTree* tDut = new TTree("DUTTree", "DUT data");
 
-    TTree* noiseTree = nullptr;
-    int noise_eventID, noise_stripID, noise_stripType;
-    double noise_value;
-
-    struct NoiseStat {
-        long long n = 0;
-        double sum = 0.0;
-        double sum2 = 0.0;
-    };
-    map<pair<int, int>, NoiseStat> noiseStats;
-    std::set<int> noiseProcessedEvents;
-
-    if (m_saveNoiseData) {
-        noiseTree = new TTree("Noise", "Per-strip noise samples");
-        noiseTree->Branch("eventID", &noise_eventID);
-        noiseTree->Branch("stripID", &noise_stripID);
-        noiseTree->Branch("stripType", &noise_stripType);
-        noiseTree->Branch("noise", &noise_value);
-    }
-
     // 加载事件并处理DUT数据
-    for (Long64_t i = 0; i < nEntries; ++i) {
+    if (m_maxEvents == -1) m_maxEvents = tracksPerEvent.size();
+    for (Long64_t i = 0; i < totalTrackEntries && processed < m_maxEvents; ++i) {
         trackTree->GetEntry(i);
 
-        if (processed % m_progressInterval == 0) {
-            cout << "\r  Processing: " << processed << "/" << nEntries << flush;
-        }
+        const auto multiplicity = tracksPerEvent.find(eventID);
+        if (multiplicity == tracksPerEvent.end() || multiplicity->second == 0) continue;
+
+        if (processed % m_progressInterval == 0)
+            cout << "\r  Processing events: " << processed
+                 << "/" << m_maxEvents << flush;
 
         auto rawHits = parser->LoadEvent(eventID);
         if (rawHits.empty()) continue;
@@ -227,29 +229,13 @@ bool DUTAnalysisScript::Execute() {
             detEvt->SetRawData(rawHits[det->GetID()]);
             detEvt->Process(evt.t0);
             evt.detectorFramesMap[id] = std::move(detEvt);
-
-            if (m_saveNoiseData && noiseProcessedEvents.insert(eventID).second) {
-                noise_eventID = eventID;
-                for (const auto& raw : evt.detectorFramesMap[id]->Raw()) {
-                    noise_stripID = raw.stripID;
-                    noise_stripType = raw.type;
-                    noise_value = raw.adc[0];
-                    noiseTree->Fill();
-
-                    auto key = make_pair(noise_stripType, noise_stripID);
-                    auto& stat = noiseStats[key];
-                    stat.n++;
-                    stat.sum += noise_value;
-                    stat.sum2 += noise_value * noise_value;
-                }
-            }
         }
 
         events.push_back(move(evt));
         processed++;
     }
     cout << endl;
-    cout << "  Processed " << events.size() << " DUT events" << endl;
+    cout << "  Processed " << events.size() << " single-track DUT events" << endl;
 
     // 运行DUT对齐
     if (m_runAlignment) {
@@ -262,38 +248,6 @@ bool DUTAnalysisScript::Execute() {
     DUTAnalysisConfig analysisConfig;
 
     cout << "\nSaving DUT results..." << endl;
-
-    // 保存噪声统计
-    if (m_saveNoiseData) {
-        TTree* noiseStatTree = new TTree("NoiseStat", "Per-strip noise variance");
-        int stat_stripID, stat_stripType;
-        long long stat_n;
-        double stat_mean, stat_variance, stat_sigma;
-
-        noiseStatTree->Branch("stripID", &stat_stripID);
-        noiseStatTree->Branch("stripType", &stat_stripType);
-        noiseStatTree->Branch("nSamples", &stat_n);
-        noiseStatTree->Branch("mean", &stat_mean);
-        noiseStatTree->Branch("variance", &stat_variance);
-        noiseStatTree->Branch("sigma", &stat_sigma);
-
-        for (const auto& [key, stat] : noiseStats) {
-            stat_stripType = key.first;
-            stat_stripID = key.second;
-            stat_n = stat.n;
-
-            if (stat.n < 2) continue;
-
-            stat_mean = stat.sum / stat.n;
-            stat_variance = (stat.sum2 - stat.n * stat_mean * stat_mean) / (stat.n - 1);
-            stat_sigma = sqrt(stat_variance);
-
-            noiseStatTree->Fill();
-        }
-
-        noiseTree->Write();
-        noiseStatTree->Write();
-    }
 
     // DUT数据分支
     Int_t dutID;
@@ -356,7 +310,7 @@ bool DUTAnalysisScript::Execute() {
             if (predY < m_effYMin || predY > m_effYMax) continue;
             // if (predY < 60 || predY > 66) continue;
             // if (predX > 70 || predX < 55) continue;
-            if (predY < 0 || predY > 20) continue;
+            // if (predY < 0 || predY > 20) continue;
             if (predX > m_effXMax || predX < m_effXMin) continue;
 
             auto frameIt = evt.detectorFramesMap.find(id);

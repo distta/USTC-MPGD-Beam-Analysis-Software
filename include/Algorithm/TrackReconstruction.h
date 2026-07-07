@@ -17,7 +17,7 @@ struct Config {
     int maxBranchesPerLayer = 3;
     int maxCandidates = 4000;
     int maxTracks = 32;
-    int conflictSearchNodes = 200000;
+    int conflictSearchNodes = 20000; // bounded exact refinement after a fast greedy solution
 };
 
 struct Result {

@@ -29,8 +29,12 @@ void TrackAnalysisScript::LoadConfig(const json& config) {
     m_tracking.maxBranchesPerLayer = config.value("maxBranchesPerLayer", 3);
     m_tracking.maxCandidates = config.value("maxCandidates", 4000);
     m_tracking.maxTracks = config.value("maxTracksPerEvent", 32);
+    m_tracking.conflictSearchNodes = config.value("conflictSearchNodes", 20000);
     m_alignment.maxIterations = config.value("alignmentIterations", 20);
     m_alignment.minTracks = config.value("alignmentMinTracks", 20);
+    m_alignment.maxEvents = config.value("alignmentMaxEvents", 10000);
+    m_alignment.maxTracks = config.value("alignmentMaxTracks", 5000);
+    m_alignment.maxFunctionCalls = config.value("alignmentMaxFunctionCalls", 600);
     m_alignment.maxShiftStep = config.value("alignmentMaxShiftStep", 0.20);
     m_alignment.maxRotationStep = config.value("alignmentMaxRotationStep", 0.001);
     m_alignment.debug = m_debug;

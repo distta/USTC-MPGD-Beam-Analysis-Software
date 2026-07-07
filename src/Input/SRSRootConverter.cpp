@@ -37,9 +37,14 @@ std::tuple<int, int, int> MapSRSChannel(unsigned int boardID,
     const int detectorID = rawDataIndex / 2 + 1;
     int stripID = static_cast<int>(mmStrip);
 
-    if (boardID == 12 || boardID == 14)
-        stripID = 384 - static_cast<int>(channelID);
-    else if (boardID == 13 || boardID == 15)
+    if (boardID == 12)
+        stripID = 256 - static_cast<int>(channelID);
+    else if (boardID == 13)
+        stripID = 128 - static_cast<int>(channelID);
+
+    if (boardID == 14)
+        stripID = 256 - static_cast<int>(channelID);
+    else if (boardID == 15)
         stripID = 128 - static_cast<int>(channelID);
 
     return {detectorID, stripID, planeType};
@@ -131,9 +136,14 @@ bool SRSRootConverter::Convert(const json& config, const std::string& outputPath
                         ? static_cast<ULong64_t>(timeSeconds) * 1000000ULL +
                               static_cast<ULong64_t>(timeMicroseconds)
                         : static_cast<ULong64_t>(entry);
-        detectorIDs.clear(); planeTypes.clear(); stripIDs.clear();
-        boardIDs.clear(); chipIDs.clear(); channelIDs.clear();
-        waveforms.clear(); channelFlags.clear();
+        detectorIDs.clear();
+        planeTypes.clear();
+        stripIDs.clear();
+        boardIDs.clear();
+        chipIDs.clear();
+        channelIDs.clear();
+        waveforms.clear();
+        channelFlags.clear();
 
         for (size_t i = 0; i < count; ++i) {
             const int boardID = static_cast<int>((*apvIDs)[i]);

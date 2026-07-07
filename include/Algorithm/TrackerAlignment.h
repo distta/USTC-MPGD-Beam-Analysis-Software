@@ -12,6 +12,9 @@ namespace Tracking {
 struct AlignmentConfig {
     int maxIterations = 20;
     int minTracks = 20;
+    int maxEvents = 10000;          // uniformly sampled events used to build alignment tracks
+    int maxTracks = 5000;           // bound the cost of every objective evaluation
+    int maxFunctionCalls = 600;
     double huberK = 2.5;
     double maxShiftStep = 0.20;     // mm / iteration
     double maxRotationStep = 0.001; // rad / iteration
