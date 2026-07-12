@@ -8,14 +8,12 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 
 class EventDisplayManager {
 public:
-    // rawDir: 原始 root 所在目录（会找到 rawDir + "/run" + runID + ".root"）
-    // resultDir: 结果目录（TrackInfo.root 在 resultDir/runID/TrackInfo.root）
-    EventDisplayManager(const std::string& rawDir,
-                        const std::string& resultDir,
-                        const std::string& runID);
+    EventDisplayManager(std::shared_ptr<RawDataParser> parser,
+                        const std::string& outputDirectory);
 
     ~EventDisplayManager();
 
@@ -53,14 +51,8 @@ private:
     const RawData* FindRawForStrip(const std::vector<RawData>& raw, int stripID, int type) const;
 
 private:
-    std::string m_rawDir;
-    std::string m_resultDir;
-    std::string m_runID;
-
-    std::string m_rawFilePath;    // rawDir + "/run" + runID + ".root"
-    std::string m_trackFilePath;  // resultDir + "/" + runID + "/TrackInfo.root"
-
-    std::unique_ptr<RawDataParser> m_parser;
+    std::string m_trackFilePath;
+    std::shared_ptr<RawDataParser> m_parser;
 
     std::vector<TrackEntry> m_trackEntries;
     std::vector<TCanvas*> m_canvases; // 管理 ROOT canvas

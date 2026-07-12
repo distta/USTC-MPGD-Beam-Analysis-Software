@@ -1,4 +1,4 @@
-#include "Algorithm/algorithms/OscilloscopeDataProcessor.h"
+#include "Algorithm/Oscilloscope/OscilloscopeDataProcessor.h"
 
 #include "Algorithm/AlgorithmFactory.h"
 

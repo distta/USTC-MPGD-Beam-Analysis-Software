@@ -44,21 +44,16 @@ bool RawDataParser::Initialize() {
     }
 
     TTree* metadataTree = static_cast<TTree*>(m_file->Get("Metadata"));
-    int schemaVersion = 0;
-
-    if (!metadataTree || !metadataTree->GetBranch("schema_version")) {
-        std::cerr << "[RawDataParser] Metadata/schema_version is missing"
-                  << std::endl;
-        return false;
-    }
-
-    metadataTree->SetBranchAddress("schema_version", &schemaVersion);
-    metadataTree->GetEntry(0);
-
-    if (schemaVersion != 1) {
-        std::cerr << "[RawDataParser] Unsupported schema version: "
-                  << schemaVersion << std::endl;
-        return false;
+    if (metadataTree && metadataTree->GetBranch("schema_version")) {
+        metadataTree->SetBranchAddress("schema_version", &m_schemaVersion);
+        metadataTree->GetEntry(0);
+        if (m_schemaVersion != 1) {
+            std::cerr << "[RawDataParser] Unsupported schema version: "
+                      << m_schemaVersion << std::endl;
+            return false;
+        }
+    } else {
+        m_schemaVersion = 1;
     }
 
     const char* required[] = {
@@ -66,7 +61,7 @@ bool RawDataParser::Initialize() {
         "timestamp",
         "detector_id",
         "plane_type",
-        "strip_id",
+        "id",
         "waveform"
     };
 
@@ -82,19 +77,12 @@ bool RawDataParser::Initialize() {
     m_tree->SetBranchAddress("timestamp", &m_timestamp);
     m_tree->SetBranchAddress("detector_id", &m_detectorIDs);
     m_tree->SetBranchAddress("plane_type", &m_planeTypes);
-    m_tree->SetBranchAddress("strip_id", &m_stripIDs);
+    m_tree->SetBranchAddress("id", &m_stripIDs);
     m_tree->SetBranchAddress("waveform", &m_waveforms);
 
     m_numOfEvents = m_tree->GetEntries();
 
     LoadCanonicalChannelData();
-
-    std::cout << "[RawDataParser] Initialized standard ROOT "
-              << m_file->GetName()
-              << " containing "
-              << m_numOfEvents
-              << " events"
-              << std::endl;
 
     return true;
 }

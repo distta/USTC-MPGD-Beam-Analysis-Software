@@ -1,8 +1,0 @@
-{
-  "baseDir": "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511",
-  "configDir": "{baseDir}/config",
-  "rawDir": "{baseDir}/raw",
-  "convertedDir": "{baseDir}/converted",
-  "resultDir": "{baseDir}/result",
-  "defaultConfig": "config.json"
-}

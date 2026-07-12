@@ -1,7 +1,7 @@
 #include "Script/TimeResolutionScript.h"
 
-#include "Algorithm/algorithms/OscilloscopeDataProcessor.h"
-#include "Algorithm/algorithms/WaveformProcessor.h"
+#include "Algorithm/Oscilloscope/OscilloscopeDataProcessor.h"
+#include "Algorithm/Analyzer/WaveformProcessor.h"
 #include "Event/DataModel.h"
 #include "Script/Base/RawDataParser.h"
 #include "Script/Base/ScriptFactory.h"

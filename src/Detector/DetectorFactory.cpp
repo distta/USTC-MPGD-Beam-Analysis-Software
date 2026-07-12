@@ -1,11 +1,84 @@
 #include "Detector/DetectorFactory.h"
 #include "Detector/Cylinder.h"
 #include "Detector/Planar.h"
+#include "Detector/PlanarPad.h"
 
+#include <algorithm>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 
 using namespace std;
+
+namespace {
+
+string RoleName(const Detector& detector) {
+    if (detector.isTracker()) return "Tracker";
+    if (detector.isDUT()) return "DUT";
+    return "Ignored";
+}
+
+string TypeName(const shared_ptr<Detector>& detector) {
+    if (dynamic_pointer_cast<PlanarPad>(detector)) return "planar_pad";
+    if (dynamic_pointer_cast<Planar>(detector)) return "planar";
+    if (dynamic_pointer_cast<Cylinder>(detector)) return "cylinder";
+    return "unknown";
+}
+
+string FormatVector(const TVector3& value) {
+    ostringstream output;
+    output << fixed << setprecision(3) << '(' << value.X() << ", "
+           << value.Y() << ", " << value.Z() << ')';
+    return output.str();
+}
+
+void PrintGeometry(const map<int, shared_ptr<Detector>>& detectors) {
+    size_t nameWidth = 4;
+    size_t trackerCount = 0;
+    size_t dutCount = 0;
+    size_t ignoredCount = 0;
+
+    for (const auto& [id, detector] : detectors) {
+        (void)id;
+        nameWidth = max(nameWidth, detector->GetName().size());
+        if (detector->isTracker()) {
+            ++trackerCount;
+        } else if (detector->isDUT()) {
+            ++dutCount;
+        } else {
+            ++ignoredCount;
+        }
+    }
+
+    const size_t blockWidth = max<size_t>(89, nameWidth + 83);
+    const string border(blockWidth, '=');
+    const string divider(blockWidth, '-');
+
+    cout << '\n'
+         << border << '\n'
+         << "  Detector Geometry\n"
+         << "  Initialized " << detectors.size() << " detectors: "
+         << trackerCount << " Tracker, " << dutCount << " DUT, "
+         << ignoredCount << " Ignored\n"
+         << divider << '\n'
+         << "  " << left << setw(5) << "ID" << setw(9) << "Role"
+         << setw(9) << "Type"
+         << setw(static_cast<int>(nameWidth + 2)) << "Name"
+         << setw(31) << "Position (x, y, z)" << "Rotation (x, y, z)\n"
+         << divider << '\n';
+
+    for (const auto& [id, detector] : detectors) {
+        cout << "  " << left << setw(5) << id << setw(9) << RoleName(*detector)
+             << setw(9) << TypeName(detector)
+             << setw(static_cast<int>(nameWidth + 2)) << detector->GetName()
+             << setw(31) << FormatVector(detector->GetPos())
+             << FormatVector(detector->GetRot()) << '\n';
+    }
+    cout << right << border << "\n\n" << flush;
+}
+
+}  // namespace
 
 DetectorFactory& DetectorFactory::GetInstance() {
     static DetectorFactory instance;
@@ -19,8 +92,6 @@ bool DetectorFactory::Initialize(const json& config) {
         return false;
     }
 
-    cout << "[DetectorFactory] Initializing detectors..." << endl;
-
     try {
         for (const auto& detConfig : config["detectors"]) {
             auto detector = CreateDetector(detConfig);
@@ -30,12 +101,10 @@ bool DetectorFactory::Initialize(const json& config) {
                     throw runtime_error("Duplicate detector ID: " + to_string(id));
                 }
                 m_detectors[id] = detector;
-                cout << "[DetectorFactory] Created detector: " << detector->GetName()
-                     << " (ID=" << id << ", Type=" << detConfig.value("type", "planar") << ")" << endl;
             }
         }
 
-        cout << "[DetectorFactory] Successfully initialized " << m_detectors.size() << " detectors" << endl;
+        PrintGeometry(m_detectors);
         return true;
 
     } catch (const exception& e) {
@@ -61,6 +130,8 @@ shared_ptr<Detector> DetectorFactory::CreateDetector(const json& detConfig) {
 
     if (type == "planar") {
         detector = make_shared<Planar>(id, name, detConfig);
+    } else if (type == "planar_pad") {
+        detector = make_shared<PlanarPad>(id, name, detConfig);
     } else if (type == "cylinder") {
         detector = make_shared<Cylinder>(id, name, detConfig);
     } else {
@@ -108,5 +179,4 @@ vector<int> DetectorFactory::GetDetectorIDsByRole(Detector::Role role) const {
 
 void DetectorFactory::Clear() {
     m_detectors.clear();
-    cout << "[DetectorFactory] Cleared all detectors" << endl;
 }

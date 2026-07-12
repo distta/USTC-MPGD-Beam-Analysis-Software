@@ -4,5 +4,11 @@
 
 class SRSRootConverter : public IRawDataConverter {
    public:
-    bool Convert(const json& config, const std::string& outputPath) override;
+    bool AcquireRawData(const std::filesystem::path& rawDir,
+                        const std::string& runID,
+                        std::string& error) override;
+    bool Convert(const std::string& outputPath) override;
+
+   private:
+    std::filesystem::path m_inputPath;
 };

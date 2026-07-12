@@ -1,4 +1,4 @@
-#include "algorithms/ClusterReconstructor.h"
+#include "Algorithm/Analyzer/ClusterReconstructor.h"
 #include "AlgorithmFactory.h"
 #include "DataModel.h"
 #include "DetectorFrame.h"

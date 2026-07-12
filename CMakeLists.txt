@@ -26,6 +26,7 @@ set(SOURCES
     src/Event/EventDisplay.cpp
     src/Detector/Detector.cpp
     src/Detector/Planar.cpp
+    src/Detector/PlanarPad.cpp
     src/Detector/Cylinder.cpp
     src/Detector/DetectorFactory.cpp
     src/Algorithm/AlgorithmFactory.cpp
@@ -43,7 +44,6 @@ set(SOURCES
     src/Input/SRSRootConverter.cpp
     src/Script/Base/RawDataParser.cpp
     src/Script/Base/ScriptFactory.cpp
-    src/Script/Base/ScriptManager.cpp
     src/Script/ExampleScript.cpp
     src/Script/TrackAnalysisScript.cpp
     src/Script/TimeResolutionScript.cpp

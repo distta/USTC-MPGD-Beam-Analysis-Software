@@ -1,13 +1,18 @@
 {
+  "mode": "analysis",
   "conversion": {
-    "type": "BTAPVDat",
-    "input": "/home/qxhuang/fs/ustcfs/workarea/BeamResult_LHCb/LHCB/APV_DATA_1/run1.dat",
-    "pedestal_input": "/home/qxhuang/fs/ustcfs/workarea/BeamResult_LHCb/LHCB/APV_DATA_1/run2_pedstal.dat",
-    "output": "/home/qxhuang/fs/ustcfs/workarea/BeamResult_LHCb/converted/run1.root",
-    "map": "config/maps/channel_map.csv",
-    "samples_per_waveform": 30,
-    "decoder_debug": true,
-    "decoder_debug_limit": 200,
-    "allow_unmapped": true
-  }
+    "overwrite": false,
+    "type": "BTAPVDat"
+  },
+  "detectors": [],
+  "scripts": [
+    {
+      "name": "Conversion check",
+      "type": "ExampleScript",
+      "enabled": true,
+      "config": {
+        "message": "BT APV conversion completed"
+      }
+    }
+  ]
 }

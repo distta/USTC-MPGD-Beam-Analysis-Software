@@ -11,4 +11,9 @@ class Planar : public Detector {
     TVector3 GetPlaneNormal() const;
 
     std::vector<LocalHit> CalcLocalHitsFromClusters(const std::vector<Cluster>& clusters) const override;
+
+    const planarConfig* GetPlanarConfig() const override { return &m_config; }
+
+   private:
+    planarConfig m_config;
 };

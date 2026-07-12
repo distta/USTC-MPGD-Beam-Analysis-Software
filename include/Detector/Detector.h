@@ -33,7 +33,9 @@ class Detector {
         m_alignPos.SetXYZ(dx, dy, dz);
         m_alignRot.SetXYZ(dRotX, dRotY, dRotZ);
     }
-    const planarConfig& getConfig() const { return m_config; }
+    virtual const planarConfig* GetPlanarConfig() const { return nullptr; }
+    virtual const planarPadConfig* GetPlanarPadConfig() const { return nullptr; }
+    virtual const cylinderConfig* GetCylinderConfig() const { return nullptr; }
 
     // Coordinate Transform
     TVector3 LocalToGlobal(const TVector3& localPos) const;
@@ -72,6 +74,4 @@ class Detector {
     int m_id;
     std::string m_name;
     Role m_role;
-
-    planarConfig m_config;
 };

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "Algorithm/TrackReconstruction.h"
-#include "Algorithm/TrackerAlignment.h"
-#include "Algorithm/TrackPerformance.h"
+#include "Algorithm/Track/TrackReconstruction.h"
+#include "Algorithm/Track/TrackerAlignment.h"
+#include "Algorithm/Track/TrackPerformance.h"
 #include "Script/Base/IScript.h"
 
 class TrackAnalysisScript : public IScript {
@@ -14,6 +14,7 @@ class TrackAnalysisScript : public IScript {
     bool Execute() override;
 
    private:
+    bool m_runAlignment = false;
     bool m_saveValidationData = true;
     bool m_debug = true;
     bool m_performanceHistograms = true;

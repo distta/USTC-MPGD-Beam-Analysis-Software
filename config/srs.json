@@ -1,9 +1,18 @@
 {
+  "mode": "analysis",
   "conversion": {
-    "enabled": true,
     "overwrite": false,
-    "type": "SRS",
-    "input": "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/raw/run1755.root",
-    "output": "/home/qxhuang/fs/ustcfs/workarea/BeamResult_202511/converted/run1755.root"
-  }
+    "type": "SRS"
+  },
+  "detectors": [],
+  "scripts": [
+    {
+      "name": "Conversion check",
+      "type": "ExampleScript",
+      "enabled": true,
+      "config": {
+        "message": "SRS conversion completed"
+      }
+    }
+  ]
 }

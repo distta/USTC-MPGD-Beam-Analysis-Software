@@ -1,7 +1,7 @@
 #pragma once
 
-#include "Algorithm/TrackReconstruction.h"
-#include "Algorithm/TrackerAlignment.h"
+#include "Algorithm/Track/TrackReconstruction.h"
+#include "Algorithm/Track/TrackerAlignment.h"
 #include <map>
 #include <memory>
 #include <vector>

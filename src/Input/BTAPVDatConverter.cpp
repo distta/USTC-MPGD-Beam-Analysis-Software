@@ -3,6 +3,8 @@
 #include <TFile.h>
 #include <TTree.h>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -18,6 +20,7 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+using json = nlohmann::json;
 
 namespace {
 
@@ -73,7 +76,61 @@ std::vector<std::string> CollectDatFiles(const json& config,
     return files;
 }
 
+fs::path ResolvePath(const json& config,
+                     const char* key,
+                     const fs::path& defaultPath,
+                     const fs::path& baseDir) {
+    if (!config.contains(key) || !config[key].is_string() ||
+        config[key].get<std::string>().empty()) {
+        return defaultPath;
+    }
+
+    fs::path path = config[key].get<std::string>();
+    if (path.is_absolute()) {
+        return path.lexically_normal();
+    }
+    return (baseDir / path).lexically_normal();
+}
+
+bool HasFiles(const json& config, const char* key) {
+    return config.contains(key) && config[key].is_array() &&
+           !config[key].empty();
+}
+
+bool IsReadableInputPath(const fs::path& path) {
+    return fs::is_regular_file(path) || fs::is_directory(path);
+}
+
 }  // namespace
+
+bool BTAPVDatConverter::AcquireRawData(const fs::path& rawDir,
+                                       const std::string& runID,
+                                       std::string& error) {
+    const fs::path baseDir = rawDir.parent_path();
+    const fs::path rawInput = rawDir / ("run" + runID + ".dat");
+    const fs::path pedestalInput = rawDir / ("run" + runID + "_pedestal.dat");
+    const fs::path mapInput = baseDir / "maps" / "channel_map.csv";
+
+    if (!fs::is_regular_file(rawInput)) {
+        error = "conversion input does not exist: " + rawInput.string();
+        return false;
+    }
+
+    if (!fs::is_regular_file(pedestalInput)) {
+        error = "pedestal input does not exist: " + pedestalInput.string();
+        return false;
+    }
+
+    if (!fs::is_regular_file(mapInput)) {
+        error = "channel map does not exist: " + mapInput.string();
+        return false;
+    }
+
+    m_files = {rawInput.string()};
+    m_pedestalFiles = {pedestalInput.string()};
+    m_mapPath = mapInput.string();
+    return true;
+}
 
 bool BTAPVDatConverter::ReadWord(std::istream& input, uint16_t& value) {
     unsigned char bytes[2];
@@ -283,8 +340,12 @@ bool BTAPVDatConverter::DecodeFile(const std::string& path,
     return blockCount > 0;
 }
 
-bool BTAPVDatConverter::Convert(const json& config,
-                                const std::string& outputPath) {
+bool BTAPVDatConverter::Convert(const std::string& outputPath) {
+    json config;
+    config["files"] = m_files;
+    config["pedestal_files"] = m_pedestalFiles;
+    config["map"] = m_mapPath;
+
     const auto files = CollectDatFiles(config, "input", "files");
     const auto pedestalFiles = CollectDatFiles(
         config, "pedestal_input", "pedestal_files");

@@ -1,18 +1,21 @@
 #include "Detector/Planar.h"
 #include "DataModel.h"
 #include "iostream"
+#include <algorithm>
 #include <cmath>
 #include <map>
 
 Planar::Planar(int id, const std::string& name, const json& config) : Detector(id, name, config) {
 
     if (config.contains("readoutPlanes")) {
+        m_config.readoutPlaneType.clear();
         m_config.readoutPlaneAngle.clear();
         m_config.readoutPlanePitch.clear();
         m_config.readoutPlaneStripNumber.clear();
         for (auto& [planeIDStr, planeData] : config["readoutPlanes"].items()) {
             try {
                 int type = std::stoi(planeIDStr);
+                m_config.readoutPlaneType.push_back(type);
                 m_config.readoutPlaneAngle.emplace(type, planeData["angle"]);
                 m_config.readoutPlanePitch.emplace(type, planeData["pitch"]);
                 m_config.readoutPlaneStripNumber.emplace(type, int(planeData["num"]));
@@ -20,6 +23,8 @@ Planar::Planar(int id, const std::string& name, const json& config) : Detector(i
                 std::cout << "Error: " << e.what() << " in readout plane configuration" << std::endl;
             }
         }
+        std::sort(m_config.readoutPlaneType.begin(),
+                  m_config.readoutPlaneType.end());
     }
 }
 

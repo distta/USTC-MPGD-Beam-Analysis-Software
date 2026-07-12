@@ -113,6 +113,18 @@ struct planarConfig {
     std::map<int, int> readoutPlaneStripNumber = {{0, 256}, {1, 256}};
 };
 
+struct planarPadConfig {
+    int rows = 0;
+    int columns = 0;
+    double pitchX = 0.0;
+    double pitchY = 0.0;
+    double sizeX = 0.0;
+    double sizeY = 0.0;
+    int planeType = 0;
+    std::string indexing = "row-major";
+    std::string origin = "center";
+};
+
 struct cylinderConfig {
     double radius = 65;
     std::map<int, double> readoutPlaneAngle = {{0, 0}};

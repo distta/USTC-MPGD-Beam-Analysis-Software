@@ -22,13 +22,13 @@
 #include <iostream>
 #include <limits>
 
-EventDisplayManager::EventDisplayManager(const std::string& rawDir,
-                                         const std::string& resultDir,
-                                         const std::string& runID)
-    : m_rawDir(rawDir), m_resultDir(resultDir), m_runID(runID) {
-    m_rawFilePath = m_rawDir + "/run" + m_runID + ".root";
-    m_trackFilePath = m_resultDir + "/" + m_runID + "/TrackInfo.root";
-    m_outBaseDir = m_resultDir + "/" + m_runID + "/EventDisplay/";
+EventDisplayManager::EventDisplayManager(
+    std::shared_ptr<RawDataParser> parser,
+    const std::string& outputDirectory)
+    : m_parser(std::move(parser)) {
+    const auto output = std::filesystem::path(outputDirectory);
+    m_trackFilePath = (output / "TrackInfo.root").string();
+    m_outBaseDir = (output / "EventDisplay").string() + "/";
 }
 
 EventDisplayManager::~EventDisplayManager() {
@@ -39,10 +39,8 @@ EventDisplayManager::~EventDisplayManager() {
 
 // 初始化 RawDataParser 并加载 track entries
 bool EventDisplayManager::Initialize() {
-    // 初始化 parser
-    m_parser = std::make_unique<RawDataParser>(m_rawFilePath);
-    if (!m_parser->Initialize()) {
-        std::cerr << "[EventDisplay] RawDataParser 初始化失败: " << m_rawFilePath << std::endl;
+    if (!m_parser) {
+        std::cerr << "[EventDisplay] RawDataParser 未初始化" << std::endl;
         return false;
     }
 
@@ -283,6 +281,12 @@ void EventDisplayManager::DrawDUTOverview(int eventID, std::shared_ptr<Detector>
 
     // 从 DetectorFrame 获取 StripHits 并按 type 分组
     const auto& allStripHits = detFrame->StripHits();
+    const auto* planarConfig = det->GetPlanarConfig();
+    if (!planarConfig) {
+        std::cerr << "[EventDisplay] DUT overview currently supports planar strip detectors only; detector "
+                  << det->GetName() << " uses another readout type" << std::endl;
+        return;
+    }
     std::map<int, std::vector<StripHit>> stripHitsMap;
     for (const auto& sh : allStripHits) {
         stripHitsMap[sh.type].push_back(sh);
@@ -317,7 +321,7 @@ void EventDisplayManager::DrawDUTOverview(int eventID, std::shared_ptr<Detector>
     for (const auto& [type, hits] : stripHitsMap) {
 
         int STRIP_XMIN = 0;
-        int STRIP_XMAX = det->getConfig().readoutPlaneStripNumber.at(type);
+        int STRIP_XMAX = planarConfig->readoutPlaneStripNumber.at(type);
 
         c->cd(padIdx++);
         gPad->SetGrid(1, 1);
@@ -368,8 +372,8 @@ void EventDisplayManager::DrawDUTOverview(int eventID, std::shared_ptr<Detector>
 
         // 预测击中标记
 
-        double predHit = (type == 0) ? localPos.X() / det->getConfig().readoutPlanePitch.at(type)
-                                     : localPos.Y() / det->getConfig().readoutPlanePitch.at(type);
+        double predHit = (type == 0) ? localPos.X() / planarConfig->readoutPlanePitch.at(type)
+                                     : localPos.Y() / planarConfig->readoutPlanePitch.at(type);
 
         TMarker* mHit = new TMarker(predHit, hAmp->GetMaximum() * 0.5, 29);
         mHit->SetMarkerColor(kMagenta);

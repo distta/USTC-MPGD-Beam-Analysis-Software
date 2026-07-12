@@ -17,6 +17,9 @@
 using namespace std;
 
 void TrackAnalysisScript::LoadConfig(const json& config) {
+    m_runAlignment = config.value(
+        "runAlignment",
+        config.value("performAlignment", false));
     m_saveValidationData = config.value("saveValidationData", true);
     m_progressInterval = max(1, config.value("progressInterval", 10000));
     m_debug = config.value("debug", true);
@@ -43,7 +46,8 @@ void TrackAnalysisScript::LoadConfig(const json& config) {
 void TrackAnalysisScript::Print() const {
     cout << "TrackAnalysisScript: gate=" << m_tracking.gateSigma << " sigma, resolution=("
          << m_tracking.resolutionX << ", " << m_tracking.resolutionY << ") mm, maxCandidates="
-         << m_tracking.maxCandidates << ", maxTracks/event=" << m_tracking.maxTracks << '\n';
+         << m_tracking.maxCandidates << ", maxTracks/event=" << m_tracking.maxTracks
+         << ", alignment=" << (m_runAlignment ? "enabled" : "disabled") << '\n';
 }
 
 bool TrackAnalysisScript::Execute() {
@@ -59,7 +63,8 @@ bool TrackAnalysisScript::Execute() {
         cerr << "[TrackAnalysis] at least three trackers are required\n";
         return false;
     }
-    cout << "[TrackAnalysis] trackers=" << trackers.size() << " events=" << parser->GetTotalEvents() << '\n';
+    cout << "[TrackAnalysis] trackers=" << trackers.size()
+         << " events=" << parser->GetTotalEvents() << '\n';
     Print();
 
     const Long64_t total = parser->GetTotalEvents();
@@ -89,19 +94,18 @@ bool TrackAnalysisScript::Execute() {
 
     Tracking::Reconstructor reconstructor(trackers, m_tracking);
     vector<Tracking::AlignmentIteration> alignmentHistory;
-    cout << "[TrackAnalysis] perform tracker alignment? (y/n): " << flush;
-    char alignChoice = 'n';
-    cin >> alignChoice;
-    if (alignChoice == 'y' || alignChoice == 'Y') {
+    if (m_runAlignment) {
         Tracking::Aligner aligner(trackers, reconstructor, m_alignment);
         if (!aligner.Run(events)) cerr << "[TrackAnalysis] alignment did not converge; using last valid geometry\n";
         alignmentHistory = aligner.History();
-        cout << "[TrackAlign] final geometry\n";
-        for (const auto& detector : trackers) {
-            const auto pos = detector->GetPos();
-            const auto rot = detector->GetRot();
-            cout << "  id=" << detector->GetID() << " pos=(" << pos.X() << ',' << pos.Y() << ',' << pos.Z()
-                 << ") rotZ=" << rot.Z() << '\n';
+        if (m_debug) {
+            cout << "[TrackAlign] final geometry\n";
+            for (const auto& detector : trackers) {
+                const auto pos = detector->GetPos();
+                const auto rot = detector->GetRot();
+                cout << "  id=" << detector->GetID() << " pos=(" << pos.X() << ',' << pos.Y() << ',' << pos.Z()
+                     << ") rotZ=" << rot.Z() << '\n';
+            }
         }
     }
 
@@ -195,7 +199,7 @@ bool TrackAnalysisScript::Execute() {
     tracksTree.Write();
     if (validation) validation->Write();
     if (performance) performance->Write();
-    cout << "[TrackAnalysis] output=" << outputPath << " time="
+    cout << "[TrackAnalysis] wrote TrackInfo.root in "
          << fixed << setprecision(2) << chrono::duration<double>(chrono::steady_clock::now() - start).count() << " s\n";
     return true;
 }

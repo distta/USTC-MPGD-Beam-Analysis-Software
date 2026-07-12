@@ -1,4 +1,4 @@
-#include "algorithms/ClusterBuilder.h"
+#include "Algorithm/Analyzer/ClusterBuilder.h"
 #include "AlgorithmFactory.h"
 #include "Detector/Detector.h"
 #include "DetectorFrame.h"

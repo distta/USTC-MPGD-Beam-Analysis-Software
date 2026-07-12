@@ -5,7 +5,6 @@
 #include "Event/DetectorFrame.h"
 #include "Script/Base/RawDataParser.h"
 #include "Script/Base/ScriptFactory.h"
-#include "Script/Base/ScriptManager.h"
 
 #include "Math/Factory.h"
 #include "Math/Functor.h"
@@ -132,10 +131,6 @@ void DUTAnalysisScript::Print() const {
 bool DUTAnalysisScript::Execute() {
     auto t0 = chrono::high_resolution_clock::now();
 
-    cout << "\n========================================" << endl;
-    cout << " DUT Analysis Script" << endl;
-    cout << "========================================" << endl;
-
     auto parser = GetParser();
     if (!parser) {
         cerr << "Error: Parser not set!" << endl;
@@ -146,7 +141,7 @@ bool DUTAnalysisScript::Execute() {
 
     // 加载track信息
     string trackFile = GetOutputDir() + "TrackInfo.root";
-    cout << "\nLoading track info..." << endl;
+    cout << "Loading track info..." << endl;
     cout << "File: " << trackFile << endl;
 
     TFile* f = TFile::Open(trackFile.c_str(), "READ");
@@ -196,7 +191,7 @@ bool DUTAnalysisScript::Execute() {
 
     int processed = 0;
 
-    cout << "  Track entries: " << totalTrackEntries
+    cout << "[DUTAnalysis] track entries=" << totalTrackEntries
          << ", unique events: " << tracksPerEvent.size()
          << ", single-track events: " << singleTrackEvents << endl;
 
@@ -234,8 +229,8 @@ bool DUTAnalysisScript::Execute() {
         events.push_back(move(evt));
         processed++;
     }
-    cout << endl;
-    cout << "  Processed " << events.size() << " single-track DUT events" << endl;
+    cout << "\n[DUTAnalysis] processed " << events.size()
+         << " single-track DUT events" << endl;
 
     // 运行DUT对齐
     if (m_runAlignment) {
@@ -600,10 +595,8 @@ bool DUTAnalysisScript::Execute() {
     auto t1 = chrono::high_resolution_clock::now();
     double sec = chrono::duration<double>(t1 - t0).count();
 
-    cout << "\n========================================" << endl;
-    cout << "DUT Analysis Complete" << endl;
-    cout << "Time: " << fixed << setprecision(2) << sec << " seconds" << endl;
-    cout << "========================================" << endl;
+    cout << "[DUTAnalysis] wrote DUTInfo.root in "
+         << fixed << setprecision(2) << sec << " s" << endl;
 
     return true;
 }
@@ -673,16 +666,26 @@ LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<
     double predY = predL.Y();
 
     // 从探测器配置读取参数，消除魔法数字
-    const auto& config = detector->getConfig();
+    const auto* config = detector->GetPlanarConfig();
     const int typeX = DUTAnalysisConfig::kTypeX;
     const int typeY = DUTAnalysisConfig::kTypeY;
+
+    LocalHit localHit;
+    if (!config) {
+        residualX = DUTAnalysisConfig::kInvalidValue;
+        residualY = DUTAnalysisConfig::kInvalidValue;
+        localHit.localPos.SetXYZ(DUTAnalysisConfig::kInvalidValue,
+                                DUTAnalysisConfig::kInvalidValue, 0);
+        localHit.clusterIndices = {-1, -1};
+        return localHit;
+    }
 
     // X方向处理：找到最优cluster
     int bestClusterXIndex = -1;
     double minResX = std::numeric_limits<double>::infinity();
     double bestPosX = DUTAnalysisConfig::kInvalidValue;
-    if (config.readoutPlanePitch.find(typeX) != config.readoutPlanePitch.end()) {
-        double pitchX = config.readoutPlanePitch.at(typeX);
+    if (config->readoutPlanePitch.find(typeX) != config->readoutPlanePitch.end()) {
+        double pitchX = config->readoutPlanePitch.at(typeX);
         for (size_t i = 0; i < clusters.size(); ++i) {
             if (clusters[i].type == typeX) {
                 double currentResX = std::abs(clusters[i].centroid * pitchX - predX);
@@ -697,8 +700,8 @@ LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<
     int bestClusterYIndex = -1;
     double minResY = std::numeric_limits<double>::infinity();
     double bestPosY = DUTAnalysisConfig::kInvalidValue;
-    if (config.readoutPlanePitch.find(typeY) != config.readoutPlanePitch.end()) {
-        double pitchY = config.readoutPlanePitch.at(typeY);
+    if (config->readoutPlanePitch.find(typeY) != config->readoutPlanePitch.end()) {
+        double pitchY = config->readoutPlanePitch.at(typeY);
         for (size_t i = 0; i < clusters.size(); ++i) {
             if (clusters[i].type == typeY) {
                 double currentResY = std::abs(clusters[i].centroid * pitchY - predY);
@@ -711,10 +714,8 @@ LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<
     }
 
     // 构建LocalHit
-    LocalHit localHit;
-
     if (bestClusterXIndex != -1) {
-        double pitchX = config.readoutPlanePitch.at(typeX);
+        double pitchX = config->readoutPlanePitch.at(typeX);
         residualX = clusters[bestClusterXIndex].pos * pitchX - predX;
     } else {
         bestPosX = DUTAnalysisConfig::kInvalidValue;
@@ -722,7 +723,7 @@ LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<
     }
 
     if (bestClusterYIndex != -1) {
-        double pitchY = config.readoutPlanePitch.at(typeY);
+        double pitchY = config->readoutPlanePitch.at(typeY);
         residualY = clusters[bestClusterYIndex].pos * pitchY - predY;
     } else {
         bestPosY = DUTAnalysisConfig::kInvalidValue;

@@ -1,8 +1,8 @@
 #include "Detector/Detector.h"
 #include "Algorithm/AlgorithmFactory.h"
-#include "Algorithm/algorithms/ClusterBuilder.h"
-#include "Algorithm/algorithms/ClusterReconstructor.h"
-#include "Algorithm/algorithms/WaveformProcessor.h"
+#include "Algorithm/Analyzer/ClusterBuilder.h"
+#include "Algorithm/Analyzer/ClusterReconstructor.h"
+#include "Algorithm/Analyzer/WaveformProcessor.h"
 #include "TMath.h"
 #include "TMatrixD.h"
 #include <iostream>

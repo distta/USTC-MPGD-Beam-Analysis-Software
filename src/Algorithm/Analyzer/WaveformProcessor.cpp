@@ -1,4 +1,4 @@
-#include "algorithms/WaveformProcessor.h"
+#include "Algorithm/Analyzer/WaveformProcessor.h"
 #include "AlgorithmFactory.h"
 #include "DetectorFrame.h"
 #include "TVirtualFFT.h"

@@ -1,4 +1,4 @@
-#include "Algorithm/TrackPerformance.h"
+#include "Algorithm/Track/TrackPerformance.h"
 #include "Detector/Detector.h"
 #include "Event/DetectorFrame.h"
 
@@ -70,9 +70,13 @@ PerformanceAnalyzer::PerformanceAnalyzer(TDirectory* output,
         auto* hitsDir = detectorDir->mkdir("Hits");
         auto* residualDir = detectorDir->mkdir("Residuals");
         double xMax = 1.0, yMax = 1.0;
-        const auto& detConfig = detector->getConfig();
-        if (detConfig.readoutPlaneStripNumber.count(0)) xMax = detConfig.readoutPlaneStripNumber.at(0) * detConfig.readoutPlanePitch.at(0);
-        if (detConfig.readoutPlaneStripNumber.count(1)) yMax = detConfig.readoutPlaneStripNumber.at(1) * detConfig.readoutPlanePitch.at(1);
+        if (const auto* detConfig = detector->GetPlanarConfig()) {
+            if (detConfig->readoutPlaneStripNumber.count(0)) xMax = detConfig->readoutPlaneStripNumber.at(0) * detConfig->readoutPlanePitch.at(0);
+            if (detConfig->readoutPlaneStripNumber.count(1)) yMax = detConfig->readoutPlaneStripNumber.at(1) * detConfig->readoutPlanePitch.at(1);
+        } else if (const auto* padConfig = detector->GetPlanarPadConfig()) {
+            xMax = padConfig->columns * padConfig->pitchX;
+            yMax = padConfig->rows * padConfig->pitchY;
+        }
         auto& h = m_detectorHistograms[id];
         {
             TDirectory::TContext context(hitsDir);

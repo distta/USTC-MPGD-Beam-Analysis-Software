@@ -24,6 +24,7 @@ class RawDataParser {
 
     Long64_t GetTotalEvents() const { return m_numOfEvents; };
     ULong64_t GetCurrentEventID() const { return m_eventID; }
+    int GetSchemaVersion() const { return m_schemaVersion; }
 
     // 获取指定通道的sigma，返回-1表示未找到
     double GetSigma(int detID, int type, int stripID) const;
@@ -46,6 +47,7 @@ class RawDataParser {
     bool LoadCanonicalChannelData();
 
     Long64_t m_numOfEvents{0};
+    int m_schemaVersion{0};
 
     TFile* m_file{nullptr};
     TTree* m_tree{nullptr};

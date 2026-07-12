@@ -1,12 +1,13 @@
 #pragma once
 
-#include <nlohmann/json.hpp>
+#include <filesystem>
 #include <string>
-
-using json = nlohmann::json;
 
 class IRawDataConverter {
    public:
     virtual ~IRawDataConverter() = default;
-    virtual bool Convert(const json& config, const std::string& outputPath) = 0;
+    virtual bool AcquireRawData(const std::filesystem::path& rawDir,
+                                const std::string& runID,
+                                std::string& error) = 0;
+    virtual bool Convert(const std::string& outputPath) = 0;
 };

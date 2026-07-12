@@ -16,7 +16,6 @@ void AlgorithmFactory::RegisterAlgorithm(const std::string& name, AlgorithmCreat
     }
 
     m_registry[name] = createFunc;
-    std::cout << "[AlgorithmFactory] Registered algorithm: " << name << std::endl;
 }
 
 std::shared_ptr<IAlgorithm> AlgorithmFactory::CreateAlgorithm(const std::string& name, const json& config) {

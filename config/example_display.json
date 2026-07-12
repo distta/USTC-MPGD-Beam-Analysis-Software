@@ -1,0 +1,50 @@
+{
+  "mode": "eventDisplay",
+  "conversion": {
+    "overwrite": false,
+    "type": "SRS"
+  },
+  "detectors": [
+    {
+      "id": 1,
+      "name": "Tracker 1",
+      "type": "planar",
+      "role": "Tracker",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0]
+    },
+    {
+      "id": 2,
+      "name": "Tracker 2",
+      "type": "planar",
+      "role": "Tracker",
+      "position": [0.0, 0.0, 100.0],
+      "rotation": [0.0, 0.0, 0.0]
+    },
+    {
+      "id": 3,
+      "name": "Tracker 3",
+      "type": "planar",
+      "role": "Tracker",
+      "position": [0.0, 0.0, 200.0],
+      "rotation": [0.0, 0.0, 0.0]
+    },
+    {
+      "id": 4,
+      "name": "Tracker 4",
+      "type": "planar",
+      "role": "Tracker",
+      "position": [0.0, 0.0, 300.0],
+      "rotation": [0.0, 0.0, 0.0]
+    },
+    {
+      "id": 5,
+      "name": "DUT",
+      "type": "planar",
+      "role": "DUT",
+      "position": [0.0, 0.0, 150.0],
+      "rotation": [0.0, 0.0, 0.0]
+    }
+  ],
+  "scripts": []
+}

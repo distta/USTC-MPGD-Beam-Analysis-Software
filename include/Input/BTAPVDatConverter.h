@@ -10,7 +10,10 @@
 
 class BTAPVDatConverter : public IRawDataConverter {
    public:
-    bool Convert(const json& config, const std::string& outputPath) override;
+    bool AcquireRawData(const std::filesystem::path& rawDir,
+                        const std::string& runID,
+                        std::string& error) override;
+    bool Convert(const std::string& outputPath) override;
 
    private:
     struct DecodedChannel {
@@ -30,4 +33,8 @@ class BTAPVDatConverter : public IRawDataConverter {
                     size_t decoderDebugLimit,
                     std::map<uint64_t, DecodedEvent>& events) const;
     static bool ReadWord(std::istream& input, uint16_t& value);
+
+    std::vector<std::string> m_files;
+    std::vector<std::string> m_pedestalFiles;
+    std::string m_mapPath;
 };

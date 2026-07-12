@@ -15,7 +15,6 @@ void ScriptFactory::RegisterScript(const std::string& name, ScriptCreateFunc cre
     }
     
     m_registry[name] = createFunc;
-    std::cout << "Script registered: " << name << std::endl;
 }
 
 std::shared_ptr<IScript> ScriptFactory::CreateScript(const std::string& name, const json& config) {
