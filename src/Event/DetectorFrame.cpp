@@ -7,9 +7,9 @@ bool DetectorFrame::AnalyzeRaw() {
     return waveformProcessor->Process(*this);
 }
 
-// Clustering StripHit
+// Clustering ChannelHit
 bool DetectorFrame::Clustering() {
-    if (m_stripHits.empty()) return false;
+    if (m_channelHits.empty()) return false;
 
     auto clusterBuilder = m_det.GetAlgorithm<ClusterBuilder>("ClusterBuilder");
     return clusterBuilder->Process(*this);

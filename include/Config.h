@@ -1,8 +1,11 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <map>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
 
 using json = nlohmann::json;
@@ -20,7 +23,7 @@ class AlgorithmConfig {
 class WaveformConfig : public AlgorithmConfig {
    public:
     std::string mode = "Default";
-    double cfdFraction = 0.1;
+    double cfdFraction = 0.3;
     double noiseThreshold = 100.0;
     double saturationLevel = 2000.0;
     double timePitch = 25.0;
@@ -56,6 +59,7 @@ class ClusterConfig : public AlgorithmConfig {
     int minClusterSize = 1;      // 最小聚类大小
     int maxClusterSize = 10;     // 最大聚类大小
     double MaxChargeDiff = 0.4;  // 对于不同Cluster匹配最大电荷差
+    int connectivity = 4;        // pad 聚类邻接方式：4 或 8
 
     void loadFrom(const json& config) override {
         const json* cfg = &config;
@@ -63,6 +67,10 @@ class ClusterConfig : public AlgorithmConfig {
         if (cfg->contains("minClusterSize")) minClusterSize = (*cfg)["minClusterSize"];
         if (cfg->contains("maxClusterSize")) maxClusterSize = (*cfg)["maxClusterSize"];
         if (cfg->contains("MaxChargeDiff")) MaxChargeDiff = (*cfg)["MaxChargeDiff"];
+        if (cfg->contains("connectivity")) connectivity = (*cfg)["connectivity"];
+        if (connectivity != 4 && connectivity != 8) {
+            throw std::runtime_error("ClusterConfig.connectivity must be 4 or 8");
+        }
     }
 
     void print() const override {
@@ -71,11 +79,13 @@ class ClusterConfig : public AlgorithmConfig {
         std::cout << "  Min Cluster Size: " << minClusterSize << std::endl;
         std::cout << "  Max Cluster Size: " << maxClusterSize << std::endl;
         std::cout << "  Max Charge Diff: " << MaxChargeDiff << std::endl;
+        std::cout << "  Pad Connectivity: " << connectivity << std::endl;
     }
 };
 
 enum class ReconstructionMethod {
     ChargeWeighted,  // 电荷加权
+    PadChargeWeighted,  // pad 二维电荷加权
     UTPC,            // UTPC算法
     RawUTPC          // raw UTPC算法
 };
@@ -84,6 +94,8 @@ enum class ReconstructionMethod {
 class ReconstructionConfig : public AlgorithmConfig {
    public:
     ReconstructionMethod method = ReconstructionMethod::ChargeWeighted;
+    std::string weightSource = "amp";
+    double weightPower = 1.0;
 
     void loadFrom(const json& config) override {
         const json* cfg = &config;
@@ -94,15 +106,36 @@ class ReconstructionConfig : public AlgorithmConfig {
                 method = ReconstructionMethod::UTPC;
             } else if (methodStr == "rawUTPC") {
                 method = ReconstructionMethod::RawUTPC;
+            } else if (methodStr == "PadChargeWeighted") {
+                method = ReconstructionMethod::PadChargeWeighted;
             } else {
                 method = ReconstructionMethod::ChargeWeighted;
             }
         }
+        if (cfg->contains("weightSource"))
+            weightSource = (*cfg)["weightSource"].get<std::string>();
+        if (cfg->contains("weightPower"))
+            weightPower = (*cfg)["weightPower"].get<double>();
+        if (weightSource != "charge" && weightSource != "amp")
+            throw std::runtime_error(
+                "ReconstructionConfig.weightSource must be charge or amp");
+        if (!std::isfinite(weightPower) || weightPower < 0.0)
+            throw std::runtime_error(
+                "ReconstructionConfig.weightPower must be finite and non-negative");
     }
 
     void print() const override {
         std::cout << "ReconstructionConfig:" << std::endl;
-        std::cout << "  Method: " << (method == ReconstructionMethod::ChargeWeighted ? "ChargeWeighted" : "UTPC") << std::endl;
+        const char* name = "ChargeWeighted";
+        if (method == ReconstructionMethod::PadChargeWeighted) name = "PadChargeWeighted";
+        else if (method == ReconstructionMethod::UTPC) name = "UTPC";
+        else if (method == ReconstructionMethod::RawUTPC) name = "rawUTPC";
+        std::cout << "  Method: " << name << std::endl;
+        if (method == ReconstructionMethod::ChargeWeighted ||
+            method == ReconstructionMethod::PadChargeWeighted) {
+            std::cout << "  Weight Source: " << weightSource << std::endl;
+            std::cout << "  Weight Power: " << weightPower << std::endl;
+        }
     }
 };
 
@@ -121,8 +154,6 @@ struct planarPadConfig {
     double sizeX = 0.0;
     double sizeY = 0.0;
     int planeType = 0;
-    std::string indexing = "row-major";
-    std::string origin = "center";
 };
 
 struct cylinderConfig {

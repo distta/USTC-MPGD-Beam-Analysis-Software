@@ -3,19 +3,26 @@
 #include "TVector3.h"
 #include <map>
 #include <memory>
+#include <vector>
 
 class DetectorFrame;
 
 struct RawData {
-    int stripID;             // 读出板编号
-    int type;                // 通道编号
+    int id0;                 // strip ID，或 pad column
+    int id1{-1};             // pad row；strip 读出为 -1
+    int type;                // 读出面编号
     std::vector<short> adc;  // 波形采样点 (ADC counts)
+
+    bool HasID1() const { return id1 >= 0; }
 };
 
-struct StripHit {
-    int ID;    // 条号
-    int type;  // 读出条类型 (X, Y, U/V…)
+struct ChannelHit {
+    int id0;                 // strip ID，或 pad column
+    int id1{-1};             // pad row；strip 读出为 -1
+    int type;                // 读出面/通道类型
     int rawIndices;
+
+    bool HasID1() const { return id1 >= 0; }
 
     // ---- 提取的关键量 ----
     double amp;       // 峰值 - baseline
@@ -34,17 +41,19 @@ struct StripHit {
 };
 
 struct Cluster {
-    int type;                          // 属于X/Y/U/V 哪个方向
-    std::vector<int> stripHitIndices;  // StripHit在DetectorFrame::m_stripHits中的全局索引
+    int type;                            // 所属读出面/通道类型
+    std::vector<int> channelHitIndices;  // ChannelHit在DetectorFrame::m_channelHits中的全局索引
 
     // ---- 聚类整体量 ----
-    int size;       // 聚类条数
-    int range;      // 聚类范围 (最大ID - 最小ID)
+    int size;       // 聚类通道数
+    int range;      // 一维通道范围；二维 pad 聚类算法不应依赖该字段
     double charge;  // 聚类总电荷
     double maxAmp;
     double time;      // 聚类时间 (最早)
     double centroid;  // 聚类重心
     double pos;       // cluster重建位置
+    TVector3 localPosition;  // 二维读出重建位置
+    bool hasLocalPosition{false};
 };
 
 typedef TVector3 GlobalHit;

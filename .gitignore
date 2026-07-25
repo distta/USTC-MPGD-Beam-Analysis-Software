@@ -1,10 +1,11 @@
 /build/
 /raw/
 /result/
-data/raw/
-data/processed/
-data/result/
+
 
 /.cache/
 /.vscode/
 /.qoder/
+/daq/
+/external/
+/data

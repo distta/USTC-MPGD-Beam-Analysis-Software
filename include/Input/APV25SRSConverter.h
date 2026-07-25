@@ -2,7 +2,7 @@
 
 #include "Input/IRawDataConverter.h"
 
-class SRSRootConverter : public IRawDataConverter {
+class APV25SRSConverter : public IRawDataConverter {
    public:
     bool AcquireRawData(const std::filesystem::path& rawDir,
                         const std::string& runID,
@@ -11,4 +11,5 @@ class SRSRootConverter : public IRawDataConverter {
 
    private:
     std::filesystem::path m_inputPath;
+    std::filesystem::path m_geometryPath;
 };

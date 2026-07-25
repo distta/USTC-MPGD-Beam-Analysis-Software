@@ -360,7 +360,7 @@ int main(int argc, char* argv[]) {
       return kUsageError;
    }
 
-   const std::string runID = argv[1];
+   const std::string runID = argv[2];
    if (runID.empty() ||
        !std::all_of(runID.begin(), runID.end(),
                     [](unsigned char c) { return std::isdigit(c); })) {
@@ -371,7 +371,7 @@ int main(int argc, char* argv[]) {
 
    const auto runStarted = std::chrono::steady_clock::now();
 
-   const fs::path baseDir = fs::absolute(argv[2]).lexically_normal();
+   const fs::path baseDir = fs::absolute(argv[1]).lexically_normal();
    const fs::path configFile = baseDir / "config.json";
    const fs::path rawDirectory = baseDir / "raw";
    const fs::path processedDirectory = baseDir / "processed";
@@ -419,7 +419,7 @@ int main(int argc, char* argv[]) {
    bool shouldConvert = false;
    if (config.contains("conversion")) {
       const std::string converterType =
-          config["conversion"].value("type", "SRS");
+          config["conversion"].value("type", "APV25SRS");
       converter = ConverterFactory::Create(converterType);
       if (!converter) {
          std::cerr << "Input/conversion error: unknown converter type '"
@@ -447,7 +447,7 @@ int main(int argc, char* argv[]) {
    if (shouldConvert) {
       const auto started = std::chrono::steady_clock::now();
       const std::string converterType =
-          config["conversion"].value("type", "SRS");
+          config["conversion"].value("type", "APV25SRS");
       if (!converter->AcquireRawData(rawDirectory, runID, error)) {
          std::cerr << "Input/conversion error: " << error << '\n';
          return kInputError;

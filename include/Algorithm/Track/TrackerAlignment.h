@@ -10,16 +10,16 @@ class Detector;
 namespace Tracking {
 
 struct AlignmentConfig {
-    int maxIterations = 20;
+    int maxIterations = 30;
     int minTracks = 20;
-    int maxEvents = 10000;          // uniformly sampled events used to build alignment tracks
-    int maxTracks = 5000;           // bound the cost of every objective evaluation
     int maxFunctionCalls = 600;
     double huberK = 2.5;
     double maxShiftStep = 0.20;     // mm / iteration
     double maxRotationStep = 0.001; // rad / iteration
     double shiftTolerance = 0.001;
     double rotationTolerance = 1e-6;
+    double relativeLossTolerance = 1e-4;
+    int convergencePatience = 3;
     bool debug = true;
 };
 

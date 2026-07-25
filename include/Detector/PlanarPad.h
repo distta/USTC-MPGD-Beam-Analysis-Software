@@ -2,8 +2,6 @@
 
 #include "Detector.h"
 
-#include <utility>
-
 class PlanarPad : public Detector {
    public:
     PlanarPad(int id, const std::string& name, const json& config);
@@ -17,10 +15,7 @@ class PlanarPad : public Detector {
         return &m_padConfig;
     }
 
-    bool IsValidPadID(int padID) const;
-    std::pair<int, int> PadIDToRowColumn(int padID) const;
-    int RowColumnToPadID(int row, int column) const;
-    TVector3 PadCenter(int padID) const;
+    TVector3 PadPosition(int row, int column) const;
     bool ContainsLocal(const TVector3& localPosition) const;
 
    private:

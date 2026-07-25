@@ -106,9 +106,9 @@ void FFTAnalyzer(Cluster& cluster, Event& evt, int detID) {
             nFreq, 0, nFreq * df);
     }
 
-    for (int stripIndex : cluster.stripHitIndices) {
-        StripHit hit = evt.detectorFramesMap[detID]->GetStripHit(stripIndex);
-        auto rawData = evt.detectorFramesMap[detID]->GetRawFromStrip(hit);
+    for (int stripIndex : cluster.channelHitIndices) {
+        ChannelHit hit = evt.detectorFramesMap[detID]->GetChannelHit(stripIndex);
+        auto rawData = evt.detectorFramesMap[detID]->GetRawFromChannel(hit);
         const auto& waveform = rawData->adc;
 
         std::vector<double> timeSignal(nSamples);

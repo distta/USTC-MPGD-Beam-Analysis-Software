@@ -279,20 +279,56 @@ void EventDisplayManager::DrawDUTOverview(int eventID, std::shared_ptr<Detector>
     const int DUT_ID = det->GetID();
     const std::string detName = det->GetName();
 
-    // 从 DetectorFrame 获取 StripHits 并按 type 分组
-    const auto& allStripHits = detFrame->StripHits();
+    // 从 DetectorFrame 获取 ChannelHits 并按 type 分组
+    const auto& allChannelHits = detFrame->ChannelHits();
     const auto* planarConfig = det->GetPlanarConfig();
+    const auto* padConfig = det->GetPlanarPadConfig();
+    if (padConfig) {
+        const double xMin = -0.5 * padConfig->pitchX;
+        const double xMax =
+            (padConfig->columns - 0.5) * padConfig->pitchX;
+        const double yMin = -0.5 * padConfig->pitchY;
+        const double yMax =
+            (padConfig->rows - 0.5) * padConfig->pitchY;
+        auto* canvas = new TCanvas(Form("DUT_%d_evt%d_pad_overview", DUT_ID, eventID),
+                                   Form("DUT %d - event %d pad overview", DUT_ID, eventID),
+                                   900, 800);
+        m_canvases.push_back(canvas);
+        auto* occupancy = new TH2F(Form("hPadAmp_evt%d_dut%d", eventID, DUT_ID),
+                                   Form("%s;Local X [mm];Local Y [mm]", detName.c_str()),
+                                   padConfig->columns, xMin, xMax,
+                                   padConfig->rows, yMin, yMax);
+        for (const auto& hit : allChannelHits) {
+            if (!hit.isValid || hit.type != padConfig->planeType ||
+                !hit.HasID1())
+                continue;
+            const int row = hit.id1;
+            const int column = hit.id0;
+            if (row < 0 || row >= padConfig->rows ||
+                column < 0 || column >= padConfig->columns) continue;
+            occupancy->SetBinContent(column + 1, row + 1, hit.amp);
+        }
+        occupancy->SetStats(0);
+        occupancy->Draw("COLZ TEXT");
+        const auto prediction = det->GlobalToLocal(det->CalcHitFromTrack(track));
+        auto* marker = new TMarker(prediction.X(), prediction.Y(), 29);
+        marker->SetMarkerColor(kMagenta);
+        marker->SetMarkerSize(2.0);
+        marker->Draw();
+        canvas->Write(Form("canvas_evt%d_dut%d", eventID, DUT_ID));
+        return;
+    }
     if (!planarConfig) {
         std::cerr << "[EventDisplay] DUT overview currently supports planar strip detectors only; detector "
                   << det->GetName() << " uses another readout type" << std::endl;
         return;
     }
-    std::map<int, std::vector<StripHit>> stripHitsMap;
-    for (const auto& sh : allStripHits) {
-        stripHitsMap[sh.type].push_back(sh);
+    std::map<int, std::vector<ChannelHit>> channelHitsMap;
+    for (const auto& sh : allChannelHits) {
+        channelHitsMap[sh.type].push_back(sh);
     }
 
-    if (stripHitsMap.empty()) {
+    if (channelHitsMap.empty()) {
         TLatex note;
         note.SetTextSize(0.04);
         note.DrawLatexNDC(0.15, 0.5, Form("DUT %s (ID=%d) : no strip hits for event %d", detName.c_str(), DUT_ID, eventID));
@@ -301,7 +337,7 @@ void EventDisplayManager::DrawDUTOverview(int eventID, std::shared_ptr<Detector>
         return;
     }
 
-    int nTypes = stripHitsMap.size();
+    int nTypes = channelHitsMap.size();
     TCanvas* c = new TCanvas(Form("DUT_%d_evt%d_overview", DUT_ID, eventID),
                              Form("DUT %d - event %d overview", DUT_ID, eventID),
                              1200, std::max(500, nTypes * 300));
@@ -318,7 +354,7 @@ void EventDisplayManager::DrawDUTOverview(int eventID, std::shared_ptr<Detector>
     TVector3 localPos = det->GlobalToLocal(globalHit);
 
     int padIdx = 1;
-    for (const auto& [type, hits] : stripHitsMap) {
+    for (const auto& [type, hits] : channelHitsMap) {
 
         int STRIP_XMIN = 0;
         int STRIP_XMAX = planarConfig->readoutPlaneStripNumber.at(type);
@@ -329,8 +365,8 @@ void EventDisplayManager::DrawDUTOverview(int eventID, std::shared_ptr<Detector>
         // 收集strip幅度和时间
         std::map<int, double> stripAmp, stripTime;
         for (const auto& sh : hits) {
-            stripAmp[sh.ID] = sh.amp;
-            stripTime[sh.ID] = (sh.time - 81) * TIME_SCALE;
+            stripAmp[sh.id0] = sh.amp;
+            stripTime[sh.id0] = (sh.time - 81) * TIME_SCALE;
         }
 
         // 幅度直方图 (左Y轴)
@@ -392,10 +428,10 @@ void EventDisplayManager::DrawDUTOverview(int eventID, std::shared_ptr<Detector>
     c->Write(Form("canvas_evt%d_dut%d", eventID, DUT_ID));
 }
 
-// 在 det->GetRawData() 中查找对应 strip 的 RawData（按 stripID 和 type 匹配）
+// 在 det->GetRawData() 中查找对应 strip 的 RawData（按 id0 和 type 匹配）
 const RawData* EventDisplayManager::FindRawForStrip(const std::vector<RawData>& raw, int stripID, int type) const {
     for (const auto& r : raw) {
-        if (r.stripID == stripID && r.type == type) return &r;
+        if (r.id0 == stripID && r.type == type) return &r;
     }
     return nullptr;
 }

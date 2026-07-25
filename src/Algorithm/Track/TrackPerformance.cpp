@@ -2,209 +2,320 @@
 #include "Detector/Detector.h"
 #include "Event/DetectorFrame.h"
 
+#include <TCanvas.h>
 #include <TDirectory.h>
 #include <TF1.h>
+#include <TGraph.h>
 #include <TH1D.h>
 #include <TH2D.h>
+#include <TLegend.h>
+#include <TPaveText.h>
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 #include <string>
 
 namespace Tracking {
 namespace {
 
-double Sigma68(std::vector<double> values) {
-    if (values.empty()) return 0.0;
-    const auto middle = values.begin() + values.size() / 2;
-    std::nth_element(values.begin(), middle, values.end());
-    const double median = *middle;
-    for (double& value : values) value = std::abs(value - median);
-    const size_t index = std::min(values.size() - 1, static_cast<size_t>(0.6827 * values.size()));
-    std::nth_element(values.begin(), values.begin() + index, values.end());
-    return values[index];
+struct HitMapBinning {
+    int binsX = 128;
+    int binsY = 128;
+    double xMin = 0.0;
+    double xMax = 1.0;
+    double yMin = 0.0;
+    double yMax = 1.0;
+};
+
+HitMapBinning MakeHitMapBinning(const Detector& detector) {
+    HitMapBinning result;
+    if (const auto* config = detector.GetPlanarConfig()) {
+        const auto xPitch = config->readoutPlanePitch.find(0);
+        const auto xStrips = config->readoutPlaneStripNumber.find(0);
+        if (xPitch != config->readoutPlanePitch.end() &&
+            xStrips != config->readoutPlaneStripNumber.end()) {
+            result.xMax = xPitch->second * xStrips->second;
+        }
+        const auto yPitch = config->readoutPlanePitch.find(1);
+        const auto yStrips = config->readoutPlaneStripNumber.find(1);
+        if (yPitch != config->readoutPlanePitch.end() &&
+            yStrips != config->readoutPlaneStripNumber.end()) {
+            result.yMax = yPitch->second * yStrips->second;
+        }
+    } else if (const auto* config = detector.GetPlanarPadConfig()) {
+        result.xMin = -0.5 * config->pitchX;
+        result.xMax = (config->columns - 0.5) * config->pitchX;
+        result.yMin = -0.5 * config->pitchY;
+        result.yMax = (config->rows - 0.5) * config->pitchY;
+    }
+    return result;
 }
 
-void FillSummary(TH1D* summary, TH1D* x, TH1D* y,
-                 const std::vector<double>& valuesX, const std::vector<double>& valuesY) {
-    const double sx68 = Sigma68(valuesX), sy68 = Sigma68(valuesY);
-    summary->SetBinContent(1, x->GetMean());
-    summary->SetBinContent(2, x->GetRMS());
-    summary->SetBinContent(3, sx68);
-    summary->SetBinContent(5, y->GetMean());
-    summary->SetBinContent(6, y->GetRMS());
-    summary->SetBinContent(7, sy68);
-    if (x->GetEntries() > 20 && sx68 > 0) {
-        x->Fit("gaus", "Q0", "", x->GetMean() - 2 * sx68, x->GetMean() + 2 * sx68);
-        if (x->GetFunction("gaus")) summary->SetBinContent(4, std::abs(x->GetFunction("gaus")->GetParameter(2)));
+struct GaussianFit {
+    double mean{};
+    double sigma{};
+    double chi2Ndf{};
+};
+
+GaussianFit FitSingleGaussian(TH1D* histogram) {
+    GaussianFit result;
+    if (!histogram || histogram->GetEntries() < 20) return result;
+    histogram->Fit("gaus", "Q0");
+    auto* gaussian = histogram->GetFunction("gaus");
+    if (!gaussian) return result;
+    gaussian->ResetBit(TF1::kNotDraw);
+    result.mean = gaussian->GetParameter(1);
+    result.sigma = std::abs(gaussian->GetParameter(2));
+    result.chi2Ndf = gaussian->GetNDF() > 0 ? gaussian->GetChisquare() / gaussian->GetNDF() : 0.0;
+    return result;
+}
+
+void DrawGaussianFit(TH1D* histogram, const GaussianFit& fit) {
+    histogram->SetStats(false);
+    histogram->Draw();
+    if (auto* gaussian = histogram->GetFunction("gaus")) {
+        gaussian->SetLineColor(kRed + 1);
+        gaussian->SetLineWidth(2);
+        gaussian->Draw("SAME");
     }
-    if (y->GetEntries() > 20 && sy68 > 0) {
-        y->Fit("gaus", "Q0", "", y->GetMean() - 2 * sy68, y->GetMean() + 2 * sy68);
-        if (y->GetFunction("gaus")) summary->SetBinContent(8, std::abs(y->GetFunction("gaus")->GetParameter(2)));
-    }
+    auto* label = new TPaveText(0.62, 0.72, 0.88, 0.88, "NDC");
+    label->SetFillColor(kWhite);
+    label->SetBorderSize(1);
+    label->SetTextAlign(12);
+    std::ostringstream mean, sigma, quality;
+    mean << "Gaussian #mu = " << std::setprecision(4) << fit.mean << " mm";
+    sigma << "Gaussian #sigma = " << std::setprecision(4) << fit.sigma << " mm";
+    quality << "#chi^{2}/ndf = " << std::setprecision(4) << fit.chi2Ndf;
+    label->AddText(mean.str().c_str());
+    label->AddText(sigma.str().c_str());
+    label->AddText(quality.str().c_str());
+    label->Draw();
 }
 
 }  // namespace
 
 PerformanceAnalyzer::PerformanceAnalyzer(TDirectory* output,
-                                         std::vector<std::shared_ptr<Detector>> detectors, const Config& config,
-                                         int totalEvents, double residualRange)
-    : m_output(output), m_detectors(std::move(detectors)), m_config(config), m_totalEvents(totalEvents), m_residualRange(residualRange) {
-    auto* global = m_output->mkdir("Global");
-    TDirectory::TContext globalContext(global);
-    m_tracksPerEvent = new TH1D("hTracksPerEvent", "Reconstructed tracks per event;Tracks;Events", config.maxTracks + 1, -0.5, config.maxTracks + 0.5);
-    m_seedCandidates = new TH1D("hSeedCandidates", "Seed candidates per event;Candidates;Events", 101, -0.5, config.maxCandidates + 0.5);
-    m_finalCandidates = new TH1D("hFinalCandidates", "Quality-selected candidates per event;Candidates;Events", 101, -0.5, 100.5);
-    m_conflictNodes = new TH1D("hConflictSearchNodes", "Conflict-search nodes per event;Visited nodes;Events", 100, 0, config.conflictSearchNodes);
-    m_chi2 = new TH1D("hTrackChi2Ndf", "Track fit quality;#chi^{2}/ndf;Tracks", 200, 0, config.maxChi2Ndf);
-    m_layersPerTrack = new TH1D("hLayersPerTrack", "Layers used per track;Layers;Tracks", detectors.size() + 1, -0.5, detectors.size() + 0.5);
-    m_kx = new TH1D("hTrackSlopeX", "Track slope X;k_{x};Tracks", 200, -0.1, 0.1);
-    m_ky = new TH1D("hTrackSlopeY", "Track slope Y;k_{y};Tracks", 200, -0.1, 0.1);
-    m_bx = new TH1D("hTrackInterceptX", "Track intercept X;b_{x} [mm];Tracks", 256, -10, 120);
-    m_by = new TH1D("hTrackInterceptY", "Track intercept Y;b_{y} [mm];Tracks", 256, -10, 120);
-    m_angle = new TH1D("hTrackAngle", "Track polar angle;atan(#sqrt{k_{x}^{2}+k_{y}^{2}}) [rad];Tracks", 200, 0, 0.15);
+                                         std::vector<std::shared_ptr<Detector>> detectors,
+                                         std::vector<std::shared_ptr<Detector>> referenceDetectors,
+                                         const Config& config,
+                                         double residualRange)
+    : m_output(output),
+      m_detectors(std::move(detectors)),
+      m_referenceDetectors(std::move(referenceDetectors)),
+      m_config(config) {
+    auto* resolutionDirectory = m_output->mkdir("Resolution");
+    {
+        TDirectory::TContext resolutionContext(resolutionDirectory);
+        m_commonEquivalentHitX = new TH1D(
+            "hCommonEquivalentHitX",
+            "Common equivalent hit residual X;Equivalent hit residual X [mm];Entries",
+            240, -residualRange, residualRange);
+        m_commonEquivalentHitY = new TH1D(
+            "hCommonEquivalentHitY",
+            "Common equivalent hit residual Y;Equivalent hit residual Y [mm];Entries",
+            240, -residualRange, residualRange);
+    }
 
     for (const auto& detector : m_detectors) {
         const int id = detector->GetID();
         auto* detectorDir = m_output->mkdir(("Detector_" + std::to_string(id)).c_str());
         auto* hitsDir = detectorDir->mkdir("Hits");
         auto* residualDir = detectorDir->mkdir("Residuals");
-        double xMax = 1.0, yMax = 1.0;
-        if (const auto* detConfig = detector->GetPlanarConfig()) {
-            if (detConfig->readoutPlaneStripNumber.count(0)) xMax = detConfig->readoutPlaneStripNumber.at(0) * detConfig->readoutPlanePitch.at(0);
-            if (detConfig->readoutPlaneStripNumber.count(1)) yMax = detConfig->readoutPlaneStripNumber.at(1) * detConfig->readoutPlanePitch.at(1);
-        } else if (const auto* padConfig = detector->GetPlanarPadConfig()) {
-            xMax = padConfig->columns * padConfig->pitchX;
-            yMax = padConfig->rows * padConfig->pitchY;
-        }
         auto& h = m_detectorHistograms[id];
         {
             TDirectory::TContext context(hitsDir);
-            h.hitMultiplicity = new TH1D("hHitMultiplicity", "Local-hit multiplicity;Local hits/event;Events", 65, -0.5, 64.5);
-            h.clusterMultiplicity = new TH1D("hClusterMultiplicity", "Cluster multiplicity;Clusters/event;Events", 101, -0.5, 100.5);
-            h.clusterSize = new TH1D("hClusterSize", "Cluster size;Strips/cluster;Clusters", 21, -0.5, 20.5);
-            h.allHitX = new TH1D("hAllHitX", "All local hits X;Local X [mm];Hits", 256, 0, xMax);
-            h.allHitY = new TH1D("hAllHitY", "All local hits Y;Local Y [mm];Hits", 256, 0, yMax);
-            h.selectedHitX = new TH1D("hSelectedHitX", "Track-associated hits X;Local X [mm];Hits", 256, 0, xMax);
-            h.selectedHitY = new TH1D("hSelectedHitY", "Track-associated hits Y;Local Y [mm];Hits", 256, 0, yMax);
-            h.allHitXY = new TH2D("hAllHitXY", "All local hits;Local X [mm];Local Y [mm]", 128, 0, xMax, 128, 0, yMax);
-            h.selectedHitXY = new TH2D("hSelectedHitXY", "Track-associated hits;Local X [mm];Local Y [mm]", 128, 0, xMax, 128, 0, yMax);
+            h.clusterMultiplicity = new TH1D(
+                "hClusterMultiplicity",
+                "Cluster multiplicity per selected event;Clusters/event;Events",
+                101, -0.5, 100.5);
+            const auto binning = MakeHitMapBinning(*detector);
+            h.hitMap = new TH2D(
+                "hHitMap", "Selected local-hit map;Local X [mm];Local Y [mm]",
+                binning.binsX, binning.xMin, binning.xMax,
+                binning.binsY, binning.yMin, binning.yMax);
         }
         {
             TDirectory::TContext context(residualDir);
-            h.residualX = new TH1D("hUnbiasedResidualX", "Unbiased residual X;X_{meas}-X_{pred} [mm];Entries", 240, -residualRange, residualRange);
-            h.residualY = new TH1D("hUnbiasedResidualY", "Unbiased residual Y;Y_{meas}-Y_{pred} [mm];Entries", 240, -residualRange, residualRange);
-            h.residualXY = new TH2D("hUnbiasedResidualXY", "Unbiased residuals;Residual X [mm];Residual Y [mm]", 120, -residualRange, residualRange, 120, -residualRange, residualRange);
-            h.pullX = new TH1D("hPullX", "Unbiased pull X;Residual X/#sigma_{X};Entries", 200, -10, 10);
-            h.pullY = new TH1D("hPullY", "Unbiased pull Y;Residual Y/#sigma_{Y};Entries", 200, -10, 10);
-            h.residualXVsHitX = new TH2D("hResidualXVsHitX", "Residual X vs hit X;Local X [mm];Residual X [mm]", 128, 0, xMax, 120, -residualRange, residualRange);
-            h.residualYVsHitY = new TH2D("hResidualYVsHitY", "Residual Y vs hit Y;Local Y [mm];Residual Y [mm]", 128, 0, yMax, 120, -residualRange, residualRange);
-            h.residualXVsSlope = new TH2D("hResidualXVsSlopeX", "Residual X vs slope X;k_{x};Residual X [mm]", 100, -0.1, 0.1, 120, -residualRange, residualRange);
-            h.residualYVsSlope = new TH2D("hResidualYVsSlopeY", "Residual Y vs slope Y;k_{y};Residual Y [mm]", 100, -0.1, 0.1, 120, -residualRange, residualRange);
-            h.residualXVsEvent = new TH2D("hResidualXVsEvent", "Residual X vs event;Event ID;Residual X [mm]", 200, 0, totalEvents, 120, -residualRange, residualRange);
-            h.residualYVsEvent = new TH2D("hResidualYVsEvent", "Residual Y vs event;Event ID;Residual Y [mm]", 200, 0, totalEvents, 120, -residualRange, residualRange);
-            h.summary = new TH1D("hResidualSummary", "Residual summary;Metric;Value [mm]", 8, 0.5, 8.5);
-            const char* labels[] = {"meanX", "RMSX", "sigma68X", "gausSigmaX", "meanY", "RMSY", "sigma68Y", "gausSigmaY"};
-            for (int bin = 1; bin <= 8; ++bin) h.summary->GetXaxis()->SetBinLabel(bin, labels[bin - 1]);
+            h.residualX = new TH1D("hUnbiasedResidualX", "Excluded Tracker hit - remaining-Tracker fit, X;X_{excluded}-X_{remaining fit} [mm];Entries", 240, -residualRange, residualRange);
+            h.residualY = new TH1D("hUnbiasedResidualY", "Excluded Tracker hit - remaining-Tracker fit, Y;Y_{excluded}-Y_{remaining fit} [mm];Entries", 240, -residualRange, residualRange);
         }
     }
 }
 
-void PerformanceAnalyzer::RecordEvent(const Event& event, const std::vector<Result>& tracks,
-                                      const ReconstructionStats& stats) {
-    m_tracksPerEvent->Fill(tracks.size());
-    m_seedCandidates->Fill(stats.seedCandidates);
-    m_finalCandidates->Fill(stats.finalCandidates);
-    m_conflictNodes->Fill(stats.conflictSearchNodes);
+void PerformanceAnalyzer::RecordEvent(const Event& event) {
+    std::vector<TVector3> globalHits;
+    globalHits.reserve(m_detectors.size());
     for (const auto& detector : m_detectors) {
-        auto& h = m_detectorHistograms[detector->GetID()];
         const auto& frame = event.detectorFramesMap.at(detector->GetID());
-        h.hitMultiplicity->Fill(frame->LocalHits().size());
-        h.clusterMultiplicity->Fill(frame->Clusters().size());
-        for (const auto& cluster : frame->Clusters()) h.clusterSize->Fill(cluster.size);
-        for (const auto& hit : frame->LocalHits()) {
-            h.allHitX->Fill(hit.localPos.X());
-            h.allHitY->Fill(hit.localPos.Y());
-            h.allHitXY->Fill(hit.localPos.X(), hit.localPos.Y());
-        }
+        if (frame->LocalHits().size() != 1) return;
+        globalHits.push_back(detector->LocalToGlobal(frame->LocalHits().front().localPos));
     }
-    for (const auto& result : tracks) {
-        m_chi2->Fill(result.track.chi2);
-        m_layersPerTrack->Fill(result.hitIndices.size());
-        m_kx->Fill(result.track.kx);
-        m_ky->Fill(result.track.ky);
-        m_bx->Fill(result.track.bx);
-        m_by->Fill(result.track.by);
-        m_angle->Fill(std::atan(std::hypot(result.track.kx, result.track.ky)));
-        for (const auto& [id, hitIndex] : result.hitIndices) {
-            auto& h = m_detectorHistograms[id];
-            const auto& hit = event.detectorFramesMap.at(id)->LocalHits().at(hitIndex);
-            h.selectedHitX->Fill(hit.localPos.X());
-            h.selectedHitY->Fill(hit.localPos.Y());
-            h.selectedHitXY->Fill(hit.localPos.X(), hit.localPos.Y());
-            std::vector<TVector3> otherHits;
-            for (const auto& [otherID, otherIndex] : result.hitIndices) {
-                if (otherID == id) continue;
-                const auto detector = std::find_if(m_detectors.begin(), m_detectors.end(), [otherID](const auto& d) { return d->GetID() == otherID; });
-                otherHits.push_back((*detector)->LocalToGlobal(event.detectorFramesMap.at(otherID)->LocalHits().at(otherIndex).localPos));
-            }
-            if (otherHits.size() < 2) continue;
-            const auto fit = FitWeighted(otherHits, m_config.resolutionX, m_config.resolutionY);
-            const auto detector = std::find_if(m_detectors.begin(), m_detectors.end(), [id](const auto& d) { return d->GetID() == id; });
-            const auto predicted = (*detector)->GlobalToLocal((*detector)->CalcHitFromTrack(fit));
-            const double rx = hit.localPos.X() - predicted.X(), ry = hit.localPos.Y() - predicted.Y();
-            h.residualX->Fill(rx);
-            h.residualY->Fill(ry);
-            h.residualXY->Fill(rx, ry);
-            h.pullX->Fill(rx / m_config.resolutionX);
-            h.pullY->Fill(ry / m_config.resolutionY);
-            h.residualXVsHitX->Fill(hit.localPos.X(), rx);
-            h.residualYVsHitY->Fill(hit.localPos.Y(), ry);
-            h.residualXVsSlope->Fill(result.track.kx, rx);
-            h.residualYVsSlope->Fill(result.track.ky, ry);
-            h.residualXVsEvent->Fill(event.eventID, rx);
-            h.residualYVsEvent->Fill(event.eventID, ry);
-            h.residualValuesX.push_back(rx);
-            h.residualValuesY.push_back(ry);
+
+    for (size_t detectorIndex = 0; detectorIndex < m_detectors.size(); ++detectorIndex) {
+        const auto& detector = m_detectors[detectorIndex];
+        const auto& frame = event.detectorFramesMap.at(detector->GetID());
+        const auto& hit = frame->LocalHits().front();
+        auto& h = m_detectorHistograms[detector->GetID()];
+        h.clusterMultiplicity->Fill(frame->Clusters().size());
+        h.hitMap->Fill(hit.localPos.X(), hit.localPos.Y());
+        std::vector<TVector3> otherHits;
+        otherHits.reserve(m_detectors.size() - 1);
+        for (size_t otherIndex = 0; otherIndex < globalHits.size(); ++otherIndex) {
+            if (otherIndex != detectorIndex) otherHits.push_back(globalHits[otherIndex]);
         }
+        if (otherHits.size() < 2) continue;
+
+        const auto fit = FitWeighted(otherHits, m_config.resolutionX, m_config.resolutionY);
+        const auto predicted = detector->GlobalToLocal(detector->CalcHitFromTrack(fit));
+        const double rx = hit.localPos.X() - predicted.X();
+        const double ry = hit.localPos.Y() - predicted.Y();
+
+        double sumZ = 0.0, sumZZ = 0.0;
+        for (const auto& otherHit : otherHits) {
+            sumZ += otherHit.Z();
+            sumZZ += otherHit.Z() * otherHit.Z();
+        }
+        const double n = static_cast<double>(otherHits.size());
+        const double meanZ = sumZ / n;
+        const double szz = sumZZ - sumZ * sumZ / n;
+        double predictionVarianceScale = 0.0;
+        if (szz > 1e-12) {
+            const double dz = globalHits[detectorIndex].Z() - meanZ;
+            predictionVarianceScale = 1.0 / n + dz * dz / szz;
+        }
+        const double scale = std::sqrt(1.0 + predictionVarianceScale);
+        h.residualX->Fill(rx);
+        h.residualY->Fill(ry);
+        m_commonEquivalentHitX->Fill(rx / scale);
+        m_commonEquivalentHitY->Fill(ry / scale);
     }
 }
 
-void PerformanceAnalyzer::RecordAlignment(const std::vector<AlignmentIteration>& history) {
-    if (history.empty()) return;
-    auto* directory = m_output->mkdir("Alignment");
-    TDirectory::TContext context(directory);
-    const int n = history.size();
-    auto* before = new TH1D("hLossBefore", "Alignment loss before update;Iteration;Robust loss", n, 0.5, n + 0.5);
-    auto* after = new TH1D("hLossAfter", "Alignment loss after update;Iteration;Robust loss", n, 0.5, n + 0.5);
-    auto* tracks = new TH1D("hTracksUsed", "Tracks used by alignment;Iteration;Tracks", n, 0.5, n + 0.5);
-    auto* shift = new TH1D("hMaxShiftStep", "Maximum shift update;Iteration;Shift [mm]", n, 0.5, n + 0.5);
-    auto* rotation = new TH1D("hMaxRotationStep", "Maximum rotation update;Iteration;Rotation [rad]", n, 0.5, n + 0.5);
-    std::map<int, TH1D*> dx, dy, rz;
-    for (const auto& detector : m_detectors) {
-        const auto suffix = std::to_string(detector->GetID());
-        dx[detector->GetID()] = new TH1D(("hAlignDx_" + suffix).c_str(), ("Detector " + suffix + " alignment dx;Iteration;dx [mm]").c_str(), n, 0.5, n + 0.5);
-        dy[detector->GetID()] = new TH1D(("hAlignDy_" + suffix).c_str(), ("Detector " + suffix + " alignment dy;Iteration;dy [mm]").c_str(), n, 0.5, n + 0.5);
-        rz[detector->GetID()] = new TH1D(("hAlignRz_" + suffix).c_str(), ("Detector " + suffix + " alignment rz;Iteration;rz [rad]").c_str(), n, 0.5, n + 0.5);
-    }
-    for (int i = 0; i < n; ++i) {
-        before->SetBinContent(i + 1, history[i].lossBefore);
-        after->SetBinContent(i + 1, history[i].lossAfter);
-        tracks->SetBinContent(i + 1, history[i].tracks);
-        shift->SetBinContent(i + 1, history[i].maxShift);
-        rotation->SetBinContent(i + 1, history[i].maxRotation);
-        for (const auto& detector : m_detectors) {
-            const int id = detector->GetID();
-            dx[id]->SetBinContent(i + 1, history[i].alignPosition.at(id).X());
-            dy[id]->SetBinContent(i + 1, history[i].alignPosition.at(id).Y());
-            rz[id]->SetBinContent(i + 1, history[i].alignRotation.at(id).Z());
-        }
-    }
+std::pair<double, double> PerformanceAnalyzer::EstimateHitResolution() {
+    const auto fitX = FitSingleGaussian(m_commonEquivalentHitX);
+    const auto fitY = FitSingleGaussian(m_commonEquivalentHitY);
+    return {fitX.sigma, fitY.sigma};
 }
 
 void PerformanceAnalyzer::Write() {
-    for (auto& [id, h] : m_detectorHistograms)
-        FillSummary(h.summary, h.residualX, h.residualY, h.residualValuesX, h.residualValuesY);
+    for (auto& [id, h] : m_detectorHistograms) {
+        const auto residualFitX = FitSingleGaussian(h.residualX);
+        const auto residualFitY = FitSingleGaussian(h.residualY);
+        TDirectory::TContext residualContext(h.residualX->GetDirectory());
+        TCanvas residualCanvas(
+            ("cLeaveOneOutResidual_Detector" + std::to_string(id)).c_str(),
+            ("Remaining trackers vs excluded Tracker " + std::to_string(id)).c_str(),
+            1400, 600);
+        residualCanvas.Divide(2, 1);
+        residualCanvas.cd(1);
+        DrawGaussianFit(h.residualX, residualFitX);
+        residualCanvas.cd(2);
+        DrawGaussianFit(h.residualY, residualFitY);
+        residualCanvas.Write();
+    }
+
+    const auto commonFitX = FitSingleGaussian(m_commonEquivalentHitX);
+    const auto commonFitY = FitSingleGaussian(m_commonEquivalentHitY);
+    const double sigmaHitX = commonFitX.sigma;
+    const double sigmaHitY = commonFitY.sigma;
+    if (sigmaHitX <= 0.0 || sigmaHitY <= 0.0 || m_detectors.size() < 3) {
+        m_output->Write();
+        return;
+    }
+
+    double meanZ = 0.0;
+    for (const auto& detector : m_detectors) meanZ += detector->GetPos().Z();
+    meanZ /= static_cast<double>(m_detectors.size());
+    double szz = 0.0;
+    for (const auto& detector : m_detectors) {
+        const double dz = detector->GetPos().Z() - meanZ;
+        szz += dz * dz;
+    }
+    if (szz <= 1e-12) {
+        m_output->Write();
+        return;
+    }
+
+    const auto pointingScale = [&](double z) {
+        const double dz = z - meanZ;
+        return std::sqrt(1.0 / static_cast<double>(m_detectors.size()) + dz * dz / szz);
+    };
+
+    double zMin = m_detectors.front()->GetPos().Z();
+    double zMax = zMin;
+    for (const auto& detector : m_detectors) {
+        zMin = std::min(zMin, detector->GetPos().Z());
+        zMax = std::max(zMax, detector->GetPos().Z());
+    }
+    for (const auto& detector : m_referenceDetectors) {
+        zMin = std::min(zMin, detector->GetPos().Z());
+        zMax = std::max(zMax, detector->GetPos().Z());
+    }
+    const double margin = std::max(50.0, 0.05 * (zMax - zMin));
+    zMin -= margin;
+    zMax += margin;
+    constexpr int graphPoints = 301;
+    TGraph resolutionX(graphPoints), resolutionY(graphPoints);
+    resolutionX.SetName("gTrackingResolutionXVsZ");
+    resolutionY.SetName("gTrackingResolutionYVsZ");
+    resolutionX.SetTitle("Three-tracker pointing resolution;z [mm];Pointing resolution [#mum]");
+    resolutionY.SetTitle("Three-tracker pointing resolution;z [mm];Pointing resolution [#mum]");
+    double maximumResolution = 0.0;
+    for (int point = 0; point < graphPoints; ++point) {
+        const double z = zMin + (zMax - zMin) * point / (graphPoints - 1);
+        const double scale = pointingScale(z);
+        const double x = 1000.0 * sigmaHitX * scale;
+        const double y = 1000.0 * sigmaHitY * scale;
+        resolutionX.SetPoint(point, z, x);
+        resolutionY.SetPoint(point, z, y);
+        maximumResolution = std::max({maximumResolution, x, y});
+    }
+
+    auto* directory = m_output->GetDirectory("Resolution");
+    TDirectory::TContext context(directory);
+    TCanvas commonFitCanvas("cCommonHitGaussianFit", "Common single-hit Gaussian fit", 1400, 600);
+    commonFitCanvas.Divide(2, 1);
+    commonFitCanvas.cd(1);
+    DrawGaussianFit(m_commonEquivalentHitX, commonFitX);
+    commonFitCanvas.cd(2);
+    DrawGaussianFit(m_commonEquivalentHitY, commonFitY);
+    commonFitCanvas.Write();
+    resolutionX.Write();
+    resolutionY.Write();
+
+    TCanvas curveCanvas("cTrackingResolutionVsZ", "Tracking pointing resolution vs z", 1200, 800);
+    curveCanvas.SetLeftMargin(0.12);
+    curveCanvas.SetRightMargin(0.05);
+    curveCanvas.SetBottomMargin(0.12);
+    resolutionX.SetLineColor(kBlue + 1);
+    resolutionX.SetLineWidth(3);
+    resolutionY.SetLineColor(kRed + 1);
+    resolutionY.SetLineWidth(3);
+    resolutionX.Draw("AL");
+    resolutionX.GetYaxis()->SetRangeUser(0.0, 1.15 * maximumResolution);
+    resolutionY.Draw("L SAME");
+    TLegend legend(0.72, 0.77, 0.92, 0.90);
+    legend.AddEntry(&resolutionX, "X", "l");
+    legend.AddEntry(&resolutionY, "Y", "l");
+    legend.Draw();
+    curveCanvas.Write();
+
+    std::ostringstream report;
+    report << std::fixed << std::setprecision(2)
+           << "[Resolution] hit(X,Y)=(" << 1000.0 * sigmaHitX << ", "
+           << 1000.0 * sigmaHitY << ") um, angle(X,Y)=("
+           << 1.0e6 * sigmaHitX / std::sqrt(szz) << ", "
+           << 1.0e6 * sigmaHitY / std::sqrt(szz) << ") urad";
+    for (const auto& detector : m_referenceDetectors) {
+        const double scale = pointingScale(detector->GetPos().Z());
+        report << ", DUT" << detector->GetID() << "@z=" << detector->GetPos().Z()
+               << " mm pointing(X,Y)=(" << 1000.0 * sigmaHitX * scale << ", "
+               << 1000.0 * sigmaHitY * scale << ") um";
+    }
+    std::cout << report.str() << '\n';
     m_output->Write();
 }
 

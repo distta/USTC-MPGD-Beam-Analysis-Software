@@ -21,8 +21,6 @@ planarPadConfig ParsePadConfig(const json& detectorConfig) {
     config.sizeX = pads.value("sizeX", config.pitchX);
     config.sizeY = pads.value("sizeY", config.pitchY);
     config.planeType = pads.value("planeType", 0);
-    config.indexing = pads.value("indexing", "row-major");
-    config.origin = pads.value("origin", "center");
 
     if (config.rows <= 0 || config.columns <= 0) {
         throw std::runtime_error(
@@ -37,16 +35,6 @@ planarPadConfig ParsePadConfig(const json& detectorConfig) {
         throw std::runtime_error(
             "[PlanarPad] pad size must be positive and not exceed its pitch");
     }
-    if (config.indexing != "row-major" &&
-        config.indexing != "column-major") {
-        throw std::runtime_error(
-            "[PlanarPad] 'indexing' must be 'row-major' or 'column-major'");
-    }
-    if (config.origin != "center" && config.origin != "lower-left") {
-        throw std::runtime_error(
-            "[PlanarPad] 'origin' must be 'center' or 'lower-left'");
-    }
-
     return config;
 }
 
@@ -80,62 +68,33 @@ GlobalHit PlanarPad::CalcHitFromTrack(const Track& track) const {
     return origin + parameter * direction;
 }
 
-bool PlanarPad::IsValidPadID(int padID) const {
-    return padID >= 0 &&
-           padID < m_padConfig.rows * m_padConfig.columns;
-}
-
-std::pair<int, int> PlanarPad::PadIDToRowColumn(int padID) const {
-    if (!IsValidPadID(padID)) {
-        throw std::out_of_range("[PlanarPad] pad ID is out of range");
-    }
-
-    if (m_padConfig.indexing == "column-major") {
-        return {padID % m_padConfig.rows, padID / m_padConfig.rows};
-    }
-    return {padID / m_padConfig.columns, padID % m_padConfig.columns};
-}
-
-int PlanarPad::RowColumnToPadID(int row, int column) const {
+TVector3 PlanarPad::PadPosition(int row, int column) const {
     if (row < 0 || row >= m_padConfig.rows ||
         column < 0 || column >= m_padConfig.columns) {
         throw std::out_of_range("[PlanarPad] pad row or column is out of range");
     }
-
-    if (m_padConfig.indexing == "column-major") {
-        return column * m_padConfig.rows + row;
-    }
-    return row * m_padConfig.columns + column;
-}
-
-TVector3 PlanarPad::PadCenter(int padID) const {
-    const auto [row, column] = PadIDToRowColumn(padID);
-    double x = (static_cast<double>(column) + 0.5) * m_padConfig.pitchX;
-    double y = (static_cast<double>(row) + 0.5) * m_padConfig.pitchY;
-
-    if (m_padConfig.origin == "center") {
-        x -= 0.5 * m_padConfig.columns * m_padConfig.pitchX;
-        y -= 0.5 * m_padConfig.rows * m_padConfig.pitchY;
-    }
-    return {x, y, 0.0};
+    return {column * m_padConfig.pitchX,
+            row * m_padConfig.pitchY, 0.0};
 }
 
 bool PlanarPad::ContainsLocal(const TVector3& localPosition) const {
-    double x = localPosition.X();
-    double y = localPosition.Y();
-    if (m_padConfig.origin == "center") {
-        x += 0.5 * m_padConfig.columns * m_padConfig.pitchX;
-        y += 0.5 * m_padConfig.rows * m_padConfig.pitchY;
-    }
-
-    if (x < 0.0 || y < 0.0 ||
-        x >= m_padConfig.columns * m_padConfig.pitchX ||
-        y >= m_padConfig.rows * m_padConfig.pitchY) {
+    const double x = localPosition.X();
+    const double y = localPosition.Y();
+    const double xMinimum = -0.5 * m_padConfig.pitchX;
+    const double xMaximum =
+        (m_padConfig.columns - 0.5) * m_padConfig.pitchX;
+    const double yMinimum = -0.5 * m_padConfig.pitchY;
+    const double yMaximum =
+        (m_padConfig.rows - 0.5) * m_padConfig.pitchY;
+    if (x < xMinimum || x > xMaximum ||
+        y < yMinimum || y > yMaximum) {
         return false;
     }
 
-    const double withinPadX = std::fmod(x, m_padConfig.pitchX);
-    const double withinPadY = std::fmod(y, m_padConfig.pitchY);
+    const double withinPadX = std::fmod(
+        x - xMinimum, m_padConfig.pitchX);
+    const double withinPadY = std::fmod(
+        y - yMinimum, m_padConfig.pitchY);
     const double marginX = 0.5 * (m_padConfig.pitchX - m_padConfig.sizeX);
     const double marginY = 0.5 * (m_padConfig.pitchY - m_padConfig.sizeY);
     return withinPadX >= marginX &&
@@ -153,14 +112,10 @@ std::vector<LocalHit> PlanarPad::CalcLocalHitsFromClusters(
         const auto& cluster = clusters[index];
         if (cluster.type != m_padConfig.planeType) continue;
 
-        // The legacy Cluster stores a one-dimensional reconstructed channel ID.
-        // Rounding gives the correct pad center for single-pad clusters. A future
-        // two-dimensional pad clusterer should produce LocalHit directly.
-        const int padID = static_cast<int>(std::lround(cluster.pos));
-        if (!IsValidPadID(padID)) continue;
+        if (!cluster.hasLocalPosition) continue;
 
         LocalHit hit;
-        hit.localPos = PadCenter(padID);
+        hit.localPos = cluster.localPosition;
         hit.clusterIndices.push_back(static_cast<int>(index));
         localHits.push_back(std::move(hit));
     }

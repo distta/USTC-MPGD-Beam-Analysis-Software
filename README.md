@@ -44,7 +44,7 @@ cmake --build build -j
   "conversion": {
     "enabled": true,
     "overwrite": false,
-    "type": "SRS"
+    "type": "APV25SRS"
   },
   "detectors": [],
   "scripts": []
@@ -75,6 +75,31 @@ cmake --build build -j
 
 `TrackAnalysis.config.runAlignment` 控制 tracker alignment；分析模式不会询问 y/n。旧字段 `performAlignment` 仍可读取，但新配置应使用 `runAlignment`。
 
+TrackAnalysis 先使用每个 Tracker 都恰好有一个 `LocalHit` 的事件做 alignment 和 tracking 分辨率估计，再用得到的 X/Y hit 分辨率扫描全部事件，包括多击中事件，通过 gate、`chi2/ndf` 和 hit 冲突消解选出径迹。设置 `useEstimatedResolution=false` 可以保留配置中的 `resolutionX`/`resolutionY`。分辨率估计假设三层 Tracker 的 X/Y hit 分辨率分别相同；每层 leave-one-out 残差及合并后的等效单层残差都只使用单高斯拟合的 `sigma`，再由三层联合直线拟合协方差计算 pointing resolution。`TrackInfo.root/Performance/Resolution` 中包含单高斯拟合图、随 z 变化的 X/Y tracking 分辨率曲线、各 Tracker/DUT 位置的 pointing 分辨率、共同单层分辨率和角度分辨率，长度单位为微米、角度单位为微弧度。
+
+Tracker alignment 的 `alignmentIterations` 只是最大迭代数。参数更新连续稳定，或相对 loss 改善连续 `alignmentConvergencePatience` 轮低于 `alignmentRelativeLossTolerance` 时会提前结束；达到最大迭代数仍不满足条件会报告未收敛。
+
+`TimeResolution` 默认使用 detector 配置中恰好三个 `role: "Tracker"` 的探测器，也可以在脚本配置中用 `"trackerIDs": [id1, id2, id3]` 明确指定。每个探测器使用 `XYMean` 时间，即与该 track 匹配的 X/Y clusters 所包含有效读出通道拟合时间的平均值；Pad DUT 同样使用匹配 cluster 内有效通道拟合时间的平均值。当前不做时间 offset、时幅或飞行时间修正。三组时间差只使用三个 tracker 时间都有效的共同事件样本，以单高斯拟合宽度解出各层分辨率，再按 `1/sigma_i^2` 构造加权 `trackTime`。`TimeResolution.root/TrackTimes` 保存三层时间、权重和加权 track 时间；启用 `analyzeDUTTiming` 后，`DUTTimes` 和 `DUTTimeResolution/` 保存 DUT 时间差及扣除 track reference 后的 DUT 分辨率。`DUTTimeResolution/DUT_<id>/Correlations/` 保存 DUT-track residual 相对于最大/平均幅度、cluster charge、size、centroid、local X/Y 及 track predicted X/Y 的二维分布、profile 和 Pearson 系数。
+
+`DUTAnalysis` 只使用 cluster-envelope 定义 X/Y/2D 效率。平均效率统一按总事件数加权，即所有有效 bin 的总命中数除以总事件数，不再计算各 bin 等权平均。`margin` 是 cluster 最小/最大边缘条带中心向外扩展的距离，不叠加 tracking sigma 或其他参数。`minEntriesPerBin` 设置一个 bin 参与汇总所需的最小事件数；低于阈值、被 `excludeXBins`/`excludeYBins` 排除或为空的 bin 不参与汇总。
+
+效率不均匀度定义为有效空间 bin 效率的变异系数 `sigma(efficiency_i) / mean(efficiency_i)`，各有效 bin 等权，分别计算 X、Y 和 2D。结果写入终端汇总、效率 map 和 `EfficiencySummary` 的 `nonuniformityX/Y/2D` 分支。
+
+核心配置示例：
+
+```json
+"efficiencyMap": {
+  "minEntriesPerBin": 30,
+  "margin": 0.6,
+  "marginScan": { "min": 0.0, "max": 2.0, "step": 0.05 },
+  "fake": { "enabled": true, "seed": 12345, "partnersPerEvent": 20 }
+}
+```
+
+Cluster-envelope 使用 cluster 内实际最小/最大 strip 中心，并在两端直接增加 `margin`。Fake 分析只使用“单径迹且每个 Tracker 恰好有一个 LocalHit”的事件，结果仅作为独立假效率报告，不修正效率。
+
+结果按 `DUTInfo.root/DUT_<id>/` 排列。`Efficiency/` 中严格只有七个 canvas：`cEventCount`、`cEffMapX`、`cEffMapY`、`cEffMap2D`、`cEff2DProjectionX`、`cEff2DProjectionY` 和 `cEffVsMargin`。两张投影图分别展示 2D 效率随 local X/Y 的变化；扫描图仅显示按总事件数计算的 X/Y/2D 曲线。`EfficiencySummary` 保存配置 margin 下的数值和误差。假效率分析对每个源事件 A 移除所有被 A 自身径迹匹配的 DUT clusters，保留其余 clusters，再与不同事件 B 的径迹匹配。Fake 分析直接复用效率分析的区域、binning、排除 bin、`margin` 和 `minEntriesPerBin`；`fake` 配置块只保留开关、随机种子和 partner 数。`Fake/` 保存 `hFakeEfficiencyMapX/Y/2D` 和 `FakeSummary`；`AnalysisConfig` 保存复现参数。
+
 原有 `detectors`、`scripts` 和 `conversion` 内的转换器专用字段保持可用。旧的菜单入口、命令行目录覆盖选项、`input`/`output` 路径块及 `config/defaults.json` 配置档案已移除。
 
 ## 转换和输入
@@ -84,7 +109,7 @@ cmake --build build -j
 - 输出已存在且 `overwrite: false`：复用已有输出。
 - 输出不存在或 `overwrite: true`：调用 `conversion.type` 对应的转换器。
 
-当前转换器类型为 `SRS` 和 `BTAPVDat`。`config/srs.json` 与 `config/bt_apve.json` 给出了各自示例。
+当前转换器类型为 `APV25SRS` 和 `BTAPVDat`。
 
 ## 输出
 

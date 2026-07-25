@@ -11,6 +11,7 @@
 #include <TTree.h>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 class RawDataParser {
@@ -27,7 +28,7 @@ class RawDataParser {
     int GetSchemaVersion() const { return m_schemaVersion; }
 
     // 获取指定通道的sigma，返回-1表示未找到
-    double GetSigma(int detID, int type, int stripID) const;
+    double GetSigma(int detID, int type, int id0, int id1) const;
 
     bool WriteDebugRoot(const std::string& outputFile);
 
@@ -40,9 +41,11 @@ class RawDataParser {
 
     std::string m_rawFile;
 
-    // channel calibration: [detID][type][stripID]
-    std::map<int, std::map<int, std::map<int, double>>> m_pedSigmaMap;
-    std::map<int, std::map<int, std::map<int, ChannelCalibration>>> m_calibrationMap;
+    using ChannelCoordinate = std::pair<int, int>;
+
+    // channel calibration: [detID][type][{id0, id1 or -1}]
+    std::map<int, std::map<int, std::map<ChannelCoordinate, double>>> m_pedSigmaMap;
+    std::map<int, std::map<int, std::map<ChannelCoordinate, ChannelCalibration>>> m_calibrationMap;
 
     bool LoadCanonicalChannelData();
 
@@ -56,7 +59,8 @@ class RawDataParser {
     ULong64_t m_timestamp{0};
     std::vector<int>* m_detectorIDs{nullptr};
     std::vector<int>* m_planeTypes{nullptr};
-    std::vector<int>* m_stripIDs{nullptr};
+    std::vector<int>* m_id0s{nullptr};
+    std::vector<int>* m_id1s{nullptr};
     std::vector<std::vector<short>>* m_waveforms{nullptr};
 
 };

@@ -8,7 +8,7 @@
 class TrackAnalysisScript : public IScript {
    public:
     std::string GetName() const override { return "TrackAnalysisScript"; }
-    std::string GetDescription() const override { return "Multi-track reconstruction and robust tracker alignment"; }
+    std::string GetDescription() const override { return "Single-hit calibration followed by multi-hit track reconstruction"; }
     void LoadConfig(const json& config) override;
     void Print() const override;
     bool Execute() override;
@@ -16,10 +16,10 @@ class TrackAnalysisScript : public IScript {
    private:
     bool m_runAlignment = false;
     bool m_saveValidationData = true;
-    bool m_debug = true;
+    bool m_debug = false;
     bool m_performanceHistograms = true;
+    bool m_useEstimatedResolution = true;
     double m_residualHistogramRange = 2.0;
-    int m_progressInterval = 10000;
     Tracking::Config m_tracking;
     Tracking::AlignmentConfig m_alignment;
 };

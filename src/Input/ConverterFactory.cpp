@@ -1,6 +1,6 @@
 #include "Input/ConverterFactory.h"
 #include "Input/BTAPVDatConverter.h"
-#include "Input/SRSRootConverter.h"
+#include "Input/APV25SRSConverter.h"
 
 #include <algorithm>
 #include <cctype>
@@ -11,8 +11,8 @@ std::unique_ptr<IRawDataConverter> ConverterFactory::Create(const std::string& t
     if (normalized == "btapvdat" || normalized == "bt-apv-dat" || normalized == "bt_apv_dat") {
         return std::make_unique<BTAPVDatConverter>();
     }
-    if (normalized == "srs" || normalized == "srsroot" || normalized == "srs-root") {
-        return std::make_unique<SRSRootConverter>();
+    if (normalized == "apv25srs") {
+        return std::make_unique<APV25SRSConverter>();
     }
     return nullptr;
 }

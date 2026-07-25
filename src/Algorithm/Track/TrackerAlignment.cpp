@@ -8,9 +8,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <iostream>
-#include <random>
-#include <unordered_map>
+#include <sstream>
 
 namespace Tracking {
 namespace {
@@ -75,65 +75,49 @@ bool Aligner::Run(const std::vector<Event>& events) {
     if (m_detectors.size() < 3) return false;
     std::vector<Variable> variables;
     for (size_t i = 1; i < m_detectors.size(); ++i) {
-        if (i + 1 < m_detectors.size()) {
-            variables.push_back({i, Parameter::X});
-            variables.push_back({i, Parameter::Y});
-        }
+        variables.push_back({i, Parameter::X});
+        variables.push_back({i, Parameter::Y});
         variables.push_back({i, Parameter::Rz});
     }
     if (variables.empty()) return true;
 
-    // Track finding is substantially more expensive than the alignment fit and the
-    // hit association is stable for the deliberately small per-iteration steps.
-    // Build it once, spread the sample over the full run, and cache only the local
-    // coordinates needed by the objective.
+    // Alignment must not depend on an ambiguous hit association.  Scan the full
+    // run and keep only events for which every tracker has exactly one local hit.
+    // These hits are unique by construction, so no track reconstruction or
+    // sampling is needed while building the alignment cache.
     struct CachedHit { size_t detector; TVector3 local; };
     struct CachedTrack { std::vector<CachedHit> hits; };
-    std::unordered_map<int, size_t> detectorIndex;
-    for (size_t i = 0; i < m_detectors.size(); ++i) detectorIndex[m_detectors[i]->GetID()] = i;
 
     std::vector<CachedTrack> tracks;
-    if (m_config.maxTracks > 0) tracks.reserve(m_config.maxTracks);
-    std::mt19937_64 sampling(0x5eedULL);
-    size_t usableTracks = 0;
-    const size_t eventBudget = m_config.maxEvents > 0
-        ? std::min(events.size(), static_cast<size_t>(m_config.maxEvents)) : events.size();
-    for (size_t sample = 0; sample < eventBudget; ++sample) {
-        const size_t eventIndex = sample * events.size() / eventBudget;
-        const auto& event = events[eventIndex];
-        for (const auto& result : m_reconstructor.Reconstruct(event)) {
-            CachedTrack track;
-            track.hits.reserve(result.hitIndices.size());
-            for (const auto& [id, hit] : result.hitIndices) {
-                const auto detector = detectorIndex.find(id);
-                const auto frame = event.detectorFramesMap.find(id);
-                if (detector == detectorIndex.end() || frame == event.detectorFramesMap.end() ||
-                    hit < 0 || static_cast<size_t>(hit) >= frame->second->LocalHits().size()) continue;
-                track.hits.push_back({detector->second, frame->second->LocalHits()[hit].localPos});
+    tracks.reserve(events.size());
+    for (const auto& event : events) {
+        CachedTrack track;
+        track.hits.reserve(m_detectors.size());
+        bool uniqueHitOnEveryTracker = true;
+        for (size_t detectorIndex = 0; detectorIndex < m_detectors.size(); ++detectorIndex) {
+            const int detectorID = m_detectors[detectorIndex]->GetID();
+            const auto frame = event.detectorFramesMap.find(detectorID);
+            if (frame == event.detectorFramesMap.end() ||
+                frame->second->LocalHits().size() != 1) {
+                uniqueHitOnEveryTracker = false;
+                break;
             }
-            if (track.hits.size() < 3) continue;
-            ++usableTracks;
-            if (m_config.maxTracks <= 0 || static_cast<int>(tracks.size()) < m_config.maxTracks) {
-                tracks.push_back(std::move(track));
-            } else {
-                // Reservoir sampling keeps the bounded cache representative of the
-                // complete run instead of favoring its first events.
-                std::uniform_int_distribution<size_t> replacement(0, usableTracks - 1);
-                const size_t slot = replacement(sampling);
-                if (slot < tracks.size()) tracks[slot] = std::move(track);
-            }
+            track.hits.push_back({detectorIndex, frame->second->LocalHits().front().localPos});
         }
+        if (uniqueHitOnEveryTracker) tracks.push_back(std::move(track));
     }
     if (static_cast<int>(tracks.size()) < m_config.minTracks) {
-        std::cerr << "[TrackAlign] stop: only " << tracks.size() << " tracks\n";
+        std::cerr << "[TrackAlign] stop: only " << tracks.size()
+                  << " events have exactly one hit on every tracker\n";
         return false;
     }
     if (m_config.debug) {
-        std::cout << "[TrackAlign] cached " << tracks.size() << " tracks from up to "
-                  << eventBudget << " uniformly sampled events\n";
+        std::cout << "[TrackAlign] selected " << tracks.size() << '/' << events.size()
+                  << " events with exactly one hit on every tracker\n";
     }
 
-    int stableIterations = 0;
+    int stableParameterIterations = 0;
+    int stableLossIterations = 0;
     for (int iteration = 0; iteration < m_config.maxIterations; ++iteration) {
         std::vector<TVector3> basePos, baseRot;
         for (const auto& detector : m_detectors) {
@@ -190,8 +174,23 @@ bool Aligner::Run(const std::vector<Event>& events) {
                     track.by = y / n - track.ky * z / n;
                     auto& detector = m_detectors[target.detector];
                     const auto predicted = geometry[target.detector].ToLocal(detector->CalcHitFromTrack(track));
-                    loss += Huber((target.local.X() - predicted.X()) / reconstruction.resolutionX, m_config.huberK);
-                    loss += Huber((target.local.Y() - predicted.Y()) / reconstruction.resolutionY, m_config.huberK);
+                    // This is an unbiased residual: the target hit was omitted
+                    // from the line fit.  Its uncertainty therefore includes
+                    // both the hit resolution and the prediction uncertainty
+                    // of the fit to the remaining layers.  Dividing only by
+                    // the single-hit resolution overweights the end layers
+                    // (strong extrapolation) and creates an artificial high
+                    // loss floor even for aligned geometry.
+                    const double meanZ = z / n;
+                    const double dz = omitted.Z() - meanZ;
+                    const double predictionVarianceScale = 1.0 / n + dz * dz / szz;
+                    const double unbiasedSigmaScale = std::sqrt(1.0 + predictionVarianceScale);
+                    loss += Huber((target.local.X() - predicted.X()) /
+                                      (reconstruction.resolutionX * unbiasedSigmaScale),
+                                  m_config.huberK);
+                    loss += Huber((target.local.Y() - predicted.Y()) /
+                                      (reconstruction.resolutionY * unbiasedSigmaScale),
+                                  m_config.huberK);
                     residuals += 2;
                 }
             }
@@ -217,12 +216,26 @@ bool Aligner::Run(const std::vector<Event>& events) {
         const bool ok = minimizer->Minimize();
         const double* solution = minimizer->X();
         const double after = minimizer->MinValue();
-        if (!ok || !std::isfinite(after) || after >= before) {
+        const double lossScale = std::max(std::abs(before), 1e-12);
+        const double relativeImprovement = (before - after) / lossScale;
+        if (!ok || !std::isfinite(after)) {
             std::vector<double> zero(variables.size(), 0.0);
             apply(zero.data());
             std::cerr << "[TrackAlign] iteration " << iteration + 1 << " rejected: loss "
                       << before << " -> " << after << '\n';
-            return iteration > 0;
+            return false;
+        }
+        if (after >= before) {
+            std::vector<double> zero(variables.size(), 0.0);
+            apply(zero.data());
+            if (std::abs(relativeImprovement) <= m_config.relativeLossTolerance) {
+                std::cout << "[TrackAlign] converged after " << iteration + 1
+                          << " iterations: loss plateau " << before << " -> " << after << '\n';
+                return true;
+            }
+            std::cerr << "[TrackAlign] iteration " << iteration + 1 << " rejected: loss "
+                      << before << " -> " << after << '\n';
+            return false;
         }
         apply(solution);
         double maxShift = 0.0, maxRotation = 0.0;
@@ -243,15 +256,48 @@ bool Aligner::Run(const std::vector<Event>& events) {
         }
         m_history.push_back(std::move(history));
         if (m_config.debug) {
-            std::cout << "[TrackAlign] iter=" << iteration + 1 << " tracks=" << tracks.size()
-                      << " loss=" << before << "->" << after << " maxShift=" << maxShift
-                      << " mm maxRz=" << maxRotation << " rad\n";
+            // Format in a private stream: other progress output may leave
+            // std::cout at fixed, one-decimal precision, which made valid
+            // sub-millimetre/sub-milliradian updates appear as 0.0.
+            std::ostringstream line;
+            line << std::defaultfloat << std::setprecision(8)
+                 << "[TrackAlign] iter=" << iteration + 1 << " tracks=" << tracks.size()
+                 << " loss=" << before << "->" << after << " maxShift=" << maxShift
+                 << " mm maxRz=" << maxRotation << " rad";
+            for (const auto& detector : m_detectors) {
+                const auto pos = detector->GetAlignPos();
+                const auto rot = detector->GetAlignRot();
+                line << " det" << detector->GetID() << "(dx=" << pos.X()
+                     << ",dy=" << pos.Y() << ",rz=" << rot.Z() << ')';
+            }
+            line << '\n';
+            std::cout << line.str();
         }
-        if (maxShift < m_config.shiftTolerance && maxRotation < m_config.rotationTolerance) ++stableIterations;
-        else stableIterations = 0;
-        if (stableIterations >= 2) break;
+        if (maxShift < m_config.shiftTolerance && maxRotation < m_config.rotationTolerance)
+            ++stableParameterIterations;
+        else
+            stableParameterIterations = 0;
+        if (relativeImprovement < m_config.relativeLossTolerance)
+            ++stableLossIterations;
+        else
+            stableLossIterations = 0;
+
+        if (stableParameterIterations >= m_config.convergencePatience) {
+            std::cout << "[TrackAlign] converged after " << iteration + 1
+                      << " iterations: parameter updates are stable\n";
+            return true;
+        }
+        if (stableLossIterations >= m_config.convergencePatience) {
+            std::cout << "[TrackAlign] converged after " << iteration + 1
+                      << " iterations: relative loss improvement < "
+                      << m_config.relativeLossTolerance << " for "
+                      << m_config.convergencePatience << " consecutive iterations\n";
+            return true;
+        }
     }
-    return true;
+    std::cerr << "[TrackAlign] did not converge within " << m_config.maxIterations
+              << " iterations\n";
+    return false;
 }
 
 }  // namespace Tracking

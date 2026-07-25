@@ -13,6 +13,8 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
+#include <sstream>
 
 using namespace std;
 
@@ -21,33 +23,34 @@ void TrackAnalysisScript::LoadConfig(const json& config) {
         "runAlignment",
         config.value("performAlignment", false));
     m_saveValidationData = config.value("saveValidationData", true);
-    m_progressInterval = max(1, config.value("progressInterval", 10000));
-    m_debug = config.value("debug", true);
+    m_debug = config.value("debug", false);
     m_performanceHistograms = config.value("performanceHistograms", true);
+    m_useEstimatedResolution = config.value("useEstimatedResolution", true);
     m_residualHistogramRange = config.value("residualHistogramRange", 2.0);
     m_tracking.resolutionX = config.value("resolutionX", 0.12);
     m_tracking.resolutionY = config.value("resolutionY", 0.12);
-    m_tracking.gateSigma = config.value("gateSigma", 5.0);
+    m_tracking.gateSigma = config.value("gateSigma", 3.0);
     m_tracking.maxChi2Ndf = config.value("maxChi2Ndf", 25.0);
     m_tracking.maxBranchesPerLayer = config.value("maxBranchesPerLayer", 3);
     m_tracking.maxCandidates = config.value("maxCandidates", 4000);
     m_tracking.maxTracks = config.value("maxTracksPerEvent", 32);
     m_tracking.conflictSearchNodes = config.value("conflictSearchNodes", 20000);
-    m_alignment.maxIterations = config.value("alignmentIterations", 20);
+    m_alignment.maxIterations = config.value("alignmentIterations", 30);
     m_alignment.minTracks = config.value("alignmentMinTracks", 20);
-    m_alignment.maxEvents = config.value("alignmentMaxEvents", 10000);
-    m_alignment.maxTracks = config.value("alignmentMaxTracks", 5000);
     m_alignment.maxFunctionCalls = config.value("alignmentMaxFunctionCalls", 600);
     m_alignment.maxShiftStep = config.value("alignmentMaxShiftStep", 0.20);
     m_alignment.maxRotationStep = config.value("alignmentMaxRotationStep", 0.001);
+    m_alignment.relativeLossTolerance = std::max(
+        0.0, config.value("alignmentRelativeLossTolerance", 1e-4));
+    m_alignment.convergencePatience = std::max(
+        1, config.value("alignmentConvergencePatience", 3));
     m_alignment.debug = m_debug;
 }
 
 void TrackAnalysisScript::Print() const {
-    cout << "TrackAnalysisScript: gate=" << m_tracking.gateSigma << " sigma, resolution=("
-         << m_tracking.resolutionX << ", " << m_tracking.resolutionY << ") mm, maxCandidates="
-         << m_tracking.maxCandidates << ", maxTracks/event=" << m_tracking.maxTracks
-         << ", alignment=" << (m_runAlignment ? "enabled" : "disabled") << '\n';
+    cout << "[Tracking] single-hit calibration, multi-hit reconstruction, alignment="
+         << (m_runAlignment ? "on" : "off")
+         << ", estimated-resolution=" << (m_useEstimatedResolution ? "on" : "off") << '\n';
 }
 
 bool TrackAnalysisScript::Execute() {
@@ -63,50 +66,61 @@ bool TrackAnalysisScript::Execute() {
         cerr << "[TrackAnalysis] at least three trackers are required\n";
         return false;
     }
-    cout << "[TrackAnalysis] trackers=" << trackers.size()
-         << " events=" << parser->GetTotalEvents() << '\n';
+    cout << "[Tracking] input=" << parser->GetTotalEvents()
+         << " events, trackers=" << trackers.size() << '\n';
     Print();
 
     const Long64_t total = parser->GetTotalEvents();
-    vector<Event> events;
-    map<int, ULong64_t> rawEventIDs;
-    events.reserve(total);
-    const int requiredLayers = trackers.size() <= 3 ? trackers.size() : trackers.size() - 1;
-    for (Long64_t i = 0; i < total; ++i) {
-        if (i % m_progressInterval == 0 || i + 1 == total)
-            cout << "\r[TrackAnalysis] decode " << i + 1 << '/' << total << flush;
+    auto loadEvent = [&](Long64_t i) -> optional<Event> {
         const auto rawHits = parser->LoadEvent(i);
-        if (rawHits.empty()) continue;
+        if (rawHits.empty()) return nullopt;
         Event event{.eventID = static_cast<int>(i)};
-        rawEventIDs[event.eventID] = parser->GetCurrentEventID();
-        int validLayers = 0;
         for (const auto& detector : trackers) {
             auto frame = make_shared<DetectorFrame>(*detector);
             const auto raw = rawHits.find(detector->GetID());
             if (raw != rawHits.end()) frame->SetRawData(raw->second);
-            if (frame->Process()) ++validLayers;
+            frame->Process();
             event.detectorFramesMap[detector->GetID()] = std::move(frame);
         }
-        if (validLayers >= requiredLayers) events.push_back(std::move(event));
-    }
-    cout << "\n[TrackAnalysis] reconstructable events=" << events.size() << '/' << total << '\n';
-    if (events.empty()) return false;
+        return event;
+    };
 
-    Tracking::Reconstructor reconstructor(trackers, m_tracking);
-    vector<Tracking::AlignmentIteration> alignmentHistory;
-    if (m_runAlignment) {
-        Tracking::Aligner aligner(trackers, reconstructor, m_alignment);
-        if (!aligner.Run(events)) cerr << "[TrackAnalysis] alignment did not converge; using last valid geometry\n";
-        alignmentHistory = aligner.History();
-        if (m_debug) {
-            cout << "[TrackAlign] final geometry\n";
-            for (const auto& detector : trackers) {
-                const auto pos = detector->GetPos();
-                const auto rot = detector->GetRot();
-                cout << "  id=" << detector->GetID() << " pos=(" << pos.X() << ',' << pos.Y() << ',' << pos.Z()
-                     << ") rotZ=" << rot.Z() << '\n';
+    vector<Event> calibrationEvents;
+    calibrationEvents.reserve(total);
+    for (Long64_t i = 0; i < total; ++i) {
+        auto event = loadEvent(i);
+        if (!event) continue;
+        bool singleHitOnEveryTracker = true;
+        for (const auto& detector : trackers) {
+            if (event->detectorFramesMap.at(detector->GetID())->LocalHits().size() != 1) {
+                singleHitOnEveryTracker = false;
+                break;
             }
         }
+        if (!singleHitOnEveryTracker) continue;
+        calibrationEvents.push_back(std::move(*event));
+    }
+    cout << "[Tracking] calibration events=" << calibrationEvents.size() << '/' << total << '\n';
+    if (calibrationEvents.empty()) return false;
+
+    Tracking::Reconstructor calibrationReconstructor(trackers, m_tracking);
+    if (m_runAlignment) {
+        Tracking::Aligner aligner(trackers, calibrationReconstructor, m_alignment);
+        if (!aligner.Run(calibrationEvents)) cerr << "[TrackAnalysis] alignment did not converge; using last valid geometry\n";
+        ostringstream geometry;
+        geometry << defaultfloat << setprecision(10)
+                 << "[TrackAlign] final geometry (config.json format)\n";
+        for (const auto& detector : trackers) {
+            const auto pos = detector->GetPos();
+            const auto rot = detector->GetRot();
+            geometry << "  detector " << detector->GetID() << " ("
+                     << detector->GetName() << "):\n"
+                     << "      \"position\": [ " << pos.X() << ", " << pos.Y()
+                     << ", " << pos.Z() << " ],\n"
+                     << "      \"rotation\": [ " << rot.X() << ", " << rot.Y()
+                     << ", " << rot.Z() << " ],\n";
+        }
+        cout << geometry.str();
     }
 
     const string outputPath = GetOutputDir() + "TrackInfo.root";
@@ -126,7 +140,7 @@ bool TrackAnalysisScript::Execute() {
     Int_t detID = 0;
     Double_t resX = 0, resY = 0, hitX = 0, hitY = 0;
     vector<Int_t> clusterIndices;
-    vector<StripHit> stripHits;
+    vector<ChannelHit> channelHits;
     vector<Cluster> clusters;
     if (m_saveValidationData) {
         validation = make_unique<TTree>("TrackerValidation", "Tracker QA");
@@ -139,28 +153,59 @@ bool TrackAnalysisScript::Execute() {
         validation->Branch("hitX", &hitX);
         validation->Branch("hitY", &hitY);
         validation->Branch("clusterIndices", &clusterIndices);
-        validation->Branch("stripHits", &stripHits);
+        validation->Branch("channelHits", &channelHits);
         validation->Branch("clusters", &clusters);
     }
 
     unique_ptr<Tracking::PerformanceAnalyzer> performance;
-    if (m_performanceHistograms) {
+    if (m_performanceHistograms || m_useEstimatedResolution) {
         auto* performanceDir = output->mkdir("Performance");
+        const auto referenceDetectors =
+            DetectorFactory::GetInstance().GetDetectorsByRole(Detector::Role::DUT);
         performance = make_unique<Tracking::PerformanceAnalyzer>(
-            performanceDir, trackers, m_tracking, total, m_residualHistogramRange);
-        performance->RecordAlignment(alignmentHistory);
+            performanceDir, trackers, referenceDetectors, m_tracking,
+            m_residualHistogramRange);
     }
 
-    size_t savedTracks = 0, trackedEvents = 0;
-    for (size_t i = 0; i < events.size(); ++i) {
-        Tracking::ReconstructionStats reconstructionStats;
-        auto results = reconstructor.Reconstruct(events[i], &reconstructionStats);
-        if (performance) performance->RecordEvent(events[i], results, reconstructionStats);
+    if (performance) {
+        for (const auto& event : calibrationEvents) performance->RecordEvent(event);
+        if (m_useEstimatedResolution) {
+            const auto [estimatedX, estimatedY] = performance->EstimateHitResolution();
+            if (estimatedX > 0.0 && estimatedY > 0.0) {
+                m_tracking.resolutionX = estimatedX;
+                m_tracking.resolutionY = estimatedY;
+                cout << "[Tracking] estimated hit resolution X=" << 1000.0 * estimatedX
+                     << " um, Y=" << 1000.0 * estimatedY << " um\n";
+            } else {
+                cerr << "[TrackAnalysis] hit-resolution fit failed; using configured resolution\n";
+            }
+        }
+    }
+
+    // Calibration retains full detector frames, including raw waveforms. Free
+    // them before the all-event reconstruction pass to keep memory bounded.
+    calibrationEvents.clear();
+    calibrationEvents.shrink_to_fit();
+    Tracking::Reconstructor reconstructor(trackers, m_tracking);
+
+    size_t savedTracks = 0, trackedEvents = 0, analyzedEvents = 0, multiHitEvents = 0;
+    for (Long64_t i = 0; i < total; ++i) {
+        auto loaded = loadEvent(i);
+        if (!loaded) continue;
+        auto& event = *loaded;
+        ++analyzedEvents;
+        const bool hasMultipleHits = any_of(
+            trackers.begin(), trackers.end(), [&](const auto& detector) {
+                return event.detectorFramesMap.at(detector->GetID())->LocalHits().size() > 1;
+            });
+        if (hasMultipleHits) ++multiHitEvents;
+        const ULong64_t currentRawEventID = parser->GetCurrentEventID();
+        auto results = reconstructor.Reconstruct(event);
         if (!results.empty()) ++trackedEvents;
         for (size_t resultIndex = 0; resultIndex < results.size(); ++resultIndex) {
             const auto& result = results[resultIndex];
-            eventID = events[i].eventID;
-            rawEventID = rawEventIDs.at(events[i].eventID);
+            eventID = event.eventID;
+            rawEventID = currentRawEventID;
             trackIndex = static_cast<Int_t>(resultIndex);
             track = result.track;
             tracksTree.Fill();
@@ -169,13 +214,13 @@ bool TrackAnalysisScript::Execute() {
             if (!validation) continue;
             for (const auto& [id, hitIndex] : result.hitIndices) {
                 const auto detector = DetectorFactory::GetInstance().GetDetector(id);
-                const auto& frame = events[i].detectorFramesMap.at(id);
+                const auto& frame = event.detectorFramesMap.at(id);
                 const auto& localHit = frame->LocalHits().at(hitIndex);
                 vector<TVector3> otherHits;
                 for (const auto& [otherID, otherIndex] : result.hitIndices) {
                     if (otherID == id) continue;
                     const auto other = DetectorFactory::GetInstance().GetDetector(otherID);
-                    otherHits.push_back(other->LocalToGlobal(events[i].detectorFramesMap.at(otherID)->LocalHits().at(otherIndex).localPos));
+                    otherHits.push_back(other->LocalToGlobal(event.detectorFramesMap.at(otherID)->LocalHits().at(otherIndex).localPos));
                 }
                 const auto unbiased = Tracking::FitWeighted(otherHits, m_tracking.resolutionX, m_tracking.resolutionY);
                 const auto predicted = detector->GlobalToLocal(detector->CalcHitFromTrack(unbiased));
@@ -185,21 +230,20 @@ bool TrackAnalysisScript::Execute() {
                 resX = hitX - predicted.X();
                 resY = hitY - predicted.Y();
                 clusterIndices.assign(localHit.clusterIndices.begin(), localHit.clusterIndices.end());
-                stripHits = frame->StripHits();
+                channelHits = frame->ChannelHits();
                 clusters = frame->Clusters();
                 validation->Fill();
             }
         }
-        if (m_debug && ((i + 1) % m_progressInterval == 0 || i + 1 == events.size()))
-            cout << "\r[TrackAnalysis] fit " << i + 1 << '/' << events.size() << " tracks=" << savedTracks << flush;
     }
-    cout << "\n[TrackAnalysis] tracked events=" << trackedEvents << '/' << events.size()
-         << " tracks=" << savedTracks << '\n';
+    cout << "[Tracking] reconstructed=" << trackedEvents << '/' << analyzedEvents
+         << " events, multi-hit input=" << multiHitEvents
+         << ", tracks=" << savedTracks << '\n';
     output->cd();
     tracksTree.Write();
     if (validation) validation->Write();
-    if (performance) performance->Write();
-    cout << "[TrackAnalysis] wrote TrackInfo.root in "
+    if (performance && m_performanceHistograms) performance->Write();
+    cout << "[Tracking] output=TrackInfo.root, elapsed="
          << fixed << setprecision(2) << chrono::duration<double>(chrono::steady_clock::now() - start).count() << " s\n";
     return true;
 }

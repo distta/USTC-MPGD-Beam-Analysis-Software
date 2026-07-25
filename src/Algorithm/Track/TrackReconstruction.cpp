@@ -86,7 +86,8 @@ struct Geometry {
     bool planar = false;
 
     explicit Geometry(const Detector& value)
-        : detector(&value), position(value.GetPos()), planar(dynamic_cast<const Planar*>(&value) != nullptr) {
+        : detector(&value), position(value.GetPos()),
+          planar(value.GetPlanarConfig() != nullptr || value.GetPlanarPadConfig() != nullptr) {
         const auto rotation = value.GetRot();
         const double cx = std::cos(rotation.X()), sx = std::sin(rotation.X());
         const double cy = std::cos(rotation.Y()), sy = std::sin(rotation.Y());

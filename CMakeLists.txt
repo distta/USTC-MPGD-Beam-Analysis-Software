@@ -41,13 +41,15 @@ set(SOURCES
     src/Input/ChannelMap.cpp
     src/Input/ConverterFactory.cpp
     src/Input/BTAPVDatConverter.cpp
-    src/Input/SRSRootConverter.cpp
+    src/Input/APV25SRSConverter.cpp
     src/Script/Base/RawDataParser.cpp
     src/Script/Base/ScriptFactory.cpp
     src/Script/ExampleScript.cpp
     src/Script/TrackAnalysisScript.cpp
     src/Script/TimeResolutionScript.cpp
     src/Script/DUTAnalysisScript.cpp
+    src/Script/DUTEfficiencyAnalysis.cpp
+    src/Script/PadDUTAnalysisScript.cpp
 )
 
 add_executable(BeamAnalysis ${SOURCES})
@@ -69,6 +71,7 @@ target_link_libraries(BeamAnalysis
     Threads::Threads
     stdc++fs
 )
+
 
 # 头文件和 LinkDef
 set(DI_HDR ${CMAKE_CURRENT_SOURCE_DIR}/include/Event/DataModel.h)

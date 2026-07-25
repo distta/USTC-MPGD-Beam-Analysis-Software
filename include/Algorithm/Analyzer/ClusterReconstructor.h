@@ -13,7 +13,7 @@ class DetectorFrame;
  * @brief 簇重建算法 - 负责重建cluster的pos值
  *
  * 功能：
- * - 根据cluster中的StripHit信息重建cluster的位置（pos）
+ * - 根据cluster中的ChannelHit信息重建cluster的位置（pos）
  * - 支持多种重建方法（电荷加权、UTPC等）
  */
 class ClusterReconstructor : public IAlgorithm {
@@ -43,9 +43,10 @@ class ClusterReconstructor : public IAlgorithm {
     ReconstructionConfig m_config;
 
     // 不同的重建方法（以stripID为单位）
-    void reconstructChargeWeighted(Cluster& cluster, const std::vector<StripHit>& stripHits);
-    void reconstructUTPC(Cluster& cluster, const std::vector<StripHit>& stripHits, double t0);
-    void reconstructRawUTPC(Cluster& cluster, const std::vector<StripHit>& stripHits, double t0);
+    void reconstructChargeWeighted(Cluster& cluster, const std::vector<ChannelHit>& channelHits);
+    void reconstructPadChargeWeighted(Cluster& cluster, const std::vector<ChannelHit>& channelHits);
+    void reconstructUTPC(Cluster& cluster, const std::vector<ChannelHit>& channelHits, double t0);
+    void reconstructRawUTPC(Cluster& cluster, const std::vector<ChannelHit>& channelHits, double t0);
 };
 
 #endif  // CLUSTER_RECONSTRUCTOR_H

@@ -11,7 +11,7 @@
 class DetectorFrame;
 
 /**
- * @brief 波形处理算法 - 负责RawData到StripHit的转换
+ * @brief 波形处理算法 - 负责RawData到ChannelHit的转换
  *
  * 功能：
  * - 处理原始波形数据（ADC采样点）
@@ -39,15 +39,15 @@ class WaveformProcessor : public IAlgorithm {
     // 统一接口: 处理DetectorFrame中的所有RawData
     bool Process(DetectorFrame& frame) override;
 
-    StripHit ProcessWaveform(const RawData& rawData);
+    ChannelHit ProcessWaveform(const RawData& rawData);
 
    private:
     WaveformConfig m_config;
 
     // 私有处理方法
-    StripHit processWaveformDefault(const RawData& rawData);
-    StripHit processWaveformLeadingEdgeFit(const RawData& rawData);
-    StripHit processWaveformMode1(const RawData& rawData);
+    ChannelHit processWaveformDefault(const RawData& rawData);
+    ChannelHit processWaveformLeadingEdgeFit(const RawData& rawData);
+    ChannelHit processWaveformMode1(const RawData& rawData);
 };
 
 #endif  // WAVEFORM_PROCESSOR_H
