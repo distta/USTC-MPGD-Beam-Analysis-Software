@@ -167,19 +167,18 @@ bool TrackAnalysisScript::Execute() {
             m_residualHistogramRange);
     }
 
-    if (performance) {
+    if (performance && m_useEstimatedResolution) {
         for (const auto& event : calibrationEvents) performance->RecordEvent(event);
-        if (m_useEstimatedResolution) {
-            const auto [estimatedX, estimatedY] = performance->EstimateHitResolution();
-            if (estimatedX > 0.0 && estimatedY > 0.0) {
-                m_tracking.resolutionX = estimatedX;
-                m_tracking.resolutionY = estimatedY;
-                cout << "[Tracking] estimated hit resolution X=" << 1000.0 * estimatedX
-                     << " um, Y=" << 1000.0 * estimatedY << " um\n";
-            } else {
-                cerr << "[TrackAnalysis] hit-resolution fit failed; using configured resolution\n";
-            }
+        const auto [estimatedX, estimatedY] = performance->EstimateHitResolution();
+        if (estimatedX > 0.0 && estimatedY > 0.0) {
+            m_tracking.resolutionX = estimatedX;
+            m_tracking.resolutionY = estimatedY;
+            cout << "[Tracking] estimated hit resolution X=" << 1000.0 * estimatedX
+                 << " um, Y=" << 1000.0 * estimatedY << " um\n";
+        } else {
+            cerr << "[TrackAnalysis] hit-resolution fit failed; using configured resolution\n";
         }
+        if (m_performanceHistograms) performance->Reset();
     }
 
     // Calibration retains full detector frames, including raw waveforms. Free
@@ -210,6 +209,8 @@ bool TrackAnalysisScript::Execute() {
             track = result.track;
             tracksTree.Fill();
             ++savedTracks;
+            if (performance && m_performanceHistograms)
+                performance->RecordTrack(event, result);
 
             if (!validation) continue;
             for (const auto& [id, hitIndex] : result.hitIndices) {
@@ -243,6 +244,9 @@ bool TrackAnalysisScript::Execute() {
     tracksTree.Write();
     if (validation) validation->Write();
     if (performance && m_performanceHistograms) performance->Write();
+    tracksTree.SetDirectory(nullptr);
+    if (validation) validation->SetDirectory(nullptr);
+    output->Close();
     cout << "[Tracking] output=TrackInfo.root, elapsed="
          << fixed << setprecision(2) << chrono::duration<double>(chrono::steady_clock::now() - start).count() << " s\n";
     return true;

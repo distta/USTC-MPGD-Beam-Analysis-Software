@@ -8,6 +8,7 @@
 #include <TLegend.h>
 #include <TLine.h>
 #include <TLatex.h>
+#include <TMath.h>
 #include <TTree.h>
 
 #include <algorithm>
@@ -74,6 +75,28 @@ struct Grid {
             if (matched[axis]) ++numerator[axis][bin];
     }
 };
+
+std::pair<int, int> PlanarAxisTypes(const planarConfig& config) {
+    int typeX = -1;
+    int typeY = -1;
+    double bestX = std::numeric_limits<double>::infinity();
+    double bestY = std::numeric_limits<double>::infinity();
+    for (int type : config.readoutPlaneType) {
+        const double angle =
+            config.readoutPlaneAngle.at(type) * TMath::DegToRad();
+        const double xScore = std::abs(std::sin(angle));
+        const double yScore = std::abs(std::cos(angle));
+        if (xScore < bestX) {
+            bestX = xScore;
+            typeX = type;
+        }
+        if (yScore < bestY) {
+            bestY = yScore;
+            typeY = type;
+        }
+    }
+    return {typeX, typeY};
+}
 
 bool Contains(const std::vector<int>& bins, int value) {
     return std::find(bins.begin(), bins.end(), value) != bins.end();
@@ -520,10 +543,13 @@ Result Analyze(const std::vector<Event>& events,
     Result result;
     if (!detector || !outputDirectory || config.xBins <= 0 || config.yBins <= 0) return result;
     const auto* planar = detector->GetPlanarConfig();
-    if (!planar || !planar->readoutPlanePitch.count(kX) ||
-        !planar->readoutPlanePitch.count(kY)) return result;
-    const double pitchX = planar->readoutPlanePitch.at(kX);
-    const double pitchY = planar->readoutPlanePitch.at(kY);
+    if (!planar) return result;
+    const auto [typeX, typeY] = PlanarAxisTypes(*planar);
+    if (typeX < 0 || typeY < 0 ||
+        !planar->readoutPlanePitch.count(typeX) ||
+        !planar->readoutPlanePitch.count(typeY)) return result;
+    const double pitchX = planar->readoutPlanePitch.at(typeX);
+    const double pitchY = planar->readoutPlanePitch.at(typeY);
 
     std::vector<Sample> samples;
     samples.reserve(events.size());
@@ -539,8 +565,8 @@ Result Analyze(const std::vector<Event>& events,
         sample.predX = predicted.X();
         sample.predY = predicted.Y();
         sample.flatBin = flatBin;
-        sample.intervalsX = BuildIntervals(frame, kX, pitchX);
-        sample.intervalsY = BuildIntervals(frame, kY, pitchY);
+        sample.intervalsX = BuildIntervals(frame, typeX, pitchX);
+        sample.intervalsY = BuildIntervals(frame, typeY, pitchY);
         samples.push_back(std::move(sample));
     }
 

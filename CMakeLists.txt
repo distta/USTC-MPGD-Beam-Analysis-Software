@@ -30,7 +30,7 @@ set(SOURCES
     src/Detector/Cylinder.cpp
     src/Detector/DetectorFactory.cpp
     src/Algorithm/AlgorithmFactory.cpp
-    src/Algorithm/Analyzer/WaveformProcessor.cpp
+    src/Algorithm/Analyzer/HitProcessor.cpp
     src/Algorithm/Oscilloscope/OscilloscopeDataProcessor.cpp
     src/Algorithm/Analyzer/ClusterBuilder.cpp
     src/Algorithm/Analyzer/ClusterReconstructor.cpp
@@ -42,6 +42,7 @@ set(SOURCES
     src/Input/ConverterFactory.cpp
     src/Input/BTAPVDatConverter.cpp
     src/Input/APV25SRSConverter.cpp
+    src/Input/VMM3aConverter.cpp
     src/Script/Base/RawDataParser.cpp
     src/Script/Base/ScriptFactory.cpp
     src/Script/ExampleScript.cpp
@@ -67,7 +68,7 @@ target_include_directories(BeamAnalysis PRIVATE
     ${EIGEN3_INCLUDE_DIR} 
 )
 
-target_link_libraries(BeamAnalysis
+target_link_libraries(BeamAnalysis PRIVATE
     ${ROOT_LIBRARIES}
     Threads::Threads
     stdc++fs

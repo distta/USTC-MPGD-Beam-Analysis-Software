@@ -1,7 +1,7 @@
 #pragma once
 #include "Algorithm/Analyzer/ClusterBuilder.h"
 #include "Algorithm/Analyzer/ClusterReconstructor.h"
-#include "Algorithm/Analyzer/WaveformProcessor.h"
+#include "Algorithm/Analyzer/HitProcessor.h"
 #include "DataModel.h"
 #include "Detector.h"
 #include <stdexcept>

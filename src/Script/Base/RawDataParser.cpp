@@ -50,38 +50,54 @@ bool RawDataParser::Initialize() {
    } else {
       m_schemaVersion = 0;
    }
-   if (m_schemaVersion != 2) {
+   if (m_schemaVersion != 2 && m_schemaVersion != 3) {
       std::cerr << "[RawDataParser] Unsupported schema version: "
                 << m_schemaVersion
-                << "; re-run conversion to produce schema version 2"
+                << "; supported versions are 2 and 3"
                 << std::endl;
       return false;
    }
 
-   const char* required[] = {
-       "event_id",
-       "timestamp",
-       "detector_id",
-       "plane_type",
-       "id0",
-       "id1",
-       "waveform"};
+   const std::vector<std::string> required =
+       m_schemaVersion == 3
+           ? std::vector<std::string>{
+                 "evt", "time", "det", "plane", "id0", "id1",
+                 "chip", "channel", "waveform", "adc", "rawhitid",
+                 "hit_time_ns"}
+           : std::vector<std::string>{
+                 "event_id", "timestamp", "detector_id", "plane_type",
+                 "id0", "id1", "waveform"};
 
-   for (const char* branch : required) {
-      if (!m_tree->GetBranch(branch)) {
+   for (const auto& branch : required) {
+      if (!m_tree->GetBranch(branch.c_str())) {
          std::cerr << "[RawDataParser] Missing branch: "
                    << branch << std::endl;
          return false;
       }
    }
 
-   m_tree->SetBranchAddress("event_id", &m_eventID);
-   m_tree->SetBranchAddress("timestamp", &m_timestamp);
-   m_tree->SetBranchAddress("detector_id", &m_detectorIDs);
-   m_tree->SetBranchAddress("plane_type", &m_planeTypes);
-   m_tree->SetBranchAddress("id0", &m_id0s);
-   m_tree->SetBranchAddress("id1", &m_id1s);
-   m_tree->SetBranchAddress("waveform", &m_waveforms);
+   if (m_schemaVersion == 3) {
+      m_tree->SetBranchAddress("evt", &m_eventID);
+      m_tree->SetBranchAddress("time", &m_eventTimeNs);
+      m_tree->SetBranchAddress("det", &m_detectorIDs);
+      m_tree->SetBranchAddress("plane", &m_planeTypes);
+      m_tree->SetBranchAddress("id0", &m_id0s);
+      m_tree->SetBranchAddress("id1", &m_id1s);
+      m_tree->SetBranchAddress("chip", &m_chipIDs);
+      m_tree->SetBranchAddress("channel", &m_channelIDs);
+      m_tree->SetBranchAddress("waveform", &m_waveforms);
+      m_tree->SetBranchAddress("adc", &m_adcs);
+      m_tree->SetBranchAddress("rawhitid", &m_rawHitIDs);
+      m_tree->SetBranchAddress("hit_time_ns", &m_hitTimesNs);
+   } else {
+      m_tree->SetBranchAddress("event_id", &m_eventID);
+      m_tree->SetBranchAddress("timestamp", &m_timestamp);
+      m_tree->SetBranchAddress("detector_id", &m_detectorIDs);
+      m_tree->SetBranchAddress("plane_type", &m_planeTypes);
+      m_tree->SetBranchAddress("id0", &m_id0s);
+      m_tree->SetBranchAddress("id1", &m_id1s);
+      m_tree->SetBranchAddress("waveform", &m_waveforms);
+   }
 
    m_numOfEvents = m_tree->GetEntries();
 
@@ -112,8 +128,12 @@ bool RawDataParser::LoadCanonicalChannelData() {
 
    int polarity = 1;
 
+   const char* detectorBranch =
+       m_schemaVersion == 3 ? "det" : "detector_id";
+   const char* planeBranch =
+       m_schemaVersion == 3 ? "plane" : "plane_type";
    const char* required[] = {
-       "detector_id", "plane_type", "id0", "id1"};
+       detectorBranch, planeBranch, "id0", "id1"};
    for (const char* branch : required) {
       if (!channelTree->GetBranch(branch)) {
          std::cerr << "[RawDataParser] Channels tree is missing branch: "
@@ -122,8 +142,8 @@ bool RawDataParser::LoadCanonicalChannelData() {
       }
    }
 
-   channelTree->SetBranchAddress("detector_id", &detectorID);
-   channelTree->SetBranchAddress("plane_type", &planeType);
+   channelTree->SetBranchAddress(detectorBranch, &detectorID);
+   channelTree->SetBranchAddress(planeBranch, &planeType);
    channelTree->SetBranchAddress("id0", &id0);
    channelTree->SetBranchAddress("id1", &id1);
 
@@ -377,7 +397,8 @@ std::unordered_map<int, std::vector<RawData>>
    auto& factory = DetectorFactory::GetInstance();
    const auto& detectors = factory.GetAllDetectors();
 
-   if (!m_detectorIDs || !m_planeTypes || !m_id0s || !m_id1s || !m_waveforms) {
+   if (!m_detectorIDs || !m_planeTypes || !m_id0s || !m_id1s ||
+       !m_waveforms) {
       return result;
    }
 
@@ -388,6 +409,18 @@ std::unordered_map<int, std::vector<RawData>>
        m_id1s->size() != nHits ||
        m_waveforms->size() != nHits) {
       std::cerr << "[RawDataParser] Inconsistent vectors at entry "
+                << eventID << '\n';
+      return result;
+   }
+   if (m_schemaVersion == 3 &&
+       (!m_chipIDs || !m_channelIDs || !m_adcs || !m_rawHitIDs ||
+        !m_hitTimesNs ||
+        m_chipIDs->size() != nHits ||
+        m_channelIDs->size() != nHits ||
+        m_adcs->size() != nHits ||
+        m_rawHitIDs->size() != nHits ||
+        m_hitTimesNs->size() != nHits)) {
+      std::cerr << "[RawDataParser] Inconsistent schema v3 vectors at entry "
                 << eventID << '\n';
       return result;
    }
@@ -405,6 +438,33 @@ std::unordered_map<int, std::vector<RawData>>
       const int id0 = (*m_id0s)[i];
       const int id1Value = (*m_id1s)[i];
       if (id0 < 0) continue;
+
+      if (m_schemaVersion == 3) {
+         double calibratedADC = static_cast<double>((*m_adcs)[i]);
+         const auto detIt = m_calibrationMap.find(detID);
+         if (detIt != m_calibrationMap.end()) {
+            const auto planeIt = detIt->second.find(planeType);
+            if (planeIt != detIt->second.end()) {
+               const auto channelIt =
+                   planeIt->second.find({id0, id1Value});
+               if (channelIt != planeIt->second.end()) {
+                  const auto& calibration = channelIt->second;
+                  calibratedADC =
+                      (calibratedADC - calibration.pedestal) *
+                      calibration.gain * calibration.polarity;
+               }
+            }
+         }
+
+         RawData decoded{id0, id1Value, planeType, {}};
+         decoded.chip = (*m_chipIDs)[i];
+         decoded.channel = (*m_channelIDs)[i];
+         decoded.rawHitID = (*m_rawHitIDs)[i];
+         decoded.adcValue = calibratedADC;
+         decoded.hitTimeNs = (*m_hitTimesNs)[i];
+         result[detID].push_back(std::move(decoded));
+         continue;
+      }
 
       std::vector<short> calibrated = (*m_waveforms)[i];
       double gain = 1.0;

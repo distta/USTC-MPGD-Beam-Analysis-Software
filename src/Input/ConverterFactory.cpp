@@ -1,6 +1,7 @@
 #include "Input/ConverterFactory.h"
 #include "Input/BTAPVDatConverter.h"
 #include "Input/APV25SRSConverter.h"
+#include "Input/VMM3aConverter.h"
 
 #include <algorithm>
 #include <cctype>
@@ -13,6 +14,9 @@ std::unique_ptr<IRawDataConverter> ConverterFactory::Create(const std::string& t
     }
     if (normalized == "apv25srs") {
         return std::make_unique<APV25SRSConverter>();
+    }
+    if (normalized == "vmm3a" || normalized == "vmm") {
+        return std::make_unique<VMM3aConverter>();
     }
     return nullptr;
 }

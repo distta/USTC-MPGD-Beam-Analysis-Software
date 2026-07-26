@@ -2,7 +2,7 @@
 #include "Algorithm/AlgorithmFactory.h"
 #include "Algorithm/Analyzer/ClusterBuilder.h"
 #include "Algorithm/Analyzer/ClusterReconstructor.h"
-#include "Algorithm/Analyzer/WaveformProcessor.h"
+#include "Algorithm/Analyzer/HitProcessor.h"
 #include "TMath.h"
 #include "TMatrixD.h"
 #include <iostream>
@@ -54,10 +54,10 @@ Detector::Detector(int id, const std::string& name, const nlohmann::json& config
 
     } else {
         try {
-            // 创建默认的waveformProcessor
-            auto waveformProc = factory.CreateAlgorithm("WaveformProcessor", json::object());
-            waveformProc->SetDetector(this);
-            m_algorithms["WaveformProcessor"] = waveformProc;
+            // 创建默认的 hit processor（自动识别波形或已解码 hit）
+            auto hitProcessor = factory.CreateAlgorithm("HitProcessor", json::object());
+            hitProcessor->SetDetector(this);
+            m_algorithms["HitProcessor"] = hitProcessor;
 
             // 创建默认的clustering
             auto clustering = factory.CreateAlgorithm("ClusterBuilder", json::object());

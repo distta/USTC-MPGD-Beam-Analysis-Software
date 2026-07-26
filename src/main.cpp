@@ -33,9 +33,9 @@ constexpr int kExecutionError = 6;
 
 void PrintUsage() {
    std::cout << "Usage:\n"
-             << "  ./BeamAnalysis <run_id> <base_dir>\n\n"
+             << "  ./BeamAnalysis <base_dir> <run_id>\n\n"
              << "Example:\n"
-             << "  ./BeamAnalysis 1591 /data/beam\n";
+             << "  ./BeamAnalysis /data/beam 1591\n";
 }
 
 json LoadConfig(const fs::path& path) {
@@ -372,8 +372,11 @@ int main(int argc, char* argv[]) {
    const auto runStarted = std::chrono::steady_clock::now();
 
    const fs::path baseDir = fs::absolute(argv[1]).lexically_normal();
-   const fs::path configFile = baseDir / "config.json";
    const fs::path rawDirectory = baseDir / "raw";
+   const fs::path rootConfigFile = baseDir / "config.json";
+   const fs::path rawConfigFile = rawDirectory / "config.json";
+   const fs::path configFile =
+       fs::is_regular_file(rootConfigFile) ? rootConfigFile : rawConfigFile;
    const fs::path processedDirectory = baseDir / "processed";
    const fs::path outputDirectory = baseDir / "result" / runID;
 
@@ -417,7 +420,10 @@ int main(int argc, char* argv[]) {
    std::string inputSummary;
    std::unique_ptr<IRawDataConverter> converter;
    bool shouldConvert = false;
-   if (config.contains("conversion")) {
+   const bool conversionEnabled =
+       config.contains("conversion") &&
+       config["conversion"].value("enabled", true);
+   if (conversionEnabled) {
       const std::string converterType =
           config["conversion"].value("type", "APV25SRS");
       converter = ConverterFactory::Create(converterType);
@@ -426,6 +432,7 @@ int main(int argc, char* argv[]) {
                    << converterType << "'\n";
          return kInputError;
       }
+      converter->Configure(config["conversion"]);
       const bool overwrite = config["conversion"].value("overwrite", false);
       shouldConvert = overwrite || !fs::is_regular_file(processedInput);
       inputSummary = shouldConvert

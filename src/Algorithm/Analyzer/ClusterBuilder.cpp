@@ -9,6 +9,7 @@
 #include <map>
 #include <queue>
 #include <set>
+#include <unordered_map>
 #include <utility>
 
 REGISTER_ALGORITHM("ClusterBuilder", ClusterBuilder)
@@ -32,57 +33,66 @@ std::vector<Cluster> ClusterBuilder::BuildClusters(const std::vector<ChannelHit>
     std::vector<Cluster> clusters;
     if (channelHits.empty()) return clusters;
 
-    std::vector<int> currentGroupIndices;
-    int currentType = -1;
-    bool initialized = false;
+    std::map<int, std::vector<int>> indicesByType;
+    for (size_t index = 0; index < channelHits.size(); ++index) {
+        if (channelHits[index].isValid)
+            indicesByType[channelHits[index].type].push_back(
+                static_cast<int>(index));
+    }
 
-    for (size_t i = 0; i < channelHits.size(); ++i) {
+    for (const auto& [type, indices] : indicesByType) {
+        std::vector<int> parent(indices.size());
+        std::vector<int> rank(indices.size(), 0);
+        for (size_t index = 0; index < parent.size(); ++index)
+            parent[index] = static_cast<int>(index);
 
-        const auto& currentHit = channelHits[i];
+        const auto findRoot = [&](int value, const auto& self) -> int {
+            if (parent[value] != value)
+                parent[value] = self(parent[value], self);
+            return parent[value];
+        };
+        const auto merge = [&](int left, int right) {
+            left = findRoot(left, findRoot);
+            right = findRoot(right, findRoot);
+            if (left == right) return;
+            if (rank[left] < rank[right]) std::swap(left, right);
+            parent[right] = left;
+            if (rank[left] == rank[right]) ++rank[left];
+        };
 
-        if (!currentHit.isValid) continue;
-
-        if (!initialized) {
-            currentType = currentHit.type;
-            initialized = true;
-        }
-
-        bool shouldEndCluster = false;
-
-        if (!currentGroupIndices.empty()) {
-
-            const auto& prevHit = channelHits[currentGroupIndices.back()];
-
-            if (currentHit.type != currentType) {
-                shouldEndCluster = true;
-            } else if (currentHit.id0 > prevHit.id0 + 1 + m_config.maxGap) {
-                shouldEndCluster = true;
+        for (size_t left = 0; left < indices.size(); ++left) {
+            const auto& leftHit = channelHits[indices[left]];
+            for (size_t right = left + 1; right < indices.size(); ++right) {
+                const auto& rightHit = channelHits[indices[right]];
+                if (rightHit.id0 - leftHit.id0 > 1 + m_config.maxGap)
+                    break;
+                if (std::abs(rightHit.time - leftHit.time) <=
+                    m_config.timeWindowNs) {
+                    merge(static_cast<int>(left), static_cast<int>(right));
+                }
             }
         }
 
-        if (shouldEndCluster) {
+        std::map<int, std::vector<int>> components;
+        for (size_t index = 0; index < indices.size(); ++index) {
+            components[findRoot(static_cast<int>(index), findRoot)]
+                .push_back(indices[index]);
+        }
+        for (auto& [root, members] : components) {
+            (void)root;
             Cluster cluster{};
-            cluster.type = currentType;
-            cluster.channelHitIndices = currentGroupIndices;
-            if (processCluster(cluster, channelHits)) {
+            cluster.type = type;
+            cluster.channelHitIndices = std::move(members);
+            if (processCluster(cluster, channelHits))
                 clusters.push_back(std::move(cluster));
-            }
-
-            currentGroupIndices.clear();
-            currentType = currentHit.type;
-        }
-
-        currentGroupIndices.push_back(i);
-    }
-
-    if (!currentGroupIndices.empty()) {
-        Cluster cluster{};
-        cluster.type = currentType;
-        cluster.channelHitIndices = currentGroupIndices;
-        if (processCluster(cluster, channelHits)) {
-            clusters.push_back(std::move(cluster));
         }
     }
+
+    std::sort(clusters.begin(), clusters.end(),
+              [](const Cluster& left, const Cluster& right) {
+                  return left.channelHitIndices.front() <
+                         right.channelHitIndices.front();
+              });
 
     return clusters;
 }
@@ -179,9 +189,14 @@ bool ClusterBuilder::processCluster(
     if (cluster.channelHitIndices.empty()) return false;
 
     // 计算size和range
-    cluster.size = logicalSize >= 0
-                       ? logicalSize
-                       : static_cast<int>(cluster.channelHitIndices.size());
+    if (logicalSize >= 0) {
+        cluster.size = logicalSize;
+    } else {
+        std::set<int> uniqueIDs;
+        for (int index : cluster.channelHitIndices)
+            uniqueIDs.insert(channelHits[index].id0);
+        cluster.size = static_cast<int>(uniqueIDs.size());
+    }
 
     int minID = std::numeric_limits<int>::max();
     int maxID = std::numeric_limits<int>::min();

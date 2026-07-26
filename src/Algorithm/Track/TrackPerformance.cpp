@@ -9,6 +9,7 @@
 #include <TH1D.h>
 #include <TH2D.h>
 #include <TLegend.h>
+#include <TList.h>
 #include <TPaveText.h>
 
 #include <algorithm>
@@ -129,7 +130,7 @@ PerformanceAnalyzer::PerformanceAnalyzer(TDirectory* output,
             TDirectory::TContext context(hitsDir);
             h.clusterMultiplicity = new TH1D(
                 "hClusterMultiplicity",
-                "Cluster multiplicity per selected event;Clusters/event;Events",
+                "Cluster multiplicity per selected track;Clusters/event;Tracks",
                 101, -0.5, 100.5);
             const auto binning = MakeHitMapBinning(*detector);
             h.hitMap = new TH2D(
@@ -146,25 +147,57 @@ PerformanceAnalyzer::PerformanceAnalyzer(TDirectory* output,
 }
 
 void PerformanceAnalyzer::RecordEvent(const Event& event) {
-    std::vector<TVector3> globalHits;
-    globalHits.reserve(m_detectors.size());
+    std::map<int, int> hitIndices;
     for (const auto& detector : m_detectors) {
         const auto& frame = event.detectorFramesMap.at(detector->GetID());
         if (frame->LocalHits().size() != 1) return;
-        globalHits.push_back(detector->LocalToGlobal(frame->LocalHits().front().localPos));
+        hitIndices.emplace(detector->GetID(), 0);
+    }
+    RecordSelection(event, hitIndices);
+}
+
+void PerformanceAnalyzer::RecordTrack(const Event& event,
+                                      const Result& result) {
+    RecordSelection(event, result.hitIndices);
+}
+
+void PerformanceAnalyzer::RecordSelection(
+    const Event& event,
+    const std::map<int, int>& hitIndices) {
+    std::map<int, TVector3> globalHits;
+    for (const auto& detector : m_detectors) {
+        const int id = detector->GetID();
+        const auto selected = hitIndices.find(id);
+        const auto frame = event.detectorFramesMap.find(id);
+        if (selected == hitIndices.end() ||
+            frame == event.detectorFramesMap.end() ||
+            selected->second < 0 ||
+            static_cast<size_t>(selected->second) >=
+                frame->second->LocalHits().size()) {
+            continue;
+        }
+        globalHits.emplace(
+            id, detector->LocalToGlobal(
+                    frame->second->LocalHits()[selected->second].localPos));
     }
 
-    for (size_t detectorIndex = 0; detectorIndex < m_detectors.size(); ++detectorIndex) {
-        const auto& detector = m_detectors[detectorIndex];
+    for (const auto& detector : m_detectors) {
+        const int id = detector->GetID();
+        const auto selected = hitIndices.find(id);
+        const auto selectedGlobal = globalHits.find(id);
+        if (selected == hitIndices.end() ||
+            selectedGlobal == globalHits.end()) {
+            continue;
+        }
         const auto& frame = event.detectorFramesMap.at(detector->GetID());
-        const auto& hit = frame->LocalHits().front();
-        auto& h = m_detectorHistograms[detector->GetID()];
+        const auto& hit = frame->LocalHits()[selected->second];
+        auto& h = m_detectorHistograms[id];
         h.clusterMultiplicity->Fill(frame->Clusters().size());
         h.hitMap->Fill(hit.localPos.X(), hit.localPos.Y());
         std::vector<TVector3> otherHits;
-        otherHits.reserve(m_detectors.size() - 1);
-        for (size_t otherIndex = 0; otherIndex < globalHits.size(); ++otherIndex) {
-            if (otherIndex != detectorIndex) otherHits.push_back(globalHits[otherIndex]);
+        otherHits.reserve(globalHits.size() - 1);
+        for (const auto& [otherID, otherHit] : globalHits) {
+            if (otherID != id) otherHits.push_back(otherHit);
         }
         if (otherHits.size() < 2) continue;
 
@@ -183,7 +216,7 @@ void PerformanceAnalyzer::RecordEvent(const Event& event) {
         const double szz = sumZZ - sumZ * sumZ / n;
         double predictionVarianceScale = 0.0;
         if (szz > 1e-12) {
-            const double dz = globalHits[detectorIndex].Z() - meanZ;
+            const double dz = selectedGlobal->second.Z() - meanZ;
             predictionVarianceScale = 1.0 / n + dz * dz / szz;
         }
         const double scale = std::sqrt(1.0 + predictionVarianceScale);
@@ -191,6 +224,24 @@ void PerformanceAnalyzer::RecordEvent(const Event& event) {
         h.residualY->Fill(ry);
         m_commonEquivalentHitX->Fill(rx / scale);
         m_commonEquivalentHitY->Fill(ry / scale);
+    }
+}
+
+void PerformanceAnalyzer::Reset() {
+    const auto reset = [](TH1* histogram) {
+        if (!histogram) return;
+        histogram->Reset("ICESM");
+        if (auto* functions = histogram->GetListOfFunctions())
+            functions->Delete();
+    };
+    reset(m_commonEquivalentHitX);
+    reset(m_commonEquivalentHitY);
+    for (auto& [id, histograms] : m_detectorHistograms) {
+        (void)id;
+        reset(histograms.clusterMultiplicity);
+        reset(histograms.hitMap);
+        reset(histograms.residualX);
+        reset(histograms.residualY);
     }
 }
 
@@ -276,7 +327,9 @@ void PerformanceAnalyzer::Write() {
 
     auto* directory = m_output->GetDirectory("Resolution");
     TDirectory::TContext context(directory);
-    TCanvas commonFitCanvas("cCommonHitGaussianFit", "Common single-hit Gaussian fit", 1400, 600);
+    TCanvas commonFitCanvas(
+        "cCommonHitGaussianFit",
+        "Common selected-track equivalent-hit Gaussian fit", 1400, 600);
     commonFitCanvas.Divide(2, 1);
     commonFitCanvas.cd(1);
     DrawGaussianFit(m_commonEquivalentHitX, commonFitX);

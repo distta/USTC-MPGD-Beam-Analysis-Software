@@ -1,6 +1,7 @@
 #include "Script/TimeResolutionScript.h"
 
-#include "Algorithm/Analyzer/WaveformProcessor.h"
+#include "Algorithm/Oscilloscope/OscilloscopeDataProcessor.h"
+#include "Algorithm/Analyzer/HitProcessor.h"
 #include "Detector/DetectorFactory.h"
 #include "Event/DataModel.h"
 #include "Script/Base/RawDataParser.h"
@@ -151,7 +152,7 @@ array<double, kEstimatorCount> ExtractTimes(const vector<int>& clusterIndices,
                                             const vector<Cluster>& clusters,
                                             const vector<ChannelHit>& channelHits,
                                             const vector<RawData>& detectorRawData,
-                                            WaveformProcessor& timingFitter) {
+                                            HitProcessor& timingFitter) {
     array<double, kEstimatorCount> result;
     result.fill(numeric_limits<double>::quiet_NaN());
     array<vector<TimeMeasurement>, 2> planeStripTimes;
@@ -170,7 +171,8 @@ array<double, kEstimatorCount> ExtractTimes(const vector<int>& clusterIndices,
 
             auto cached = fittedStripTimes.find(rawIndex);
             if (cached == fittedStripTimes.end()) {
-                const ChannelHit fitted = timingFitter.ProcessWaveform(detectorRawData[rawIndex]);
+                const ChannelHit fitted =
+                    timingFitter.ProcessHit(detectorRawData[rawIndex]);
                 TimeMeasurement measurement;
                 if (fitted.isValid && isfinite(fitted.time)) {
                     measurement.time = fitted.time;
@@ -242,7 +244,7 @@ bool LoadReconstructionTimes(TTree& validation, RawDataParser& parser,
     validation.SetBranchAddress("channelHits", &channelHits);
     validation.SetBranchAddress("clusters", &clusters);
 
-    WaveformProcessor timingFitter;
+    HitProcessor timingFitter;
     timingFitter.LoadConfig(timingWaveformConfig);
     int loadedEventID = numeric_limits<int>::min();
     unordered_map<int, vector<RawData>> rawHits;
@@ -340,7 +342,7 @@ DUTTimingResult LoadDUTTiming(
     dutTree.SetBranchAddress("selectedCluster", &selectedCluster);
     dutTree.SetBranchAddress("selectedChannelHits", &selectedChannelHits);
 
-    WaveformProcessor timingFitter;
+    HitProcessor timingFitter;
     timingFitter.LoadConfig(timingWaveformConfig);
     int loadedEventID = numeric_limits<int>::min();
     unordered_map<int, vector<RawData>> rawHits;
@@ -376,7 +378,7 @@ DUTTimingResult LoadDUTTiming(
                 continue;
             }
             const ChannelHit fitted =
-                timingFitter.ProcessWaveform(rawDetector->second[rawIndex]);
+                timingFitter.ProcessHit(rawDetector->second[rawIndex]);
             if (fitted.isValid && isfinite(fitted.time)) {
                 dutMeasurements.push_back(
                     {fitted.time, fitted.timeError});

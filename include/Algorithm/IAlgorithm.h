@@ -67,7 +67,7 @@ class IAlgorithm {
      * @return 处理是否成功
      * 
      * 各算法子类根据自身职责实现该方法:
-     * - WaveformProcessor: 读取Raw数据，生成StripHit
+     * - HitProcessor: 读取Raw数据，生成ChannelHit
      * - ClusterBuilder: 读取StripHit，生成Cluster
      * - ClusterReconstructor: 读取StripHit和Cluster，重建Cluster位置
      */

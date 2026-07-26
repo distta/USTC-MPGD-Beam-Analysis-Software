@@ -27,6 +27,8 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <numeric>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -35,6 +37,28 @@ using namespace std;
 void RunDUTAlign(const std::vector<Event>& events, std::shared_ptr<Detector> detector, int detID);
 LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<Cluster>& clusters, const TVector3& predL, double& residualX, double& residualY);
 double DUTChi2Objective(const double* par, const std::vector<Event>& events, std::shared_ptr<Detector> detector, int detID);
+
+std::pair<int, int> PlanarAxisTypes(const planarConfig& config) {
+   int typeX = -1;
+   int typeY = -1;
+   double bestX = std::numeric_limits<double>::infinity();
+   double bestY = std::numeric_limits<double>::infinity();
+   for (int type : config.readoutPlaneType) {
+      const double angle =
+          config.readoutPlaneAngle.at(type) * TMath::DegToRad();
+      const double xScore = std::abs(std::sin(angle));
+      const double yScore = std::abs(std::cos(angle));
+      if (xScore < bestX) {
+         bestX = xScore;
+         typeX = type;
+      }
+      if (yScore < bestY) {
+         bestY = yScore;
+         typeY = type;
+      }
+   }
+   return {typeX, typeY};
+}
 struct ResidualAnalysisResult {
    double sigma68 = 0;
    double sigmaFit = 0;
@@ -57,12 +81,171 @@ struct DUTAlignmentQAPoint {
    bool validY = false;
 };
 
+struct DUTTimingResolutionResult {
+   long long entries = 0;
+   double mean = std::numeric_limits<double>::quiet_NaN();
+   double sigma = std::numeric_limits<double>::quiet_NaN();
+   double sigmaError = std::numeric_limits<double>::quiet_NaN();
+   double sigma68 = std::numeric_limits<double>::quiet_NaN();
+};
+
 ResidualAnalysisResult AnalyzeResidualSequence(const std::vector<double>& residuals, TFile* outputFile, const std::string& histName);
 void WriteDUTAlignmentQA(TFile* outputFile, int detID,
                          const std::vector<DUTAlignmentQAPoint>& points,
                          double predXMin, double predXMax,
                          double predYMin, double predYMax);
+DUTTimingResolutionResult WriteDUTXYMeanTimeResolution(
+    TFile* outputFile, int detID, std::vector<double> times);
 
+double CombinedXYMeanTime(const std::vector<ChannelHit>& channelHitsX,
+                          const std::vector<ChannelHit>& channelHitsY) {
+   double sum = 0.0;
+   size_t count = 0;
+   bool hasX = false;
+   bool hasY = false;
+   for (const auto& hit : channelHitsX) {
+      if (!hit.isValid || !std::isfinite(hit.time)) continue;
+      sum += hit.time;
+      ++count;
+      hasX = true;
+   }
+   for (const auto& hit : channelHitsY) {
+      if (!hit.isValid || !std::isfinite(hit.time)) continue;
+      sum += hit.time;
+      ++count;
+      hasY = true;
+   }
+   return hasX && hasY && count > 0
+              ? sum / static_cast<double>(count)
+              : std::numeric_limits<double>::quiet_NaN();
+}
+
+DUTTimingResolutionResult WriteDUTXYMeanTimeResolution(
+    TFile* outputFile, int detID, std::vector<double> times) {
+   DUTTimingResolutionResult result;
+   times.erase(
+       std::remove_if(times.begin(), times.end(),
+                      [](double value) { return !std::isfinite(value); }),
+       times.end());
+   result.entries = static_cast<long long>(times.size());
+   if (!outputFile || times.size() < 20) return result;
+
+   std::sort(times.begin(), times.end());
+   const auto quantile = [&](double fraction) {
+      const double position = fraction * (times.size() - 1);
+      const size_t lower = static_cast<size_t>(std::floor(position));
+      const size_t upper = static_cast<size_t>(std::ceil(position));
+      const double weight = position - lower;
+      return times[lower] * (1.0 - weight) + times[upper] * weight;
+   };
+   const double median = quantile(0.50);
+   result.sigma68 = 0.5 * (quantile(0.84) - quantile(0.16));
+
+   double rawMean =
+       std::accumulate(times.begin(), times.end(), 0.0) / times.size();
+   double rawVariance = 0.0;
+   for (double value : times)
+      rawVariance += (value - rawMean) * (value - rawMean);
+   const double rawSigma =
+       std::sqrt(rawVariance / static_cast<double>(times.size() - 1));
+   double initialSigma =
+       result.sigma68 > 0.0 ? result.sigma68 : rawSigma;
+   if (!std::isfinite(initialSigma) || initialSigma <= 0.0) return result;
+
+   double plotLow = quantile(0.005);
+   double plotHigh = quantile(0.995);
+   const double padding = std::max(
+       1.0, 0.08 * std::max(1.0, plotHigh - plotLow));
+   plotLow -= padding;
+   plotHigh += padding;
+   if (!(plotHigh > plotLow)) {
+      plotLow = median - 5.0 * initialSigma;
+      plotHigh = median + 5.0 * initialSigma;
+   }
+
+   auto* dutDirectory =
+       outputFile->GetDirectory(("DUT_" + std::to_string(detID)).c_str());
+   if (!dutDirectory)
+      dutDirectory =
+          outputFile->mkdir(("DUT_" + std::to_string(detID)).c_str());
+   auto* timingDirectory = dutDirectory->GetDirectory("TimeResolution");
+   if (!timingDirectory)
+      timingDirectory = dutDirectory->mkdir("TimeResolution");
+   TDirectory::TContext context(timingDirectory);
+
+   TH1D histogram(
+       "hXYMeanTime",
+       Form("DUT %d XYMean time relative to trigger;"
+            "XYMean time - trigger [ns];Events",
+            detID),
+       200, plotLow, plotHigh);
+   for (double value : times) histogram.Fill(value);
+
+   const double fitLow =
+       std::max(plotLow, median - 2.5 * initialSigma);
+   const double fitHigh =
+       std::min(plotHigh, median + 2.5 * initialSigma);
+   TF1 gaussian(
+       Form("fXYMeanTimeGaussian_DUT%d", detID), "gaus",
+       fitLow, fitHigh);
+   gaussian.SetParameters(histogram.GetMaximum(), median, initialSigma);
+   gaussian.SetLineColor(kRed + 1);
+   gaussian.SetLineWidth(2);
+   const int fitStatus = histogram.Fit(&gaussian, "QRS0");
+   if (fitStatus == 0 &&
+       std::isfinite(gaussian.GetParameter(1)) &&
+       std::isfinite(gaussian.GetParameter(2))) {
+      result.mean = gaussian.GetParameter(1);
+      result.sigma = std::abs(gaussian.GetParameter(2));
+      result.sigmaError = gaussian.GetParError(2);
+   } else {
+      result.mean = rawMean;
+      result.sigma = rawSigma;
+   }
+
+   TCanvas canvas(
+       "cXYMeanTimeResolution",
+       Form("DUT %d XYMean time resolution", detID), 900, 700);
+   histogram.SetStats(false);
+   histogram.Draw("E");
+   gaussian.Draw("SAME");
+   TLegend legend(0.57, 0.67, 0.88, 0.88);
+   legend.SetBorderSize(1);
+   legend.SetFillColor(kWhite);
+   legend.AddEntry(&gaussian, "Single Gaussian fit", "l");
+   legend.AddEntry(
+       static_cast<TObject*>(nullptr),
+       Form("Entries = %lld", result.entries), "");
+   legend.AddEntry(
+       static_cast<TObject*>(nullptr),
+       Form("#mu = %.3f ns", result.mean), "");
+   legend.AddEntry(
+       static_cast<TObject*>(nullptr),
+       Form("#sigma = %.3f #pm %.3f ns",
+            result.sigma, result.sigmaError), "");
+   legend.AddEntry(
+       static_cast<TObject*>(nullptr),
+       Form("#sigma_{68} = %.3f ns", result.sigma68), "");
+   legend.Draw();
+
+   histogram.Write();
+   canvas.Write();
+
+   Long64_t entries = result.entries;
+   Double_t mean = result.mean;
+   Double_t sigma = result.sigma;
+   Double_t sigmaError = result.sigmaError;
+   Double_t sigma68 = result.sigma68;
+   TTree summary("TimingSummary", "DUT XYMean timing resolution");
+   summary.Branch("entries", &entries);
+   summary.Branch("mean_ns", &mean);
+   summary.Branch("sigma_ns", &sigma);
+   summary.Branch("sigma_error_ns", &sigmaError);
+   summary.Branch("sigma68_ns", &sigma68);
+   summary.Fill();
+   summary.Write();
+   return result;
+}
 
 void WriteDUTAlignmentQA(TFile* outputFile, int detID,
                          const std::vector<DUTAlignmentQAPoint>& points,
@@ -424,6 +607,7 @@ bool DUTAnalysisScript::Execute() {
    Int_t hitFlag;
    Cluster clusterX, clusterY;
    vector<ChannelHit> channelHitsX, channelHitsY;
+   std::map<int, std::vector<double>> xyMeanTimesByDUT;
 
    tDut->Branch("eventID", &eventID);
    tDut->Branch("dutID", &dutID);
@@ -444,6 +628,12 @@ bool DUTAnalysisScript::Execute() {
 
    for (auto& det : duts) {
       int id = det->GetID();
+      const auto* planar = det->GetPlanarConfig();
+      const auto [typeX, typeY] =
+          planar ? PlanarAxisTypes(*planar)
+                 : std::pair<int, int>{
+                       DUTAnalysisConfig::kTypeX,
+                       DUTAnalysisConfig::kTypeY};
       for (auto& evt : events) {
          eventID = evt.eventID;
          dutID = id;
@@ -455,8 +645,8 @@ bool DUTAnalysisScript::Execute() {
          clusterIndices.clear();
          channelHits.clear();
          clusters.clear();
-         clusterX = CreateInvalidCluster(DUTAnalysisConfig::kTypeX);
-         clusterY = CreateInvalidCluster(DUTAnalysisConfig::kTypeY);
+         clusterX = CreateInvalidCluster(typeX);
+         clusterY = CreateInvalidCluster(typeY);
          channelHitsX.clear();
          channelHitsY.clear();
 
@@ -485,8 +675,8 @@ bool DUTAnalysisScript::Execute() {
                int idxX = clusterIdx[0];
                int idxY = clusterIdx[1];
 
-               clusterX = (idxX >= 0) ? clusters[idxX] : CreateInvalidCluster(DUTAnalysisConfig::kTypeX);
-               clusterY = (idxY >= 0) ? clusters[idxY] : CreateInvalidCluster(DUTAnalysisConfig::kTypeY);
+               clusterX = (idxX >= 0) ? clusters[idxX] : CreateInvalidCluster(typeX);
+               clusterY = (idxY >= 0) ? clusters[idxY] : CreateInvalidCluster(typeY);
 
                // 填充channelHitsX/Y
                channelHitsX.clear();
@@ -517,10 +707,14 @@ bool DUTAnalysisScript::Execute() {
                   hitFlag = 0;
 
                clusterIndices = clusterIdx;
+               const double xyMeanTime =
+                   CombinedXYMeanTime(channelHitsX, channelHitsY);
+               if (std::isfinite(xyMeanTime))
+                  xyMeanTimesByDUT[id].push_back(xyMeanTime);
 
             } else {
-               clusterX = CreateInvalidCluster(DUTAnalysisConfig::kTypeX);
-               clusterY = CreateInvalidCluster(DUTAnalysisConfig::kTypeY);
+               clusterX = CreateInvalidCluster(typeX);
+               clusterY = CreateInvalidCluster(typeY);
                hitX = DUTAnalysisConfig::kInvalidValue;
                hitY = DUTAnalysisConfig::kInvalidValue;
                resX = DUTAnalysisConfig::kInvalidValue;
@@ -578,6 +772,8 @@ bool DUTAnalysisScript::Execute() {
       const auto efficiency = DUTEfficiency::Analyze(
           events, strictSingleHitTrackerEvents, det,
           m_efficiencyConfig, fDut);
+      const auto timing = WriteDUTXYMeanTimeResolution(
+          fDut, id, xyMeanTimesByDUT[id]);
 
       printf("%-5d %8lld %10.1f %10.1f %11.3f %10.4f %11.3f %11.3f %12.3f\n",
              id, efficiency.eligibleEvents,
@@ -587,6 +783,11 @@ bool DUTAnalysisScript::Execute() {
              100.0 * efficiency.nonuniformityX,
              100.0 * efficiency.nonuniformityY,
              100.0 * efficiency.nonuniformity2D);
+      cout << "[DUTAnalysis] DUT " << id
+           << " XYMean timing: entries=" << timing.entries
+           << ", mean=" << timing.mean << " ns, sigma="
+           << timing.sigma << " +/- " << timing.sigmaError
+           << " ns, sigma68=" << timing.sigma68 << " ns\n";
    }
 
    fDut->Close();
@@ -672,8 +873,9 @@ LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<
 
    // 从探测器配置读取参数，消除魔法数字
    const auto* config = detector->GetPlanarConfig();
-   const int typeX = DUTAnalysisConfig::kTypeX;
-   const int typeY = DUTAnalysisConfig::kTypeY;
+   const auto [typeX, typeY] =
+       config ? PlanarAxisTypes(*config)
+              : std::pair<int, int>{-1, -1};
 
    LocalHit localHit;
    if (!config) {

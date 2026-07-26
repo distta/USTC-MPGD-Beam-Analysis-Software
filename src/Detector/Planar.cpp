@@ -1,5 +1,6 @@
 #include "Detector/Planar.h"
 #include "DataModel.h"
+#include "TMath.h"
 #include "iostream"
 #include <algorithm>
 #include <cmath>
@@ -81,6 +82,12 @@ std::vector<LocalHit> Planar::CalcLocalHitsFromClusters(const std::vector<Cluste
 
     // 获取所有type
     std::vector<int> types = m_config.readoutPlaneType;
+    const auto angle = [&](int type) {
+        return m_config.readoutPlaneAngle.at(type) * TMath::DegToRad();
+    };
+    const auto coordinate = [&](const Cluster& cluster) {
+        return cluster.pos * m_config.readoutPlanePitch.at(cluster.type);
+    };
 
     // 根据type数量决定匹配策略
     if (types.size() == 1) {
@@ -88,11 +95,10 @@ std::vector<LocalHit> Planar::CalcLocalHitsFromClusters(const std::vector<Cluste
         int type = types[0];
         for (size_t idx : clustersByType[type]) {
             LocalHit lh;
-            if (type == 0) {
-                lh.localPos.SetXYZ(clusters[idx].pos * m_config.readoutPlanePitch.at(type), 0, 0);
-            } else if (type == 1) {
-                lh.localPos.SetXYZ(0, clusters[idx].pos * m_config.readoutPlanePitch.at(type), 0);
-            }
+            const double phi = angle(type);
+            const double value = coordinate(clusters[idx]);
+            lh.localPos.SetXYZ(value * std::cos(phi),
+                               value * std::sin(phi), 0);
             lh.clusterIndices.push_back(idx);
             localHits.push_back(lh);
         }
@@ -108,15 +114,18 @@ std::vector<LocalHit> Planar::CalcLocalHitsFromClusters(const std::vector<Cluste
         for (size_t idx0 : indices0) {
             for (size_t idx1 : indices1) {
                 LocalHit lh;
-                double x = 0, y = 0;
-
-                if (type0 == 0) {
-                    x = clusters[idx0].pos * m_config.readoutPlanePitch.at(type0);
-                    y = clusters[idx1].pos * m_config.readoutPlanePitch.at(type1);
-                } else {
-                    x = clusters[idx1].pos * m_config.readoutPlanePitch.at(type1);
-                    y = clusters[idx0].pos * m_config.readoutPlanePitch.at(type0);
-                }
+                const double phi0 = angle(type0);
+                const double phi1 = angle(type1);
+                const double c0 = std::cos(phi0);
+                const double s0 = std::sin(phi0);
+                const double c1 = std::cos(phi1);
+                const double s1 = std::sin(phi1);
+                const double determinant = c0 * s1 - s0 * c1;
+                if (std::abs(determinant) < 1e-12) continue;
+                const double u0 = coordinate(clusters[idx0]);
+                const double u1 = coordinate(clusters[idx1]);
+                const double x = (u0 * s1 - s0 * u1) / determinant;
+                const double y = (c0 * u1 - u0 * c1) / determinant;
 
                 lh.localPos.SetXYZ(x, y, 0);
                 lh.clusterIndices.push_back(idx0);

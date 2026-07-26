@@ -3,8 +3,8 @@
 bool DetectorFrame::AnalyzeRaw() {
     if (m_raw.empty()) return false;
 
-    auto waveformProcessor = m_det.GetAlgorithm<WaveformProcessor>("WaveformProcessor");
-    return waveformProcessor->Process(*this);
+    auto hitProcessor = m_det.GetAlgorithm<HitProcessor>("HitProcessor");
+    return hitProcessor->Process(*this);
 }
 
 // Clustering ChannelHit

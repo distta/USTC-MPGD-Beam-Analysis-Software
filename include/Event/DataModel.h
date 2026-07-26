@@ -1,6 +1,8 @@
 #pragma once
 
 #include "TVector3.h"
+#include <cmath>
+#include <limits>
 #include <map>
 #include <memory>
 #include <vector>
@@ -12,8 +14,16 @@ struct RawData {
     int id1{-1};             // pad row；strip 读出为 -1
     int type;                // 读出面编号
     std::vector<short> adc;  // 波形采样点 (ADC counts)
+    int chip{-1};            // 前端芯片编号
+    int channel{-1};         // 芯片通道编号
+    unsigned int rawHitID{0};
+    double adcValue{std::numeric_limits<double>::quiet_NaN()};
+    double hitTimeNs{std::numeric_limits<double>::quiet_NaN()};
 
     bool HasID1() const { return id1 >= 0; }
+    bool HasDirectHit() const {
+        return std::isfinite(adcValue) && std::isfinite(hitTimeNs);
+    }
 };
 
 struct ChannelHit {

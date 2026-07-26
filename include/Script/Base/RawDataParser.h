@@ -57,10 +57,15 @@ class RawDataParser {
 
     ULong64_t m_eventID{0};
     ULong64_t m_timestamp{0};
+    double m_eventTimeNs{0.0};
     std::vector<int>* m_detectorIDs{nullptr};
     std::vector<int>* m_planeTypes{nullptr};
     std::vector<int>* m_id0s{nullptr};
     std::vector<int>* m_id1s{nullptr};
+    std::vector<int>* m_chipIDs{nullptr};
+    std::vector<int>* m_channelIDs{nullptr};
     std::vector<std::vector<short>>* m_waveforms{nullptr};
-
+    std::vector<unsigned short>* m_adcs{nullptr};
+    std::vector<unsigned int>* m_rawHitIDs{nullptr};
+    std::vector<double>* m_hitTimesNs{nullptr};
 };

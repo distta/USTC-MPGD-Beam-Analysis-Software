@@ -20,6 +20,8 @@ class PerformanceAnalyzer {
                         std::vector<std::shared_ptr<Detector>> referenceDetectors,
                         const Config& config, double residualRange = 2.0);
     void RecordEvent(const Event& event);
+    void RecordTrack(const Event& event, const Result& result);
+    void Reset();
     std::pair<double, double> EstimateHitResolution();
     void Write();
 
@@ -36,6 +38,9 @@ class PerformanceAnalyzer {
     Config m_config;
     std::map<int, DetectorHistograms> m_detectorHistograms;
     TH1D *m_commonEquivalentHitX{}, *m_commonEquivalentHitY{};
+
+    void RecordSelection(const Event& event,
+                         const std::map<int, int>& hitIndices);
 };
 
 }  // namespace Tracking

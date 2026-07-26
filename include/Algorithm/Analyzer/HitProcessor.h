@@ -1,5 +1,5 @@
-#ifndef WAVEFORM_PROCESSOR_H
-#define WAVEFORM_PROCESSOR_H
+#ifndef HIT_PROCESSOR_H
+#define HIT_PROCESSOR_H
 
 #include "AlgorithmFactory.h"
 #include "IAlgorithm.h"
@@ -18,13 +18,13 @@ class DetectorFrame;
  * - 提取关键物理量（峰值、电荷、时间等）
  * - 判断信号有效性
  */
-class WaveformProcessor : public IAlgorithm {
+class HitProcessor : public IAlgorithm {
    public:
-    WaveformProcessor() = default;
-    virtual ~WaveformProcessor() = default;
+    HitProcessor() = default;
+    virtual ~HitProcessor() = default;
 
     // 实现IAlgorithm接口
-    std::string GetName() const override { return "WaveformProcessor"; }
+    std::string GetName() const override { return "HitProcessor"; }
     std::string GetVersion() const override { return "1.0.0"; }
 
     void LoadConfig(const json& config) override {
@@ -39,15 +39,16 @@ class WaveformProcessor : public IAlgorithm {
     // 统一接口: 处理DetectorFrame中的所有RawData
     bool Process(DetectorFrame& frame) override;
 
-    ChannelHit ProcessWaveform(const RawData& rawData);
+    ChannelHit ProcessHit(const RawData& rawData);
 
    private:
-    WaveformConfig m_config;
+    HitProcessorConfig m_config;
 
     // 私有处理方法
+    ChannelHit processDirectHit(const RawData& rawData);
     ChannelHit processWaveformDefault(const RawData& rawData);
     ChannelHit processWaveformLeadingEdgeFit(const RawData& rawData);
     ChannelHit processWaveformMode1(const RawData& rawData);
 };
 
-#endif  // WAVEFORM_PROCESSOR_H
+#endif  // HIT_PROCESSOR_H

@@ -1,4 +1,4 @@
-#include "Algorithm/Analyzer/WaveformProcessor.h"
+#include "Algorithm/Analyzer/HitProcessor.h"
 #include "AlgorithmFactory.h"
 #include "DetectorFrame.h"
 #include "TVirtualFFT.h"
@@ -11,9 +11,9 @@
 #include <iostream>
 #include <limits>
 
-REGISTER_ALGORITHM("WaveformProcessor", WaveformProcessor)
+REGISTER_ALGORITHM("HitProcessor", HitProcessor)
 
-bool WaveformProcessor::Process(DetectorFrame& frame) {
+bool HitProcessor::Process(DetectorFrame& frame) {
    const auto& rawData = frame.Raw();
    if (rawData.empty()) return false;
 
@@ -23,7 +23,7 @@ bool WaveformProcessor::Process(DetectorFrame& frame) {
 
    // 处理每个RawData，生成ChannelHit
    for (size_t i = 0; i < rawData.size(); ++i) {
-      ChannelHit sh = ProcessWaveform(rawData[i]);
+      ChannelHit sh = ProcessHit(rawData[i]);
       sh.rawIndices = static_cast<int>(i);
       channelHits.push_back(sh);
    }
@@ -39,7 +39,10 @@ bool WaveformProcessor::Process(DetectorFrame& frame) {
    return true;
 }
 
-ChannelHit WaveformProcessor::ProcessWaveform(const RawData& rawData) {
+ChannelHit HitProcessor::ProcessHit(const RawData& rawData) {
+   if (rawData.HasDirectHit()) {
+      return processDirectHit(rawData);
+   }
    if (m_config.mode == "Fit") {
       return processWaveformLeadingEdgeFit(rawData);
    } else if (m_config.mode == "Mode1") {
@@ -48,12 +51,30 @@ ChannelHit WaveformProcessor::ProcessWaveform(const RawData& rawData) {
    return processWaveformDefault(rawData);
 }
 
-ChannelHit WaveformProcessor::processWaveformLeadingEdgeFit(const RawData& rawData) {
+ChannelHit HitProcessor::processDirectHit(const RawData& rawData) {
+   ChannelHit channelData{};
+   channelData.id0 = rawData.id0;
+   channelData.id1 = rawData.id1;
+   channelData.type = rawData.type;
+   channelData.amp = rawData.adcValue;
+   channelData.charge = rawData.adcValue;
+   channelData.peakTime = 0;
+   channelData.time = rawData.hitTimeNs;
+   channelData.riseTime = 0.0;
+   channelData.width = 0.0;
+   channelData.timeError = 0.0;
+   channelData.isSaturated =
+       rawData.adcValue >= m_config.saturationLevel;
+   channelData.isValid = rawData.adcValue >= m_config.threshold;
+   return channelData;
+}
+
+ChannelHit HitProcessor::processWaveformLeadingEdgeFit(const RawData& rawData) {
 
    const auto& waveform = rawData.adc;
    const size_t nSamples = waveform.size();
 
-   ChannelHit channelData;
+   ChannelHit channelData{};
    channelData.isValid = true;
    channelData.id0 = rawData.id0;
    channelData.id1 = rawData.id1;
@@ -67,7 +88,7 @@ ChannelHit WaveformProcessor::processWaveformLeadingEdgeFit(const RawData& rawDa
    // 1. 找峰值 + 计算电荷 + 找阈值上下限
    int peakAmp = 0, peakTime = 0, inducedCharge = 0;
    int firstOverTh = -1, lastOverTh = -1;
-   const int noiseTh = m_config.noiseThreshold;
+   const int noiseTh = m_config.threshold;
 
    for (size_t i = 0; i < nSamples; ++i) {
       const int amp = waveform[i];
@@ -147,11 +168,11 @@ ChannelHit WaveformProcessor::processWaveformLeadingEdgeFit(const RawData& rawDa
    return channelData;
 }
 
-ChannelHit WaveformProcessor::processWaveformDefault(const RawData& rawData) {
+ChannelHit HitProcessor::processWaveformDefault(const RawData& rawData) {
    const auto& waveform = rawData.adc;
    const size_t nSamples = waveform.size();
 
-   ChannelHit channelData;
+   ChannelHit channelData{};
    channelData.isValid = true;
    channelData.id0 = rawData.id0;
    channelData.id1 = rawData.id1;
@@ -162,7 +183,7 @@ ChannelHit WaveformProcessor::processWaveformDefault(const RawData& rawData) {
       return channelData;
    }
 
-   const int noiseTh = m_config.noiseThreshold;
+   const int noiseTh = m_config.threshold;
 
    // 找峰值
    int peakAmp = 0, peakTime = 0, inducedCharge = 0;
@@ -193,7 +214,7 @@ ChannelHit WaveformProcessor::processWaveformDefault(const RawData& rawData) {
       channelData.isValid = false;
    }
 
-   if (peakAmp < m_config.noiseThreshold) {
+   if (peakAmp < m_config.threshold) {
       channelData.isValid = false;
    }
 
@@ -243,12 +264,12 @@ ChannelHit WaveformProcessor::processWaveformDefault(const RawData& rawData) {
    return channelData;
 }
 
-ChannelHit WaveformProcessor::processWaveformMode1(const RawData& rawData) {
+ChannelHit HitProcessor::processWaveformMode1(const RawData& rawData) {
 
    const auto& waveform = rawData.adc;
    const size_t nSamples = waveform.size();
 
-   ChannelHit channelData;
+   ChannelHit channelData{};
    channelData.isValid = true;
    channelData.id0 = rawData.id0;
    channelData.id1 = rawData.id1;
@@ -262,7 +283,7 @@ ChannelHit WaveformProcessor::processWaveformMode1(const RawData& rawData) {
    // 1. 找峰值 + 计算电荷 + 找阈值上下限
    int peakAmp = 0, peakTime = 0, inducedCharge = 0;
    int firstOverTh = -1, lastOverTh = -1;
-   const int noiseTh = m_config.noiseThreshold;
+   const int noiseTh = m_config.threshold;
 
    for (size_t i = 0; i < nSamples; ++i) {
       const int amp = waveform[i];

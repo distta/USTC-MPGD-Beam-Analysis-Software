@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -20,11 +21,11 @@ class AlgorithmConfig {
 };
 
 // ========== 波形处理配置 ==========
-class WaveformConfig : public AlgorithmConfig {
+class HitProcessorConfig : public AlgorithmConfig {
    public:
     std::string mode = "Default";
-    double cfdFraction = 0.5;
-    double noiseThreshold = 100.0;
+    double cfdFraction = 0.3;
+    double threshold = 100.0;
     double saturationLevel = 2000.0;
     double timePitch = 25.0;
     double timeWindowStart = -50;
@@ -35,7 +36,8 @@ class WaveformConfig : public AlgorithmConfig {
         const json* cfg = &config;
         if (cfg->contains("mode")) mode = (*cfg)["mode"];
         if (cfg->contains("cfdFraction")) cfdFraction = (*cfg)["cfdFraction"];
-        if (cfg->contains("noiseThreshold")) noiseThreshold = (*cfg)["noiseThreshold"];
+        if (cfg->contains("threshold")) threshold = (*cfg)["threshold"];
+        else if (cfg->contains("noiseThreshold")) threshold = (*cfg)["noiseThreshold"];
         if (cfg->contains("saturationLevel")) saturationLevel = (*cfg)["saturationLevel"];
         if (cfg->contains("timePitch")) timePitch = (*cfg)["timePitch"];
         if (cfg->contains("timeWindowStart")) timeWindowStart = (*cfg)["timeWindowStart"];
@@ -43,10 +45,10 @@ class WaveformConfig : public AlgorithmConfig {
     }
 
     void print() const override {
-        std::cout << "WaveformConfig:" << std::endl;
+        std::cout << "HitProcessorConfig:" << std::endl;
         std::cout << "  Mode:" << mode << std::endl;
         std::cout << "  CFD Fraction:" << cfdFraction << std::endl;
-        std::cout << "  Noise Threshold: " << noiseThreshold << std::endl;
+        std::cout << "  Threshold: " << threshold << std::endl;
         std::cout << "  Saturation Level: " << saturationLevel << std::endl;
         std::cout << "  Time Pitch: " << timePitch << std::endl;
     }
@@ -59,6 +61,7 @@ class ClusterConfig : public AlgorithmConfig {
     int minClusterSize = 1;      // 最小聚类大小
     int maxClusterSize = 10;     // 最大聚类大小
     double MaxChargeDiff = 0.4;  // 对于不同Cluster匹配最大电荷差
+    double timeWindowNs = std::numeric_limits<double>::infinity();
     int connectivity = 4;        // pad 聚类邻接方式：4 或 8
 
     void loadFrom(const json& config) override {
@@ -67,9 +70,13 @@ class ClusterConfig : public AlgorithmConfig {
         if (cfg->contains("minClusterSize")) minClusterSize = (*cfg)["minClusterSize"];
         if (cfg->contains("maxClusterSize")) maxClusterSize = (*cfg)["maxClusterSize"];
         if (cfg->contains("MaxChargeDiff")) MaxChargeDiff = (*cfg)["MaxChargeDiff"];
+        if (cfg->contains("timeWindowNs")) timeWindowNs = (*cfg)["timeWindowNs"];
         if (cfg->contains("connectivity")) connectivity = (*cfg)["connectivity"];
         if (connectivity != 4 && connectivity != 8) {
             throw std::runtime_error("ClusterConfig.connectivity must be 4 or 8");
+        }
+        if (timeWindowNs < 0.0 || std::isnan(timeWindowNs)) {
+            throw std::runtime_error("ClusterConfig.timeWindowNs must be non-negative");
         }
     }
 
@@ -79,6 +86,7 @@ class ClusterConfig : public AlgorithmConfig {
         std::cout << "  Min Cluster Size: " << minClusterSize << std::endl;
         std::cout << "  Max Cluster Size: " << maxClusterSize << std::endl;
         std::cout << "  Max Charge Diff: " << MaxChargeDiff << std::endl;
+        std::cout << "  Time Window: " << timeWindowNs << " ns" << std::endl;
         std::cout << "  Pad Connectivity: " << connectivity << std::endl;
     }
 };
