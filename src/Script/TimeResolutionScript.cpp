@@ -1,6 +1,5 @@
 #include "Script/TimeResolutionScript.h"
 
-#include "Algorithm/Oscilloscope/OscilloscopeDataProcessor.h"
 #include "Algorithm/Analyzer/WaveformProcessor.h"
 #include "Detector/DetectorFactory.h"
 #include "Event/DataModel.h"
@@ -14,6 +13,8 @@
 #include <TH2D.h>
 #include <TProfile.h>
 #include <TTree.h>
+
+#include <Eigen/Dense>
 
 #include <algorithm>
 #include <array>
@@ -110,6 +111,38 @@ struct TrackTimeWeights {
     bool valid = false;
 };
 
+struct TimeMeasurement {
+    double time = numeric_limits<double>::quiet_NaN();
+    double error = numeric_limits<double>::quiet_NaN();
+};
+
+double ErrorWeightedMean(const vector<TimeMeasurement>& measurements) {
+    double weightedTime = 0.0;
+    double weightSum = 0.0;
+    for (const TimeMeasurement& measurement : measurements) {
+        if (!isfinite(measurement.time) || !isfinite(measurement.error) ||
+            measurement.error <= 0.0)
+            continue;
+        const double weight =
+            1.0 / (measurement.error * measurement.error);
+        if (!isfinite(weight)) continue;
+        weightedTime += weight * measurement.time;
+        weightSum += weight;
+    }
+    if (weightSum > 0.0) return weightedTime / weightSum;
+
+    double timeSum = 0.0;
+    size_t validTimes = 0;
+    for (const TimeMeasurement& measurement : measurements) {
+        if (!isfinite(measurement.time)) continue;
+        timeSum += measurement.time;
+        ++validTimes;
+    }
+    return validTimes > 0
+               ? timeSum / static_cast<double>(validTimes)
+               : numeric_limits<double>::quiet_NaN();
+}
+
 // ==========================
 // Reconstruction-based timing
 // ==========================
@@ -121,15 +154,15 @@ array<double, kEstimatorCount> ExtractTimes(const vector<int>& clusterIndices,
                                             WaveformProcessor& timingFitter) {
     array<double, kEstimatorCount> result;
     result.fill(numeric_limits<double>::quiet_NaN());
-    array<vector<double>, 2> planeStripTimes;
-    map<int, double> fittedStripTimes;
+    array<vector<TimeMeasurement>, 2> planeStripTimes;
+    map<int, TimeMeasurement> fittedStripTimes;
 
     for (int clusterIndex : clusterIndices) {
         if (clusterIndex < 0 || clusterIndex >= static_cast<int>(clusters.size())) continue;
         const Cluster& cluster = clusters[clusterIndex];
         if (cluster.type < 0 || cluster.type > 1) continue;
 
-        vector<double> stripTimes;
+        vector<TimeMeasurement> stripTimes;
         for (int stripIndex : cluster.channelHitIndices) {
             if (stripIndex < 0 || stripIndex >= static_cast<int>(channelHits.size())) continue;
             const int rawIndex = channelHits[stripIndex].rawIndices;
@@ -138,34 +171,53 @@ array<double, kEstimatorCount> ExtractTimes(const vector<int>& clusterIndices,
             auto cached = fittedStripTimes.find(rawIndex);
             if (cached == fittedStripTimes.end()) {
                 const ChannelHit fitted = timingFitter.ProcessWaveform(detectorRawData[rawIndex]);
-                const double fittedTime = fitted.isValid && isfinite(fitted.time)
-                                              ? fitted.time
-                                              : numeric_limits<double>::quiet_NaN();
-                cached = fittedStripTimes.emplace(rawIndex, fittedTime).first;
+                TimeMeasurement measurement;
+                if (fitted.isValid && isfinite(fitted.time)) {
+                    measurement.time = fitted.time;
+                    measurement.error = fitted.timeError;
+                }
+                cached =
+                    fittedStripTimes.emplace(rawIndex, measurement).first;
             }
-            if (isfinite(cached->second)) stripTimes.push_back(cached->second);
+            if (isfinite(cached->second.time))
+                stripTimes.push_back(cached->second);
         }
         if (stripTimes.empty()) continue;
         planeStripTimes[cluster.type].insert(
             planeStripTimes[cluster.type].end(), stripTimes.begin(), stripTimes.end());
     }
 
-    vector<double> combined;
+    vector<TimeMeasurement> combined;
     for (size_t plane = 0; plane < 2; ++plane) {
         const auto& times = planeStripTimes[plane];
         if (times.empty()) continue;
-        result[plane * 2] = accumulate(times.begin(), times.end(), 0.0) / times.size();
-        result[plane * 2 + 1] = *min_element(times.begin(), times.end());
+        result[plane * 2] = ErrorWeightedMean(times);
+        result[plane * 2 + 1] =
+            min_element(
+                times.begin(), times.end(),
+                [](const TimeMeasurement& first,
+                   const TimeMeasurement& second) {
+                    return first.time < second.time;
+                })
+                ->time;
         combined.insert(combined.end(), times.begin(), times.end());
     }
     if (!combined.empty()) {
-        result[4] = accumulate(combined.begin(), combined.end(), 0.0) / combined.size();
-        result[5] = *min_element(combined.begin(), combined.end());
+        result[4] = ErrorWeightedMean(combined);
+        result[5] =
+            min_element(
+                combined.begin(), combined.end(),
+                [](const TimeMeasurement& first,
+                   const TimeMeasurement& second) {
+                    return first.time < second.time;
+                })
+                ->time;
     }
     return result;
 }
 
 bool LoadReconstructionTimes(TTree& validation, RawDataParser& parser,
+                             const json& timingWaveformConfig,
                              ReconstructionTimingResult& result) {
     for (const char* branch : {"eventID", "rawEventID", "trackIndex", "detID",
                                "clusterIndices", "channelHits", "clusters"}) {
@@ -191,7 +243,7 @@ bool LoadReconstructionTimes(TTree& validation, RawDataParser& parser,
     validation.SetBranchAddress("clusters", &clusters);
 
     WaveformProcessor timingFitter;
-    timingFitter.LoadConfig(json{{"mode", "Fit"}});
+    timingFitter.LoadConfig(timingWaveformConfig);
     int loadedEventID = numeric_limits<int>::min();
     unordered_map<int, vector<RawData>> rawHits;
     for (Long64_t entry = 0; entry < validation.GetEntries(); ++entry) {
@@ -262,7 +314,8 @@ map<int, TrackTimeReference> BuildTrackTimeReferences(
 
 DUTTimingResult LoadDUTTiming(
     TTree& dutTree, RawDataParser& parser,
-    const map<int, TrackTimeReference>& trackReferences) {
+    const map<int, TrackTimeReference>& trackReferences,
+    const json& timingWaveformConfig) {
     DUTTimingResult result;
     for (const char* branch :
          {"eventID", "dutID", "hitFlag", "predX", "predY",
@@ -288,7 +341,7 @@ DUTTimingResult LoadDUTTiming(
     dutTree.SetBranchAddress("selectedChannelHits", &selectedChannelHits);
 
     WaveformProcessor timingFitter;
-    timingFitter.LoadConfig(json{{"mode", "Fit"}});
+    timingFitter.LoadConfig(timingWaveformConfig);
     int loadedEventID = numeric_limits<int>::min();
     unordered_map<int, vector<RawData>> rawHits;
     for (Long64_t entry = 0; entry < dutTree.GetEntries(); ++entry) {
@@ -312,7 +365,7 @@ DUTTimingResult LoadDUTTiming(
             continue;
         }
 
-        double dutTimeSum = 0.0;
+        vector<TimeMeasurement> dutMeasurements;
         double amplitudeSum = 0.0;
         double maximumAmplitude = -numeric_limits<double>::infinity();
         size_t validDUTChannels = 0;
@@ -325,7 +378,8 @@ DUTTimingResult LoadDUTTiming(
             const ChannelHit fitted =
                 timingFitter.ProcessWaveform(rawDetector->second[rawIndex]);
             if (fitted.isValid && isfinite(fitted.time)) {
-                dutTimeSum += fitted.time;
+                dutMeasurements.push_back(
+                    {fitted.time, fitted.timeError});
                 amplitudeSum += fitted.amp;
                 maximumAmplitude = max(maximumAmplitude, fitted.amp);
                 ++validDUTChannels;
@@ -335,7 +389,7 @@ DUTTimingResult LoadDUTTiming(
             ++result.invalidDUTTimes;
             continue;
         }
-        const double dutTime = dutTimeSum / validDUTChannels;
+        const double dutTime = ErrorWeightedMean(dutMeasurements);
         DUTTimingSample sample;
         sample.eventID = eventID;
         sample.rawEventID = reference->second.rawEventID;
@@ -440,6 +494,129 @@ FitResult FitGaussianWithoutWriting(const vector<double>& values) {
         result.mean = mean;
         result.sigma = sigma;
     }
+    return result;
+}
+
+int CrossValidationFold(uint64_t eventID) {
+    return static_cast<int>(
+        (eventID * 11400714819323198485ULL) >> 63);
+}
+
+struct QuadraticTimeWalkModel {
+    double amplitudeMean = numeric_limits<double>::quiet_NaN();
+    double amplitudeScale = numeric_limits<double>::quiet_NaN();
+    Eigen::Vector3d coefficients =
+        Eigen::Vector3d::Constant(numeric_limits<double>::quiet_NaN());
+    bool valid = false;
+
+    double Evaluate(double amplitude) const {
+        if (!valid || !isfinite(amplitude)) return 0.0;
+        const double normalized =
+            (amplitude - amplitudeMean) / amplitudeScale;
+        return coefficients[0] + coefficients[1] * normalized +
+               coefficients[2] * normalized * normalized;
+    }
+};
+
+struct DUTTimeWalkResult {
+    bool accepted = false;
+    array<QuadraticTimeWalkModel, 2> models;
+    vector<double> correctedResiduals;
+    FitResult rawFit;
+    FitResult correctedFit;
+    array<FitResult, 2> rawFoldFits;
+    array<FitResult, 2> correctedFoldFits;
+};
+
+QuadraticTimeWalkModel FitQuadraticTimeWalk(
+    const vector<DUTTimingSample>& samples, int heldOutFold) {
+    QuadraticTimeWalkModel model;
+    double amplitudeSum = 0.0;
+    size_t count = 0;
+    for (const DUTTimingSample& sample : samples) {
+        if (CrossValidationFold(sample.rawEventID) == heldOutFold ||
+            !isfinite(sample.amplitude) || !isfinite(sample.residual))
+            continue;
+        amplitudeSum += sample.amplitude;
+        ++count;
+    }
+    if (count < 100) return model;
+    model.amplitudeMean = amplitudeSum / static_cast<double>(count);
+    double amplitudeVariance = 0.0;
+    for (const DUTTimingSample& sample : samples) {
+        if (CrossValidationFold(sample.rawEventID) == heldOutFold ||
+            !isfinite(sample.amplitude) || !isfinite(sample.residual))
+            continue;
+        const double delta = sample.amplitude - model.amplitudeMean;
+        amplitudeVariance += delta * delta;
+    }
+    model.amplitudeScale =
+        sqrt(amplitudeVariance / static_cast<double>(count - 1));
+    if (!isfinite(model.amplitudeScale) || model.amplitudeScale <= 0.0)
+        return model;
+
+    Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
+    for (const DUTTimingSample& sample : samples) {
+        if (CrossValidationFold(sample.rawEventID) == heldOutFold ||
+            !isfinite(sample.amplitude) || !isfinite(sample.residual))
+            continue;
+        const double normalized =
+            (sample.amplitude - model.amplitudeMean) / model.amplitudeScale;
+        const Eigen::Vector3d features(
+            1.0, normalized, normalized * normalized);
+        normal.noalias() += features * features.transpose();
+        rhs.noalias() += features * sample.residual;
+    }
+    model.coefficients = normal.ldlt().solve(rhs);
+    model.valid = model.coefficients.allFinite();
+    return model;
+}
+
+DUTTimeWalkResult EvaluateDUTTimeWalk(
+    const vector<DUTTimingSample>& samples) {
+    DUTTimeWalkResult result;
+    if (samples.size() < 1000) return result;
+    result.models[0] = FitQuadraticTimeWalk(samples, 0);
+    result.models[1] = FitQuadraticTimeWalk(samples, 1);
+    if (!result.models[0].valid || !result.models[1].valid) return result;
+
+    vector<double> rawResiduals;
+    array<vector<double>, 2> rawByFold;
+    array<vector<double>, 2> correctedByFold;
+    rawResiduals.reserve(samples.size());
+    result.correctedResiduals.reserve(samples.size());
+    for (const DUTTimingSample& sample : samples) {
+        const int fold = CrossValidationFold(sample.rawEventID);
+        const double corrected =
+            sample.residual - result.models[fold].Evaluate(sample.amplitude);
+        rawResiduals.push_back(sample.residual);
+        result.correctedResiduals.push_back(corrected);
+        rawByFold[fold].push_back(sample.residual);
+        correctedByFold[fold].push_back(corrected);
+    }
+    result.rawFit = FitGaussianWithoutWriting(rawResiduals);
+    result.correctedFit =
+        FitGaussianWithoutWriting(result.correctedResiduals);
+    for (size_t fold = 0; fold < 2; ++fold) {
+        result.rawFoldFits[fold] =
+            FitGaussianWithoutWriting(rawByFold[fold]);
+        result.correctedFoldFits[fold] =
+            FitGaussianWithoutWriting(correctedByFold[fold]);
+    }
+    result.accepted =
+        isfinite(result.rawFit.sigma) &&
+        isfinite(result.correctedFit.sigma) &&
+        result.correctedFit.sigma < 0.995 * result.rawFit.sigma;
+    for (size_t fold = 0; fold < 2; ++fold) {
+        result.accepted =
+            result.accepted &&
+            isfinite(result.rawFoldFits[fold].sigma) &&
+            isfinite(result.correctedFoldFits[fold].sigma) &&
+            result.correctedFoldFits[fold].sigma <
+                result.rawFoldFits[fold].sigma;
+    }
+    if (!result.accepted) result.correctedResiduals.clear();
     return result;
 }
 
@@ -583,31 +760,29 @@ double WriteDUTCorrelation(
 bool WriteTimingOutput(const string& outputPath,
                        const map<TrackKey, map<int, DetectorTimes>>& trackTimes,
                        const map<TrackKey, int>& eventIDs,
-                       const map<uint64_t, OscilloscopeData>& dataByEventID,
                        const array<int, 3>& trackerIDs,
                        const DUTTimingResult& dutTiming,
                        const TrackTimeWeights& trackWeights,
+                       bool applyDUTTimeWalkCorrection,
                        int histogramBins) {
     unique_ptr<TFile> output(TFile::Open(outputPath.c_str(), "RECREATE"));
     if (!output || output->IsZombie()) {
         cerr << "[TimeResolution] cannot create " << outputPath << '\n';
         return false;
     }
+    map<int, DUTTimeWalkResult> dutTimeWalk;
+    if (applyDUTTimeWalkCorrection) {
+        for (const auto& [detectorID, samples] : dutTiming.samplesByDetector)
+            dutTimeWalk.emplace(detectorID, EvaluateDUTTimeWalk(samples));
+    }
 
-    TTree eventTree("EventTimes", "Matched tracker and oscilloscope times");
+    TTree eventTree("EventTimes", "Tracker detector times");
     ULong64_t outRawEventID = 0;
-    Int_t outTrackIndex = 0, outDetID = 0, outFileIndex = 0, outSegmentIndex = 0;
-    Double_t triggerTimeNs = 0.0;
-    Double_t EventIDTime = 0.0, truthT0 = 0.0;
+    Int_t outTrackIndex = 0, outDetID = 0;
     array<Double_t, kEstimatorCount> estimatorValues{};
     eventTree.Branch("rawEventID", &outRawEventID);
     eventTree.Branch("trackIndex", &outTrackIndex);
     eventTree.Branch("detectorID", &outDetID);
-    eventTree.Branch("traceFileIndex", &outFileIndex);
-    eventTree.Branch("segmentIndex", &outSegmentIndex);
-    eventTree.Branch("triggerTime", &triggerTimeNs);
-    eventTree.Branch("EventIDTime", &EventIDTime);
-    eventTree.Branch("truthT0", &truthT0);
     for (size_t estimator = 0; estimator < kEstimatorCount; ++estimator)
         eventTree.Branch(kEstimatorNames[estimator].c_str(), &estimatorValues[estimator]);
 
@@ -640,36 +815,19 @@ bool WriteTimingOutput(const string& outputPath,
 
     map<pair<int, size_t>, vector<double>> detectorTimeSamples;
     map<tuple<int, int, size_t>, vector<double>> pairResiduals;
-    map<pair<int, size_t>, vector<double>> truthResiduals;
     vector<double> trackTimeSamples;
     array<vector<double>, 3> threeTrackerPairResiduals;
-    size_t tracksWithOscilloscopeData = 0;
     size_t completeThreeTrackerTimes = 0;
     for (const auto& [key, detectors] : trackTimes) {
-        const auto oscilloscopeDataIt = dataByEventID.find(key.first);
-        const bool hasOscilloscopeData = oscilloscopeDataIt != dataByEventID.end();
-        const OscilloscopeData* oscilloscopeData = hasOscilloscopeData ? &oscilloscopeDataIt->second : nullptr;
-        if (hasOscilloscopeData) ++tracksWithOscilloscopeData;
         for (const auto& [detectorID, times] : detectors) {
             outRawEventID = key.first;
             outTrackIndex = key.second;
             outDetID = detectorID;
-            outFileIndex = hasOscilloscopeData ? oscilloscopeData->fileIndex : -1;
-            outSegmentIndex = hasOscilloscopeData ? oscilloscopeData->segmentIndex : -1;
-            triggerTimeNs = hasOscilloscopeData ? oscilloscopeData->triggerTime : numeric_limits<double>::quiet_NaN();
-            EventIDTime = hasOscilloscopeData
-                                          ? oscilloscopeData->EvnentIDtime
-                                          : numeric_limits<double>::quiet_NaN();
-            truthT0 = hasOscilloscopeData ? oscilloscopeData->truthT0 : numeric_limits<double>::quiet_NaN();
             estimatorValues = times.value;
             eventTree.Fill();
             for (size_t estimator = 0; estimator < kEstimatorCount; ++estimator) {
                 if (!isfinite(times.value[estimator])) continue;
                 detectorTimeSamples[{detectorID, estimator}].push_back(times.value[estimator]);
-                if (hasOscilloscopeData) {
-                    truthResiduals[{detectorID, estimator}].push_back(
-                        times.value[estimator] - oscilloscopeData->truthT0);
-                }
             }
         }
 
@@ -726,6 +884,10 @@ bool WriteTimingOutput(const string& outputPath,
     Double_t dutTime = numeric_limits<double>::quiet_NaN();
     Double_t dutTrackTime = numeric_limits<double>::quiet_NaN();
     Double_t dutMinusTrackTime = numeric_limits<double>::quiet_NaN();
+    Double_t dutTimeWalkCorrection = 0.0;
+    Double_t dutMinusTrackTimeCorrected =
+        numeric_limits<double>::quiet_NaN();
+    Bool_t dutTimeWalkApplied = false;
     Double_t dutAmplitude = numeric_limits<double>::quiet_NaN();
     Double_t dutMeanAmplitude = numeric_limits<double>::quiet_NaN();
     Double_t dutClusterCharge = numeric_limits<double>::quiet_NaN();
@@ -743,6 +905,10 @@ bool WriteTimingOutput(const string& outputPath,
     dutTimeTree.Branch("dutTime", &dutTime);
     dutTimeTree.Branch("trackTime", &dutTrackTime);
     dutTimeTree.Branch("dutMinusTrackTime", &dutMinusTrackTime);
+    dutTimeTree.Branch("timeWalkCorrection", &dutTimeWalkCorrection);
+    dutTimeTree.Branch(
+        "dutMinusTrackTimeCorrected", &dutMinusTrackTimeCorrected);
+    dutTimeTree.Branch("timeWalkApplied", &dutTimeWalkApplied);
     dutTimeTree.Branch("amplitude", &dutAmplitude);
     dutTimeTree.Branch("meanAmplitude", &dutMeanAmplitude);
     dutTimeTree.Branch("clusterCharge", &dutClusterCharge);
@@ -754,6 +920,10 @@ bool WriteTimingOutput(const string& outputPath,
     dutTimeTree.Branch("predictedX", &dutPredictedX);
     dutTimeTree.Branch("predictedY", &dutPredictedY);
     for (const auto& [detectorID, samples] : dutTiming.samplesByDetector) {
+        const auto correction = dutTimeWalk.find(detectorID);
+        const bool correctionAccepted =
+            correction != dutTimeWalk.end() && correction->second.accepted;
+        size_t sampleIndex = 0;
         for (const DUTTimingSample& sample : samples) {
             dutEventID = sample.eventID;
             dutRawEventID = sample.rawEventID;
@@ -762,6 +932,13 @@ bool WriteTimingOutput(const string& outputPath,
             dutTime = sample.dutTime;
             dutTrackTime = sample.trackTime;
             dutMinusTrackTime = sample.residual;
+            dutTimeWalkApplied = correctionAccepted;
+            dutMinusTrackTimeCorrected =
+                correctionAccepted
+                    ? correction->second.correctedResiduals[sampleIndex]
+                    : sample.residual;
+            dutTimeWalkCorrection =
+                sample.residual - dutMinusTrackTimeCorrected;
             dutAmplitude = sample.amplitude;
             dutMeanAmplitude = sample.meanAmplitude;
             dutClusterCharge = sample.clusterCharge;
@@ -773,6 +950,7 @@ bool WriteTimingOutput(const string& outputPath,
             dutPredictedX = sample.predictedX;
             dutPredictedY = sample.predictedY;
             dutTimeTree.Fill();
+            ++sampleIndex;
         }
     }
     dutTimeTree.Write();
@@ -1005,28 +1183,13 @@ bool WriteTimingOutput(const string& outputPath,
         cout << ", resolution invalid (missing pair fit or negative derived variance)\n";
     }
 
-    if (tracksWithOscilloscopeData > 0) {
-        TDirectory* truthDirectory = output->mkdir("TruthResiduals");
-        TDirectory* truthRawDirectory = truthDirectory->mkdir("Raw");
-        for (const auto& [key, samples] : truthResiduals) {
-            const int detectorID = key.first;
-            const size_t estimator = key.second;
-            const string estimatorLabel = kEstimatorNames[estimator];
-            const string name = SafeName("truth_d" + to_string(detectorID) + "_" + estimatorLabel);
-            const FitResult fit = WriteAndFit(
-                samples, *truthRawDirectory, name,
-                "External-T0 corrected time; t_{detector} - T0 [ns];Entries",
-                histogramBins);
-            fillSummary("truth_t0", estimatorLabel, detectorID, -1, fit, fit.sigma);
-        }
-    }
-
     if (!dutTiming.samplesByDetector.empty()) {
         TDirectory* dutDirectory = output->mkdir("DUTTimeResolution");
         for (const auto& [dutID, samples] : dutTiming.samplesByDetector) {
             vector<double> dutTimes;
             vector<double> referenceTimes;
             vector<double> residuals;
+            vector<double> correctedResiduals;
             const array<string, 9> factorNames = {
                 "max_amplitude", "mean_amplitude", "cluster_charge",
                 "cluster_size", "cluster_centroid", "cluster_local_x",
@@ -1055,6 +1218,12 @@ bool WriteTimingOutput(const string& outputPath,
                 factors[7].push_back(sample.predictedX);
                 factors[8].push_back(sample.predictedY);
             }
+            const auto correction = dutTimeWalk.find(dutID);
+            const bool correctionAccepted =
+                correction != dutTimeWalk.end() && correction->second.accepted;
+            if (correctionAccepted)
+                correctedResiduals =
+                    correction->second.correctedResiduals;
             TDirectory* detectorDirectory =
                 dutDirectory->mkdir(("DUT_" + to_string(dutID)).c_str());
             WriteAndFit(
@@ -1069,6 +1238,15 @@ bool WriteTimingOutput(const string& outputPath,
                 residuals, *detectorDirectory, "dut_minus_track_time",
                 "DUT time residual;t_{DUT}-t_{track} [ns];Events",
                 histogramBins);
+            const FitResult correctedMeasured =
+                correctionAccepted
+                    ? WriteAndFit(
+                          correctedResiduals, *detectorDirectory,
+                          "dut_minus_track_time_timewalk_corrected",
+                          "Cross-validated amplitude time-walk corrected DUT "
+                          "residual;t_{DUT}-t_{track}-#hat{f}(A) [ns];Events",
+                          histogramBins)
+                    : measured;
 
             TDirectory* correlationDirectory =
                 detectorDirectory->mkdir("Correlations");
@@ -1094,15 +1272,68 @@ bool WriteTimingOutput(const string& outputPath,
             correlationDirectory->cd();
             correlationSummary.Write();
 
+            if (applyDUTTimeWalkCorrection &&
+                correction != dutTimeWalk.end()) {
+                const DUTTimeWalkResult& calibration = correction->second;
+                TTree timeWalkSummary(
+                    "DUTTimeWalkCalibration",
+                    "Cross-validated quadratic amplitude time-walk calibration");
+                Int_t accepted = calibration.accepted;
+                Double_t rawSigma = calibration.rawFit.sigma;
+                Double_t correctedSigma = calibration.correctedFit.sigma;
+                Double_t rawFoldSigma[2] = {
+                    calibration.rawFoldFits[0].sigma,
+                    calibration.rawFoldFits[1].sigma};
+                Double_t correctedFoldSigma[2] = {
+                    calibration.correctedFoldFits[0].sigma,
+                    calibration.correctedFoldFits[1].sigma};
+                Double_t amplitudeMean[2] = {
+                    calibration.models[0].amplitudeMean,
+                    calibration.models[1].amplitudeMean};
+                Double_t amplitudeScale[2] = {
+                    calibration.models[0].amplitudeScale,
+                    calibration.models[1].amplitudeScale};
+                Double_t coefficients[2][3] = {};
+                for (size_t fold = 0; fold < 2; ++fold)
+                    for (size_t coefficient = 0; coefficient < 3;
+                         ++coefficient)
+                        coefficients[fold][coefficient] =
+                            calibration.models[fold]
+                                .coefficients[coefficient];
+                timeWalkSummary.Branch("accepted", &accepted);
+                timeWalkSummary.Branch("rawSigmaNs", &rawSigma);
+                timeWalkSummary.Branch(
+                    "correctedSigmaNs", &correctedSigma);
+                timeWalkSummary.Branch(
+                    "rawFoldSigmaNs", rawFoldSigma, "rawFoldSigmaNs[2]/D");
+                timeWalkSummary.Branch(
+                    "correctedFoldSigmaNs", correctedFoldSigma,
+                    "correctedFoldSigmaNs[2]/D");
+                timeWalkSummary.Branch(
+                    "amplitudeMean", amplitudeMean, "amplitudeMean[2]/D");
+                timeWalkSummary.Branch(
+                    "amplitudeScale", amplitudeScale,
+                    "amplitudeScale[2]/D");
+                timeWalkSummary.Branch(
+                    "coefficients", coefficients, "coefficients[2][3]/D");
+                detectorDirectory->cd();
+                timeWalkSummary.Fill();
+                timeWalkSummary.Write();
+            }
+
             TTree dutSummary(
                 "DUTResolution",
                 "DUT resolution after subtracting tracker reference in quadrature");
             Int_t valid = 0;
             Int_t summaryDUTID = dutID;
             Long64_t matchedEntries = measured.entries;
-            Double_t residualMeanNs = measured.mean;
-            Double_t measuredSigmaNs = measured.sigma;
-            Double_t measuredSigmaErrorNs = measured.sigmaError;
+            Int_t timeWalkApplied = correctionAccepted;
+            Double_t rawResidualMeanNs = measured.mean;
+            Double_t rawMeasuredSigmaNs = measured.sigma;
+            Double_t rawMeasuredSigmaErrorNs = measured.sigmaError;
+            Double_t residualMeanNs = correctedMeasured.mean;
+            Double_t measuredSigmaNs = correctedMeasured.sigma;
+            Double_t measuredSigmaErrorNs = correctedMeasured.sigmaError;
             Double_t referenceResolutionNs = trackResolutionNs;
             Double_t referenceResolutionErrorNs = trackResolutionErrorNs;
             Double_t dutVarianceNs2 = numeric_limits<double>::quiet_NaN();
@@ -1130,6 +1361,11 @@ bool WriteTimingOutput(const string& outputPath,
             dutSummary.Branch("valid", &valid);
             dutSummary.Branch("dutID", &summaryDUTID);
             dutSummary.Branch("entries", &matchedEntries);
+            dutSummary.Branch("timeWalkApplied", &timeWalkApplied);
+            dutSummary.Branch("rawResidualMeanNs", &rawResidualMeanNs);
+            dutSummary.Branch("rawMeasuredSigmaNs", &rawMeasuredSigmaNs);
+            dutSummary.Branch(
+                "rawMeasuredSigmaErrorNs", &rawMeasuredSigmaErrorNs);
             dutSummary.Branch("residualMeanNs", &residualMeanNs);
             dutSummary.Branch("measuredSigmaNs", &measuredSigmaNs);
             dutSummary.Branch("measuredSigmaErrorNs", &measuredSigmaErrorNs);
@@ -1145,7 +1381,13 @@ bool WriteTimingOutput(const string& outputPath,
 
             cout << "[TimeResolution] DUT " << dutID
                  << ": matched=" << samples.size()
-                 << ", measured sigma=" << measuredSigmaNs << " ns";
+                 << ", raw measured sigma=" << rawMeasuredSigmaNs << " ns";
+            if (applyDUTTimeWalkCorrection) {
+                cout << ", time-walk correction="
+                     << (correctionAccepted ? "accepted" : "rejected");
+                if (correctionAccepted)
+                    cout << ", corrected sigma=" << measuredSigmaNs << " ns";
+            }
             if (valid) {
                 cout << ", DUT resolution=" << dutResolutionNs << " ns\n";
             } else {
@@ -1157,7 +1399,6 @@ bool WriteTimingOutput(const string& outputPath,
     output->cd();
     summary.Write();
     cout << "[TimeResolution] tracks=" << trackTimes.size()
-         << ", with external T0=" << tracksWithOscilloscopeData
          << ", output=" << outputPath << '\n';
     return !trackTimes.empty();
 }
@@ -1165,33 +1406,21 @@ bool WriteTimingOutput(const string& outputPath,
 }  // namespace
 
 void TimeResolutionScript::LoadConfig(const json& config) {
-    m_csvDirectory = config.value("csvDirectory", m_csvDirectory);
     m_trackFile = config.value("trackFile", m_trackFile);
     m_dutFile = config.value("dutFile", m_dutFile);
     m_outputFile = config.value("outputFile", m_outputFile);
-    m_dataCacheFile = config.value("dataCacheFile",
-                                   config.value("timingCacheFile", m_dataCacheFile));
-    m_waveformDiagnosticFile =
-        config.value("waveformDiagnosticFile", m_waveformDiagnosticFile);
-    m_rebuildTimingCache = config.value("rebuildTimingCache", m_rebuildTimingCache);
-    m_writeWaveformDiagnostics =
-        config.value("writeWaveformDiagnostics", m_writeWaveformDiagnostics);
-    m_triggerThreshold = config.value("triggerThreshold", m_triggerThreshold);
-    m_eventThreshold = config.value("eventThreshold", m_eventThreshold);
-    m_eventBits = config.value("eventBits", m_eventBits);
     m_histogramBins = config.value("histogramBins", m_histogramBins);
-    m_maxWaveformFiles = config.value("maxWaveformFiles", m_maxWaveformFiles);
     m_trackerIDs = config.value("trackerIDs", m_trackerIDs);
     m_analyzeDUTTiming =
         config.value("analyzeDUTTiming", m_analyzeDUTTiming);
+    m_applyDUTTimeWalkCorrection = config.value(
+        "applyDUTTimeWalkCorrection", m_applyDUTTimeWalkCorrection);
+    if (config.contains("timingWaveform"))
+        m_timingWaveformConfig = config["timingWaveform"];
 }
 
 void TimeResolutionScript::Print() const {
-    cout << "TimeResolutionScript: CSV=" << m_csvDirectory
-         << ", trigger threshold=" << m_triggerThreshold << " V, event bits=" << m_eventBits
-         << ", rebuild cache=" << (m_rebuildTimingCache ? "yes" : "no") << '\n';
-    if (m_writeWaveformDiagnostics)
-        cout << "  waveform diagnostics=" << m_waveformDiagnosticFile << '\n';
+    cout << "TimeResolutionScript:\n";
     if (!m_trackerIDs.empty()) {
         cout << "  three-tracker IDs=";
         for (size_t i = 0; i < m_trackerIDs.size(); ++i)
@@ -1200,12 +1429,16 @@ void TimeResolutionScript::Print() const {
     }
     cout << "  DUT timing=" << (m_analyzeDUTTiming ? "enabled" : "disabled")
          << '\n';
+    cout << "  DUT time-walk correction="
+         << (m_applyDUTTimeWalkCorrection ? "enabled" : "disabled") << '\n';
+    cout << "  timing waveform=" << m_timingWaveformConfig.dump() << '\n';
 }
 
 bool TimeResolutionScript::Validate() const {
-    return m_eventBits > 0 && m_eventBits <= 63 && m_histogramBins > 0 &&
+    return m_histogramBins > 0 &&
            (m_trackerIDs.empty() || m_trackerIDs.size() == 3) &&
-           set<int>(m_trackerIDs.begin(), m_trackerIDs.end()).size() == m_trackerIDs.size();
+           set<int>(m_trackerIDs.begin(), m_trackerIDs.end()).size() ==
+               m_trackerIDs.size();
 }
 
 bool TimeResolutionScript::Execute() {
@@ -1253,7 +1486,9 @@ bool TimeResolutionScript::Execute() {
     }
     
     ReconstructionTimingResult reconstruction;
-    if (!LoadReconstructionTimes(*validation, *parser, reconstruction)) return false;
+    if (!LoadReconstructionTimes(
+            *validation, *parser, m_timingWaveformConfig, reconstruction))
+        return false;
     cout << "[TimeResolution] loaded " << reconstruction.trackTimes.size() << " tracks and "
          << reconstruction.wantedEventIDs.size() << " raw event IDs\n";
     if (reconstruction.missingRawDetectors > 0 || reconstruction.emptyTimingDetectors > 0)
@@ -1287,7 +1522,8 @@ bool TimeResolutionScript::Execute() {
         const auto references = BuildTrackTimeReferences(
             reconstruction.trackTimes, reconstruction.eventIDs, trackerIDs,
             trackWeights);
-        dutTiming = LoadDUTTiming(*dutTree, *parser, references);
+        dutTiming = LoadDUTTiming(
+            *dutTree, *parser, references, m_timingWaveformConfig);
         cout << "[TimeResolution] DUT timing samples=";
         size_t totalDUTSamples = 0;
         for (const auto& [detectorID, samples] : dutTiming.samplesByDetector) {
@@ -1299,34 +1535,11 @@ bool TimeResolutionScript::Execute() {
              << ", invalid DUT times=" << dutTiming.invalidDUTTimes << '\n';
     }
 
-    OscilloscopeDataProcessor oscilloscopeProcessor;
-    oscilloscopeProcessor.LoadConfig(json{
-        {"csvDirectory", m_csvDirectory},
-        {"outputDir", GetOutputDir()},
-        {"dataCacheFile", m_dataCacheFile},
-        {"waveformDiagnosticFile", m_waveformDiagnosticFile},
-        {"rebuildTimingCache", m_rebuildTimingCache},
-        {"writeWaveformDiagnostics", m_writeWaveformDiagnostics},
-        {"triggerThreshold", m_triggerThreshold},
-        {"eventThreshold", m_eventThreshold},
-        {"eventBits", m_eventBits},
-        {"maxWaveformFiles", m_maxWaveformFiles},
-    });
-    OscilloscopeDataResult oscilloscope;
-    const string cachePath = filesystem::path(m_dataCacheFile).is_absolute()
-                                 ? m_dataCacheFile
-                                 : GetOutputDir() + m_dataCacheFile;
-    if ((!m_csvDirectory.empty() || filesystem::exists(cachePath)) &&
-        oscilloscopeProcessor.Initialize()) {
-        oscilloscope =
-            oscilloscopeProcessor.LoadData(reconstruction.wantedEventIDs);
-    }
     const auto& trackTimes = reconstruction.trackTimes;
-    const auto& dataByEventID = oscilloscope.dataByEventID;
 
     return WriteTimingOutput(outputPath, trackTimes, reconstruction.eventIDs,
-                             dataByEventID, trackerIDs, dutTiming,
-                             trackWeights,
+                             trackerIDs, dutTiming, trackWeights,
+                             m_applyDUTTimeWalkCorrection,
                              m_histogramBins);
 }
 

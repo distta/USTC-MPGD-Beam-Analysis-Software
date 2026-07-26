@@ -129,7 +129,11 @@ ChannelHit WaveformProcessor::processWaveformLeadingEdgeFit(const RawData& rawDa
    const double tau = riseFunc.GetParameter(3);
    const double tauErr = riseFunc.GetParError(3);
    const double riseTime = tau * 2.0 * std::log(9.0);
-   const double timeError = std::abs(std::log(1.0 / m_config.cfdFraction - 1.0) * tauErr);
+   const double crossingTimeError = riseFunc.GetParError(2);
+   const double fractionDerivative =
+       std::log(1.0 / m_config.cfdFraction - 1.0);
+   const double timeError =
+       std::hypot(crossingTimeError, fractionDerivative * tauErr);
 
    // 6. 填充结果
    channelData.amp = peakAmp;

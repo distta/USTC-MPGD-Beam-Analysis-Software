@@ -12,13 +12,11 @@
 #include <TCanvas.h>
 #include <TDirectory.h>
 #include <TEfficiency.h>
-#include <TF1.h>
 #include <TFile.h>
 #include <TGraph.h>
 #include <TGraphAsymmErrors.h>
 #include <TH1D.h>
 #include <TH2D.h>
-#include <TLatex.h>
 #include <TLegend.h>
 #include <TLine.h>
 #include <TTree.h>
@@ -78,6 +76,13 @@ struct EfficiencySample {
     std::vector<PadEnvelope> envelopes;
 };
 
+struct FakeEfficiencySample {
+    int flatBin{-1};
+    const EfficiencySample* source{nullptr};
+    double partnerPredX{0.0};
+    double partnerPredY{0.0};
+};
+
 struct EfficiencyGrid {
     std::vector<long long> denominator;
     std::array<std::vector<long long>, kAxes> numerator;
@@ -109,15 +114,11 @@ struct ResidualResult {
     double mean{0.0};
     double rms{0.0};
     double sigma68{0.0};
-    double sigmaFit{0.0};
-    double sigmaFitError{0.0};
 };
 
 struct PadAlignmentQAPoint {
     double predX{0.0};
     double predY{0.0};
-    double hitX{0.0};
-    double hitY{0.0};
     double resX{0.0};
     double resY{0.0};
 };
@@ -189,6 +190,33 @@ std::array<bool, kAxes> MatchEnvelopes(
                                       envelope,
                                       {sample.predX, sample.predY, 0.0},
                                       margin);
+    }
+    return {matchedX, matchedY, matched2D};
+}
+
+std::array<bool, kAxes> MatchFakeEnvelopes(
+    const FakeEfficiencySample& sample, double margin) {
+    if (!sample.source) return {false, false, false};
+    bool matchedX = false;
+    bool matchedY = false;
+    bool matched2D = false;
+    for (const auto& envelope : sample.source->envelopes) {
+        const bool sourceMatched =
+            DistanceToInterval(sample.source->predX,
+                               envelope.xLow, envelope.xHigh) <= margin &&
+            DistanceToInterval(sample.source->predY,
+                               envelope.yLow, envelope.yHigh) <= margin;
+        if (sourceMatched) continue;
+
+        const bool x = DistanceToInterval(
+                           sample.partnerPredX,
+                           envelope.xLow, envelope.xHigh) <= margin;
+        const bool y = DistanceToInterval(
+                           sample.partnerPredY,
+                           envelope.yLow, envelope.yHigh) <= margin;
+        matchedX = matchedX || x;
+        matchedY = matchedY || y;
+        matched2D = matched2D || (x && y);
     }
     return {matchedX, matchedY, matched2D};
 }
@@ -337,9 +365,10 @@ ResidualResult WriteResidual(const std::vector<double>& input,
         return values[index];
     };
     result.sigma68 = 0.5 * (quantile(0.84) - quantile(0.16));
-    double minimum = quantile(0.005);
-    double maximum = quantile(0.995);
-    if (!(maximum > minimum)) {
+    double minimum = result.mean - 5.0 * result.rms;
+    double maximum = result.mean + 5.0 * result.rms;
+    if (!(maximum > minimum) || !std::isfinite(minimum) ||
+        !std::isfinite(maximum)) {
         minimum = result.mean - 1.0;
         maximum = result.mean + 1.0;
     }
@@ -347,21 +376,12 @@ ResidualResult WriteResidual(const std::vector<double>& input,
     TDirectory::TContext context(directory);
     TH1D histogram(name.c_str(),
                    (name + ";Residual [mm];Events").c_str(),
-                   200, minimum, maximum);
+                   100, minimum, maximum);
     for (double value : values) histogram.Fill(value);
-    if (values.size() >= 20 && result.rms > 0.0) {
-        const double fitMinimum = std::max(minimum, result.mean - 2.0 * result.rms);
-        const double fitMaximum = std::min(maximum, result.mean + 2.0 * result.rms);
-        TF1 fit((name + "_gaus").c_str(), "gaus", fitMinimum, fitMaximum);
-        histogram.Fit(&fit, "Q0R");
-        result.sigmaFit = std::abs(fit.GetParameter(2));
-        result.sigmaFitError = fit.GetParError(2);
-    }
     histogram.SetStats(false);
-    histogram.Write();
     TCanvas canvas(("c" + name.substr(1)).c_str(),
-                   (name + " residual fit").c_str(), 900, 700);
-    histogram.Draw();
+                   (name + " residual distribution").c_str(), 900, 700);
+    histogram.Draw("HIST");
     canvas.Write();
     return result;
 }
@@ -384,94 +404,51 @@ double RobustResidualRange(const std::vector<PadAlignmentQAPoint>& points,
     return std::clamp(1.2 * absoluteResiduals[index], 1.0, 100.0);
 }
 
-void WritePadAlignmentQA(TDirectory* directory,
-                         const std::vector<PadAlignmentQAPoint>& points,
-                         double predXMin, double predXMax,
-                         double predYMin, double predYMax) {
+void WriteResidualMaps(TDirectory* directory,
+                       const std::vector<PadAlignmentQAPoint>& points,
+                       double predXMin, double predXMax,
+                       double predYMin, double predYMax) {
     if (!directory || points.empty()) return;
     TDirectory::TContext context(directory);
     const double residualRangeX = RobustResidualRange(points, true);
     const double residualRangeY = RobustResidualRange(points, false);
 
-    TH2D hitXVsPredX("hHitXVsPredX",
-                     "Measured X vs track prediction;Predicted X [mm];Measured X [mm]",
-                     160, predXMin, predXMax, 160, predXMin, predXMax);
-    TH2D residualXVsPredX(
-        "hResidualXVsPredX",
-        "X residual vs track prediction;Predicted X [mm];Residual X [mm]",
-        160, predXMin, predXMax, 200, -residualRangeX, residualRangeX);
     TH2D residualXVsHitX(
         "hResidualXVsHitX",
-        "X residual vs measured hit;Measured X [mm];Residual X [mm]",
+        "X residual vs track hit;Track-predicted Hit X [mm];Residual X [mm]",
         160, predXMin, predXMax, 200, -residualRangeX, residualRangeX);
-    TH2D hitYVsPredY("hHitYVsPredY",
-                     "Measured Y vs track prediction;Predicted Y [mm];Measured Y [mm]",
-                     160, predYMin, predYMax, 160, predYMin, predYMax);
-    TH2D residualYVsPredY(
-        "hResidualYVsPredY",
-        "Y residual vs track prediction;Predicted Y [mm];Residual Y [mm]",
-        160, predYMin, predYMax, 200, -residualRangeY, residualRangeY);
     TH2D residualYVsHitY(
         "hResidualYVsHitY",
-        "Y residual vs measured hit;Measured Y [mm];Residual Y [mm]",
+        "Y residual vs track hit;Track-predicted Hit Y [mm];Residual Y [mm]",
         160, predYMin, predYMax, 200, -residualRangeY, residualRangeY);
-    TH2D matchedPredictionXY(
-        "hMatchedPredictionXY",
-        "Track predictions with a matched cluster;Predicted X [mm];Predicted Y [mm]",
-        160, predXMin, predXMax, 160, predYMin, predYMax);
-    TH2D matchedHitXY(
-        "hMatchedHitXY",
-        "Matched reconstructed pad hits;Measured X [mm];Measured Y [mm]",
-        160, predXMin, predXMax, 160, predYMin, predYMax);
-    TH2D residualYVsResidualX(
-        "hResidualYVsResidualX",
+    TH2D residualXVsHitY(
+        "hResidualXVsHitY",
+        "X residual vs orthogonal track hit;Track-predicted Hit Y [mm];Residual X [mm]",
+        160, predYMin, predYMax, 200, -residualRangeX, residualRangeX);
+    TH2D residualYVsHitX(
+        "hResidualYVsHitX",
+        "Y residual vs orthogonal track hit;Track-predicted Hit X [mm];Residual Y [mm]",
+        160, predXMin, predXMax, 200, -residualRangeY, residualRangeY);
+    TH2D residual2D(
+        "hResidual2D",
         "Two-dimensional residual correlation;Residual X [mm];Residual Y [mm]",
         200, -residualRangeX, residualRangeX,
         200, -residualRangeY, residualRangeY);
 
     for (const auto& point : points) {
-        hitXVsPredX.Fill(point.predX, point.hitX);
-        residualXVsPredX.Fill(point.predX, point.resX);
-        residualXVsHitX.Fill(point.hitX, point.resX);
-        hitYVsPredY.Fill(point.predY, point.hitY);
-        residualYVsPredY.Fill(point.predY, point.resY);
-        residualYVsHitY.Fill(point.hitY, point.resY);
-        matchedPredictionXY.Fill(point.predX, point.predY);
-        matchedHitXY.Fill(point.hitX, point.hitY);
-        residualYVsResidualX.Fill(point.resX, point.resY);
+        residualXVsHitX.Fill(point.predX, point.resX);
+        residualYVsHitY.Fill(point.predY, point.resY);
+        residualXVsHitY.Fill(point.predY, point.resX);
+        residualYVsHitX.Fill(point.predX, point.resY);
+        residual2D.Fill(point.resX, point.resY);
     }
-    for (TH2D* histogram : {&hitXVsPredX, &residualXVsPredX,
-                            &residualXVsHitX, &hitYVsPredY,
-                            &residualYVsPredY, &residualYVsHitY}) {
+    for (TH2D* histogram : {
+             &residualXVsHitX, &residualYVsHitY,
+             &residualXVsHitY, &residualYVsHitX, &residual2D}) {
         histogram->SetStats(false);
+        histogram->SetOption("COLZ TEXT");
         histogram->Write();
     }
-    for (TH2D* histogram : {&matchedPredictionXY, &matchedHitXY,
-                            &residualYVsResidualX}) {
-        histogram->SetStats(false);
-        histogram->Write();
-    }
-
-    TCanvas canvasX("cAlignmentX", "Pad DUT X alignment QA", 1800, 600);
-    canvasX.Divide(3, 1);
-    canvasX.cd(1); hitXVsPredX.Draw("COLZ");
-    canvasX.cd(2); residualXVsPredX.Draw("COLZ");
-    canvasX.cd(3); residualXVsHitX.Draw("COLZ");
-    canvasX.Write();
-
-    TCanvas canvasY("cAlignmentY", "Pad DUT Y alignment QA", 1800, 600);
-    canvasY.Divide(3, 1);
-    canvasY.cd(1); hitYVsPredY.Draw("COLZ");
-    canvasY.cd(2); residualYVsPredY.Draw("COLZ");
-    canvasY.cd(3); residualYVsHitY.Draw("COLZ");
-    canvasY.Write();
-
-    TCanvas spatialCanvas("cSpatialQA", "Pad DUT spatial QA", 1800, 600);
-    spatialCanvas.Divide(3, 1);
-    spatialCanvas.cd(1); matchedPredictionXY.Draw("COLZ");
-    spatialCanvas.cd(2); matchedHitXY.Draw("COLZ");
-    spatialCanvas.cd(3); residualYVsResidualX.Draw("COLZ");
-    spatialCanvas.Write();
 }
 
 EfficiencyGrid BuildEfficiencyGrid(
@@ -484,28 +461,19 @@ EfficiencyGrid BuildEfficiencyGrid(
     return grid;
 }
 
+EfficiencyGrid BuildFakeEfficiencyGrid(
+    const std::vector<FakeEfficiencySample>& samples,
+    int xBins, int yBins, double margin) {
+    EfficiencyGrid grid(xBins, yBins);
+    for (const auto& sample : samples) {
+        grid.Fill(sample.flatBin, MatchFakeEnvelopes(sample, margin));
+    }
+    return grid;
+}
+
 TDirectory* GetOrCreateDirectory(TDirectory* parent, const std::string& name) {
     if (auto* directory = parent->GetDirectory(name.c_str())) return directory;
     return parent->mkdir(name.c_str());
-}
-
-double EfficiencyNonuniformity(const EfficiencyGrid& grid, int axis,
-                               int minimumEntries) {
-    std::vector<double> values;
-    for (size_t bin = 0; bin < grid.denominator.size(); ++bin) {
-        if (grid.denominator[bin] < minimumEntries) continue;
-        values.push_back(static_cast<double>(grid.numerator[axis][bin]) /
-                         grid.denominator[bin]);
-    }
-    if (values.empty()) return 0.0;
-    const double mean = Mean(values);
-    if (mean <= 0.0) return 0.0;
-    double variance = 0.0;
-    for (double value : values) {
-        const double delta = value - mean;
-        variance += delta * delta;
-    }
-    return std::sqrt(variance / values.size()) / mean;
 }
 
 void WriteEfficiencyMaps(TDirectory* directory,
@@ -516,15 +484,14 @@ void WriteEfficiencyMaps(TDirectory* directory,
                          const std::string& prefix) {
     if (!directory) return;
     TDirectory::TContext context(directory);
-    TH2D eventCount((prefix + "EventCount").c_str(),
-                    "Track predictions;Local X [mm];Local Y [mm];Events",
-                    xBins, xMin, xMax, yBins, yMin, yMax);
     std::array<std::unique_ptr<TH2D>, kAxes> maps;
     const std::array<const char*, kAxes> labels = {"X", "Y", "2D"};
+    const bool isFake = prefix.find("Fake") != std::string::npos;
     for (int axis = 0; axis < kAxes; ++axis) {
         maps[axis] = std::make_unique<TH2D>(
             (prefix + "Efficiency" + labels[axis]).c_str(),
-            (std::string("Pad efficiency ") + labels[axis] +
+            (std::string(isFake ? "Pad fake efficiency " : "Pad efficiency ") +
+             labels[axis] +
              ";Local X [mm];Local Y [mm];Efficiency").c_str(),
             xBins, xMin, xMax, yBins, yMin, yMax);
     }
@@ -532,7 +499,6 @@ void WriteEfficiencyMaps(TDirectory* directory,
         for (int yBin = 1; yBin <= yBins; ++yBin) {
             const int flatBin = (xBin - 1) * yBins + (yBin - 1);
             const long long total = grid.denominator[static_cast<size_t>(flatBin)];
-            eventCount.SetBinContent(xBin, yBin, total);
             for (int axis = 0; axis < kAxes; ++axis) {
                 const double value = total >= minimumEntries
                                          ? static_cast<double>(grid.numerator[axis][static_cast<size_t>(flatBin)]) / total
@@ -541,38 +507,15 @@ void WriteEfficiencyMaps(TDirectory* directory,
             }
         }
     }
-    eventCount.SetStats(false);
-    eventCount.SetMarkerSize(1.0);
-    eventCount.Write();
-    TCanvas countCanvas(("c" + prefix.substr(1) + "EventCount").c_str(),
-                        "Pad DUT event count", 900, 700);
-    countCanvas.SetRightMargin(0.15);
-    eventCount.Draw("COLZ TEXT");
-    countCanvas.Write();
 
     for (int axis = 0; axis < kAxes; ++axis) {
         auto& map = maps[axis];
         map->SetMinimum(0.0);
-        map->SetMaximum(1.0);
+        map->SetMaximum(isFake ? 0.05 : 1.0);
         map->SetStats(false);
         map->SetMarkerSize(1.0);
+        map->SetOption("COLZ TEXT");
         map->Write();
-
-        const std::string canvasName =
-            "c" + prefix.substr(1) + "Efficiency" + labels[axis];
-        TCanvas canvas(canvasName.c_str(), map->GetTitle(), 900, 700);
-        canvas.SetRightMargin(0.15);
-        canvas.SetTopMargin(0.12);
-        map->Draw("COLZ TEXT");
-        TLatex annotation;
-        annotation.SetNDC();
-        annotation.SetTextSize(0.035);
-        annotation.DrawLatex(
-            0.12, 0.93,
-            Form("Non-uniformity = %.2f%%",
-                 100.0 * EfficiencyNonuniformity(
-                             grid, axis, minimumEntries)));
-        canvas.Write();
     }
 }
 
@@ -580,9 +523,12 @@ void WriteEfficiencyProjections(TDirectory* directory,
                                 const EfficiencyGrid& grid,
                                 int xBins, double xMin, double xMax,
                                 int yBins, double yMin, double yMax,
-                                int minimumEntries) {
+                                int minimumEntries,
+                                const std::string& prefix) {
     if (!directory) return;
     TDirectory::TContext context(directory);
+    const bool isFake = !prefix.empty();
+    const std::string quantity = isFake ? "fake efficiency" : "efficiency";
     const auto overall = EstimateEfficiency(grid, k2D, minimumEntries);
     for (int projectionAxis : {kX, kY}) {
         const bool projectX = projectionAxis == kX;
@@ -594,9 +540,9 @@ void WriteEfficiencyProjections(TDirectory* directory,
         const std::string label = projectX ? "X" : "Y";
 
         TGraphAsymmErrors graph;
-        graph.SetName(("gEfficiency2DVs" + label).c_str());
-        graph.SetTitle(("2D efficiency vs local " + label + ";Local " +
-                        label + " [mm];2D efficiency").c_str());
+        graph.SetName(("g" + prefix + "Efficiency2DVs" + label).c_str());
+        graph.SetTitle(("2D " + quantity + " vs local " + label +
+                        ";Local " + label + " [mm];2D " + quantity).c_str());
         graph.SetMarkerStyle(20);
         graph.SetMarkerSize(0.8);
         graph.SetLineWidth(2);
@@ -628,13 +574,13 @@ void WriteEfficiencyProjections(TDirectory* directory,
                                 efficiency - lower, upper - efficiency);
             ++point;
         }
-        graph.Write();
 
-        TCanvas canvas(("cEfficiency2DVs" + label).c_str(),
-                       ("2D efficiency projection on local " + label).c_str(),
+        TCanvas canvas(("c" + prefix + "Efficiency2DVs" + label).c_str(),
+                       ("2D " + quantity + " projection on local " +
+                        label).c_str(),
                        900, 700);
         graph.SetMinimum(0.0);
-        graph.SetMaximum(1.02);
+        graph.SetMaximum(isFake ? 0.05 : 1.02);
         graph.Draw("APL");
         TLine average(minimum, overall.value, maximum, overall.value);
         average.SetLineColor(kRed + 1);
@@ -643,7 +589,7 @@ void WriteEfficiencyProjections(TDirectory* directory,
         average.Draw();
         TLegend legend(0.58, 0.18, 0.88, 0.31);
         legend.SetBorderSize(0);
-        legend.AddEntry(&graph, "2D efficiency", "lp");
+        legend.AddEntry(&graph, ("2D " + quantity).c_str(), "lp");
         legend.AddEntry(&average,
                         Form("Average: %.2f%%", 100.0 * overall.value), "l");
         legend.Draw();
@@ -651,32 +597,37 @@ void WriteEfficiencyProjections(TDirectory* directory,
     }
 }
 
-void WriteMarginScan(TDirectory* directory,
-                     const std::vector<EfficiencySample>& samples,
-                     int xBins, int yBins, int minimumEntries,
-                     double minimum, double maximum, double step) {
+template <typename GridBuilder>
+void WriteMarginScan(TDirectory* directory, GridBuilder&& buildGrid,
+                     int minimumEntries,
+                     double minimum, double maximum, double step,
+                     const std::string& prefix) {
     if (!directory || step <= 0.0 || maximum < minimum) return;
     TDirectory::TContext context(directory);
+    const bool isFake = !prefix.empty();
+    const std::string quantity = isFake ? "fake efficiency" : "efficiency";
     std::array<TGraph, kAxes> graphs;
     const std::array<const char*, kAxes> labels = {"X", "Y", "2D"};
     for (int axis = 0; axis < kAxes; ++axis) {
-        graphs[axis].SetName((std::string("gEfficiencyVsMargin") + labels[axis]).c_str());
-        graphs[axis].SetTitle((std::string("Pad ") + labels[axis] +
-                              " efficiency vs margin;Margin [mm];Efficiency").c_str());
+        graphs[axis].SetName(
+            ("g" + prefix + "EfficiencyVsMargin" + labels[axis]).c_str());
+        graphs[axis].SetTitle(
+            (std::string("Pad ") + labels[axis] + " " + quantity +
+             " vs margin;Margin [mm];" + quantity).c_str());
     }
     int point = 0;
     for (double margin = minimum; margin <= maximum + 0.5 * step;
          margin += step, ++point) {
-        const auto grid = BuildEfficiencyGrid(samples, xBins, yBins, margin);
+        const auto grid = buildGrid(margin);
         for (int axis = 0; axis < kAxes; ++axis) {
             graphs[axis].SetPoint(
                 point, margin,
                 EstimateEfficiency(grid, axis, minimumEntries).value);
         }
     }
-    for (auto& graph : graphs) graph.Write();
 
-    TCanvas canvas("cEfficiencyVsMargin", "Pad efficiency vs margin",
+    TCanvas canvas(("c" + prefix + "EfficiencyVsMargin").c_str(),
+                   ("Pad " + quantity + " vs margin").c_str(),
                    900, 700);
     const std::array<int, kAxes> colors = {kBlue + 1, kRed + 1, kBlack};
     const std::array<int, kAxes> markers = {20, 21, 22};
@@ -687,7 +638,7 @@ void WriteMarginScan(TDirectory* directory,
         graphs[axis].SetLineWidth(2);
     }
     graphs[kX].SetMinimum(0.0);
-    graphs[kX].SetMaximum(1.02);
+    graphs[kX].SetMaximum(isFake ? 0.05 : 1.02);
     graphs[kX].Draw("APL");
     graphs[kY].Draw("PL SAME");
     graphs[k2D].Draw("PL SAME");
@@ -698,44 +649,6 @@ void WriteMarginScan(TDirectory* directory,
     legend.AddEntry(&graphs[k2D], "2D", "lp");
     legend.Draw();
     canvas.Write();
-}
-
-void FillEfficiencySummary(TTree& tree, int detectorID, double margin,
-                           const EfficiencyGrid& grid,
-                           int minimumEntries) {
-    Int_t dutID = detectorID;
-    Double_t marginMm = margin;
-    Long64_t eligibleEvents = 0;
-    Double_t efficiencyX = 0.0, efficiencyY = 0.0, efficiency2D = 0.0;
-    Double_t errorLowX = 0.0, errorHighX = 0.0;
-    Double_t errorLowY = 0.0, errorHighY = 0.0;
-    Double_t errorLow2D = 0.0, errorHigh2D = 0.0;
-    const auto x = EstimateEfficiency(grid, kX, minimumEntries);
-    const auto y = EstimateEfficiency(grid, kY, minimumEntries);
-    const auto xy = EstimateEfficiency(grid, k2D, minimumEntries);
-    eligibleEvents = xy.total;
-    efficiencyX = x.value;
-    efficiencyY = y.value;
-    efficiency2D = xy.value;
-    errorLowX = x.errorLow;
-    errorHighX = x.errorHigh;
-    errorLowY = y.errorLow;
-    errorHighY = y.errorHigh;
-    errorLow2D = xy.errorLow;
-    errorHigh2D = xy.errorHigh;
-    tree.Branch("dutID", &dutID);
-    tree.Branch("marginMm", &marginMm);
-    tree.Branch("eligibleEvents", &eligibleEvents);
-    tree.Branch("efficiencyX", &efficiencyX);
-    tree.Branch("errorLowX", &errorLowX);
-    tree.Branch("errorHighX", &errorHighX);
-    tree.Branch("efficiencyY", &efficiencyY);
-    tree.Branch("errorLowY", &errorLowY);
-    tree.Branch("errorHighY", &errorHighY);
-    tree.Branch("efficiency2D", &efficiency2D);
-    tree.Branch("errorLow2D", &errorLow2D);
-    tree.Branch("errorHigh2D", &errorHigh2D);
-    tree.Fill();
 }
 
 double HuberLoss(double residual, double delta) {
@@ -1479,28 +1392,22 @@ bool PadDUTAnalysisScript::Execute() {
         std::vector<double> residualsY;
         std::vector<PadAlignmentQAPoint> alignmentQAPoints;
         std::vector<EfficiencySample> samples;
-        TH2D allPadOccupancy(
-            "hAllPadOccupancy",
-            "All reconstructed pad-channel occupancy;Pad column id0;Pad row id1",
-            padConfig.columns, -0.5, padConfig.columns - 0.5,
-            padConfig.rows, -0.5, padConfig.rows - 0.5);
-        TH2D matchedPadOccupancy(
-            "hMatchedPadOccupancy",
-            "Track-matched cluster pad occupancy;Pad column id0;Pad row id1",
-            padConfig.columns, -0.5, padConfig.columns - 0.5,
-            padConfig.rows, -0.5, padConfig.rows - 0.5);
-        TH1D clusterMultiplicity(
-            "hClusterMultiplicity",
-            "Cluster multiplicity per event;Clusters;Events", 51, -0.5, 50.5);
-        TH1D matchedClusterSize(
-            "hMatchedClusterSize",
-            "Matched cluster size;Pads in cluster;Matched events", 21, -0.5, 20.5);
-        for (TH1* histogram : {static_cast<TH1*>(&allPadOccupancy),
-                               static_cast<TH1*>(&matchedPadOccupancy),
-                               static_cast<TH1*>(&clusterMultiplicity),
-                               static_cast<TH1*>(&matchedClusterSize)}) {
+        TH2D reconstructedHitMap(
+            "hReconstructedHitMap",
+            "All reconstructed DUT hits;Reconstructed X [mm];Reconstructed Y [mm]",
+            m_effXBins, m_effXMin, m_effXMax,
+            m_effYBins, m_effYMin, m_effYMax);
+        TH2D matchedHitMap(
+            "hMatchedHitMap",
+            "Track-matched reconstructed DUT hits;Reconstructed X [mm];Reconstructed Y [mm]",
+            m_effXBins, m_effXMin, m_effXMax,
+            m_effYBins, m_effYMin, m_effYMax);
+        for (TH1* histogram : {
+                 static_cast<TH1*>(&reconstructedHitMap),
+                 static_cast<TH1*>(&matchedHitMap)}) {
             histogram->SetDirectory(nullptr);
             histogram->SetStats(false);
+            histogram->SetOption("COLZ TEXT");
         }
         for (const auto& event : events) {
             eventID = event.eventID;
@@ -1521,10 +1428,11 @@ bool PadDUTAnalysisScript::Execute() {
                 const auto& frame = *frameIt->second;
                 channelHits = frame.ChannelHits();
                 clusters = frame.Clusters();
-                clusterMultiplicity.Fill(clusters.size());
-                for (const auto& channelHit : channelHits) {
-                    if (channelHit.HasID1()) {
-                        allPadOccupancy.Fill(channelHit.id0, channelHit.id1);
+                for (const auto& localHit : frame.LocalHits()) {
+                    if (std::isfinite(localHit.localPos.X()) &&
+                        std::isfinite(localHit.localPos.Y())) {
+                        reconstructedHitMap.Fill(
+                            localHit.localPos.X(), localHit.localPos.Y());
                     }
                 }
                 const PadMatch match = FindMatchedPadHit(
@@ -1538,24 +1446,18 @@ bool PadDUTAnalysisScript::Execute() {
                     resX = match.residualX;
                     resY = match.residualY;
                     selectedCluster = clusters[static_cast<size_t>(clusterIndex)];
-                    matchedClusterSize.Fill(selectedCluster.size);
+                    matchedHitMap.Fill(hitX, hitY);
                     for (int index : selectedCluster.channelHitIndices) {
                         if (index >= 0 &&
                             static_cast<size_t>(index) < channelHits.size()) {
                             selectedChannelHits.push_back(
                                 channelHits[static_cast<size_t>(index)]);
-                            const auto& selectedHit =
-                                channelHits[static_cast<size_t>(index)];
-                            if (selectedHit.HasID1()) {
-                                matchedPadOccupancy.Fill(
-                                    selectedHit.id0, selectedHit.id1);
-                            }
                         }
                     }
                     residualsX.push_back(resX);
                     residualsY.push_back(resY);
                     alignmentQAPoints.push_back(
-                        {predX, predY, hitX, hitY, resX, resY});
+                        {predX, predY, resX, resY});
                 }
 
                 const int flatBin = FindFlatBin(
@@ -1590,32 +1492,16 @@ bool PadDUTAnalysisScript::Execute() {
             residualsX, residualDirectory, "hResidualX");
         const ResidualResult resultY = WriteResidual(
             residualsY, residualDirectory, "hResidualY");
-        WritePadAlignmentQA(
+        WriteResidualMaps(
             residualDirectory, alignmentQAPoints,
             m_effXMin, m_effXMax, m_effYMin, m_effYMax);
 
-        auto* clusterDirectory = GetOrCreateDirectory(
-            detectorDirectory, "ClusterQA");
+        auto* hitMapDirectory = GetOrCreateDirectory(
+            detectorDirectory, "HitMaps");
         {
-            TDirectory::TContext context(clusterDirectory);
-            allPadOccupancy.Write();
-            matchedPadOccupancy.Write();
-            clusterMultiplicity.Write();
-            matchedClusterSize.Write();
-
-            TCanvas occupancyCanvas(
-                "cPadOccupancy", "Pad channel occupancy", 1600, 700);
-            occupancyCanvas.Divide(2, 1);
-            occupancyCanvas.cd(1); allPadOccupancy.Draw("COLZ TEXT");
-            occupancyCanvas.cd(2); matchedPadOccupancy.Draw("COLZ TEXT");
-            occupancyCanvas.Write();
-
-            TCanvas clusterCanvas(
-                "cClusterProperties", "Pad cluster properties", 1600, 700);
-            clusterCanvas.Divide(2, 1);
-            clusterCanvas.cd(1); clusterMultiplicity.Draw("HIST");
-            clusterCanvas.cd(2); matchedClusterSize.Draw("HIST");
-            clusterCanvas.Write();
+            TDirectory::TContext context(hitMapDirectory);
+            reconstructedHitMap.Write();
+            matchedHitMap.Write();
         }
 
         auto* efficiencyDirectory = GetOrCreateDirectory(
@@ -1631,18 +1517,15 @@ bool PadDUTAnalysisScript::Execute() {
             efficiencyDirectory, efficiency,
             m_effXBins, m_effXMin, m_effXMax,
             m_effYBins, m_effYMin, m_effYMax,
-            m_effMinEntriesPerBin);
+            m_effMinEntriesPerBin, "");
         WriteMarginScan(
-            efficiencyDirectory, samples,
-            m_effXBins, m_effYBins, m_effMinEntriesPerBin,
-            m_marginScanMin, m_marginScanMax, m_marginScanStep);
-        {
-            TDirectory::TContext context(efficiencyDirectory);
-            TTree summary("EfficiencySummary", "Pad DUT efficiency summary");
-            FillEfficiencySummary(summary, dutID, m_margin,
-                                  efficiency, m_effMinEntriesPerBin);
-            summary.Write();
-        }
+            efficiencyDirectory,
+            [&](double margin) {
+                return BuildEfficiencyGrid(
+                    samples, m_effXBins, m_effYBins, margin);
+            },
+            m_effMinEntriesPerBin,
+            m_marginScanMin, m_marginScanMax, m_marginScanStep, "");
 
         EfficiencyEstimate fake2D;
         if (m_enableFakeEfficiency) {
@@ -1652,7 +1535,7 @@ bool PadDUTAnalysisScript::Execute() {
                     strictSamples.push_back(&sample);
                 }
             }
-            EfficiencyGrid fakeGrid(m_effXBins, m_effYBins);
+            std::vector<FakeEfficiencySample> fakeSamples;
             if (strictSamples.size() > 1) {
                 std::mt19937 random(m_fakeSeed);
                 std::uniform_int_distribution<size_t> distribution(
@@ -1663,19 +1546,6 @@ bool PadDUTAnalysisScript::Execute() {
                 for (size_t sourceIndex = 0;
                      sourceIndex < strictSamples.size(); ++sourceIndex) {
                     const auto& source = *strictSamples[sourceIndex];
-                    EfficiencySample remaining = source;
-                    remaining.envelopes.erase(
-                        std::remove_if(
-                            remaining.envelopes.begin(), remaining.envelopes.end(),
-                            [&](const PadEnvelope& envelope) {
-                                return DistanceToInterval(
-                                           source.predX, envelope.xLow,
-                                           envelope.xHigh) <= m_margin &&
-                                       DistanceToInterval(
-                                           source.predY, envelope.yLow,
-                                           envelope.yHigh) <= m_margin;
-                            }),
-                        remaining.envelopes.end());
                     std::set<size_t> selectedPartners;
                     while (selectedPartners.size() < partners) {
                         size_t partner = distribution(random);
@@ -1684,21 +1554,27 @@ bool PadDUTAnalysisScript::Execute() {
                     }
                     for (size_t partnerIndex : selectedPartners) {
                         const auto& partner = *strictSamples[partnerIndex];
-                        remaining.predX = partner.predX;
-                        remaining.predY = partner.predY;
-                        remaining.flatBin = partner.flatBin;
-                        fakeGrid.Fill(remaining.flatBin,
-                                      MatchEnvelopes(remaining, m_margin));
+                        fakeSamples.push_back(
+                            {partner.flatBin,
+                             &source,
+                             partner.predX, partner.predY});
                     }
                 }
             }
+            const EfficiencyGrid fakeGrid = BuildFakeEfficiencyGrid(
+                fakeSamples, m_effXBins, m_effYBins, m_margin);
             auto* fakeDirectory = GetOrCreateDirectory(
-                detectorDirectory, "FakeEfficiency");
+                detectorDirectory, "Fake");
             WriteEfficiencyMaps(
                 fakeDirectory, fakeGrid,
                 m_effXBins, m_effXMin, m_effXMax,
                 m_effYBins, m_effYMin, m_effYMax,
                 m_effMinEntriesPerBin, "hFake");
+            WriteEfficiencyProjections(
+                fakeDirectory, fakeGrid,
+                m_effXBins, m_effXMin, m_effXMax,
+                m_effYBins, m_effYMin, m_effYMax,
+                m_effMinEntriesPerBin, "Fake");
             fake2D = EstimateEfficiency(
                 fakeGrid, k2D, m_effMinEntriesPerBin);
         }
@@ -1714,8 +1590,6 @@ bool PadDUTAnalysisScript::Execute() {
                   << ": events=" << efficiency2D.total
                   << ", sigma68X=" << resultX.sigma68 << " mm"
                   << ", sigma68Y=" << resultY.sigma68 << " mm"
-                  << ", fitSigmaX=" << resultX.sigmaFit << " mm"
-                  << ", fitSigmaY=" << resultY.sigmaFit << " mm"
                   << ", effX=" << 100.0 * efficiencyX.value << "%"
                   << ", effY=" << 100.0 * efficiencyY.value << "%"
                   << ", eff2D=" << 100.0 * efficiency2D.value << "%"

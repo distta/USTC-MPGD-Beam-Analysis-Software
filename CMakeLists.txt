@@ -46,6 +46,7 @@ set(SOURCES
     src/Script/Base/ScriptFactory.cpp
     src/Script/ExampleScript.cpp
     src/Script/TrackAnalysisScript.cpp
+    src/Script/OscilloscopeAnalysisScript.cpp
     src/Script/TimeResolutionScript.cpp
     src/Script/DUTAnalysisScript.cpp
     src/Script/DUTEfficiencyAnalysis.cpp

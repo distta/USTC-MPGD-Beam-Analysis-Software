@@ -23,7 +23,7 @@ class AlgorithmConfig {
 class WaveformConfig : public AlgorithmConfig {
    public:
     std::string mode = "Default";
-    double cfdFraction = 0.3;
+    double cfdFraction = 0.5;
     double noiseThreshold = 100.0;
     double saturationLevel = 2000.0;
     double timePitch = 25.0;
