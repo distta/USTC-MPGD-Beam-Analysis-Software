@@ -2669,8 +2669,6 @@ bool WriteCompactTimingOutput(
         }
     }
 
-    output->Write();
-
     string resultAnalysis;
     string resultObject;
     Int_t resultDetectorA = -1;
