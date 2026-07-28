@@ -1,16 +1,17 @@
 // Compare DUT resolution and efficiency across runs.
 //
-// Edit the USER CONFIGURATION section below, then run:
+// Edit the directory list in USER CONFIGURATION, then run:
 // root -l -b -q tools/PlotDUTRunSummary.C
 
 // Outputs are written below <dataDirectory>/result when that directory exists,
 // otherwise directly below <dataDirectory>:
-//   DUTRunSummary_<detector>_<gas>.root  (summary and fake-efficiency canvases)
+//   DUTRunSummary_<detector>_<gas>.root  (two canvases)
 
 #include <TAxis.h>
 #include <TCanvas.h>
 #include <TF1.h>
 #include <TFile.h>
+#include <TGaxis.h>
 #include <TGraph.h>
 #include <TGraphAsymmErrors.h>
 #include <TGraphErrors.h>
@@ -42,10 +43,13 @@ struct RunVoltage {
 //   <dataDirectory>/result/<runID>/DUTInfo.root
 // and then in:
 //   <dataDirectory>/<runID>/DUTInfo.root
-const std::string dataDirectory = "data/Beam202607/large-area_sector4";
+const std::vector<std::string> dataDirectories = {
+    "data/Beam202607/large-area_sector1",
+    "data/Beam202607/large-area_sector2",
+    "data/Beam202607/large-area_sector3",
+    "data/Beam202607/large-area_sector4"};
 const std::string detectorName = "Large area #muRGroove";
 const std::string gas = "Ar/ISO 98/2";
-const int dutID = 3;
 
 // Axis ranges. Keep auto=true for automatic ranges; set it to false and edit
 // the corresponding minimum/maximum values to use a fixed range.
@@ -65,18 +69,28 @@ const double fakeEfficiencyRangeMaximum = 1.0;  // percent
 // Use "auto" to write into <dataDirectory>/result when it exists.
 const std::string configuredOutputDirectory = "auto";
 
-// {run ID, voltage [V]}. Replace the example voltages with measured values.
-const std::vector<RunVoltage> runVoltages = {
-    {69, 300.0},
-    {71, 310},
-    {73, 320},
-    {75, 330},
-    {77, 340},
-    {79, 350},
-    {81, 360},
-    {83, 370},
-    {85, 380}};
 // ====================== END USER CONFIGURATION ======================
+
+std::vector<RunVoltage> RunVoltagesForDirectory(
+    const std::string& directory) {
+   int firstRun = 0;
+   if (directory.find("large-area_sector1") != std::string::npos)
+      firstRun = 13;
+   else if (directory.find("large-area_sector2") != std::string::npos)
+      firstRun = 33;
+   else if (directory.find("large-area_sector3") != std::string::npos)
+      firstRun = 51;
+   else if (directory.find("large-area_sector4") != std::string::npos)
+      firstRun = 69;
+   else
+      throw std::runtime_error(
+          "Unknown run/voltage mapping for data directory '" + directory + "'");
+
+   std::vector<RunVoltage> values;
+   for (int index = 0; index < 9; ++index)
+      values.push_back({firstRun + 2 * index, 300.0 + 10.0 * index});
+   return values;
+}
 
 struct ResolutionResult {
    double sigmaUm = 0.0;
@@ -222,11 +236,24 @@ EfficiencySummary ReadEfficiencySummary(TFile& input,
 }
 
 RunResult ReadRun(const std::string& fileName, const RunVoltage& runVoltage,
-                  int requestedDUT) {
+                  int requestedDUT = -1) {
    TFile input(fileName.c_str(), "READ");
    if (input.IsZombie()) {
       throw std::runtime_error("Cannot open '" + fileName + "'");
    }
+   if (requestedDUT < 0) {
+      for (int candidate = 0; candidate < 100; ++candidate) {
+         const std::string path =
+             "DUT_" + std::to_string(candidate) + "/EfficiencySummary";
+         if (input.Get(path.c_str())) {
+            requestedDUT = candidate;
+            break;
+         }
+      }
+   }
+   if (requestedDUT < 0)
+      throw std::runtime_error("Cannot find a DUT efficiency summary in '" +
+                               fileName + "'");
    const std::string dutPath = "DUT_" + std::to_string(requestedDUT);
    const EfficiencySummary efficiency = ReadEfficiencySummary(
        input, dutPath + "/EfficiencySummary");
@@ -275,7 +302,7 @@ void StyleGraph(TGraph& graph, int color, int marker) {
 
 }  // namespace
 
-void PlotDUTRunSummary() {
+void PlotDUTRunSummaryForDirectory(const std::string& dataDirectory) {
    if (dataDirectory.empty()) {
       throw std::runtime_error("dataDirectory must not be empty");
    }
@@ -283,14 +310,11 @@ void PlotDUTRunSummary() {
       throw std::runtime_error("detectorName must not be empty");
    }
    if (gas.empty()) throw std::runtime_error("gas must not be empty");
-   if (dutID < 0) throw std::runtime_error("dutID must be non-negative");
-   if (runVoltages.empty()) {
-      throw std::runtime_error("runVoltages must not be empty");
-   }
 
    const std::string& baseDirectory = dataDirectory;
    const std::string& gasLabel = gas;
-   std::vector<RunVoltage> sortedRunVoltages = runVoltages;
+   std::vector<RunVoltage> sortedRunVoltages =
+       RunVoltagesForDirectory(baseDirectory);
    std::sort(sortedRunVoltages.begin(), sortedRunVoltages.end(),
              [](const auto& left, const auto& right) {
                 if (left.voltage != right.voltage)
@@ -300,9 +324,16 @@ void PlotDUTRunSummary() {
    std::vector<RunResult> results;
    for (const auto& item : sortedRunVoltages) {
       const std::string inputFile = ResolveInputFile(baseDirectory, item.runID);
-      results.push_back(ReadRun(inputFile, item, dutID));
+      try {
+         results.push_back(ReadRun(inputFile, item));
+      } catch (const std::exception& error) {
+         std::fprintf(stderr,
+                      "[PlotDUTRunSummary] WARNING: skipping run %d in %s: %s\n",
+                      item.runID, baseDirectory.c_str(), error.what());
+      }
    }
-   if (results.empty()) throw std::runtime_error("No DUT runs were configured");
+   if (results.empty())
+      throw std::runtime_error("No readable DUT runs in '" + baseDirectory + "'");
    const double commonMargin = results.front().margin;
    for (const auto& result : results) {
       if (std::abs(result.margin - commonMargin) > 1e-9) {
@@ -409,8 +440,9 @@ void PlotDUTRunSummary() {
 
    gStyle->SetOptStat(0);
    gStyle->SetOptFit(0);
+   gStyle->SetTitleBorderSize(0);
    gStyle->SetEndErrorSize(3);
-   TCanvas canvas("cDUTRunSummary", "DUT run summary", 1100, 800);
+   TCanvas canvas("cDUTRunSummary", "DUT run summary", 1100, 750);
 
    const double voltageSpan = maximumVoltage > minimumVoltage
                                   ? maximumVoltage - minimumVoltage
@@ -463,49 +495,17 @@ void PlotDUTRunSummary() {
       throw std::runtime_error("Each configured axis maximum must exceed its minimum");
    }
 
-   TPad topPad("resolutionPad", "resolution", 0.0, 0.49, 1.0, 1.0);
-   TPad bottomPad("efficiencyPad", "efficiency", 0.0, 0.0, 1.0, 0.51);
-   topPad.SetLeftMargin(0.12);
-   topPad.SetRightMargin(0.04);
-   topPad.SetTopMargin(0.14);
-   topPad.SetBottomMargin(0.02);
-   bottomPad.SetLeftMargin(0.12);
-   bottomPad.SetRightMargin(0.04);
-   bottomPad.SetTopMargin(0.02);
-   bottomPad.SetBottomMargin(0.16);
-   topPad.SetGridx();
-   topPad.SetGridy();
-   bottomPad.SetGridx();
-   bottomPad.SetGridy();
-   topPad.Draw();
-   bottomPad.Draw();
+   canvas.SetLeftMargin(0.12);
+   canvas.SetRightMargin(0.14);
+   canvas.SetTopMargin(0.12);
+   canvas.SetBottomMargin(0.13);
+   canvas.SetGridx();
+   canvas.SetGridy();
 
-   topPad.cd();
-   TMultiGraph resolutionGraph;
-   resolutionGraph.SetTitle(
-       Form("%s - %s;;Resolution [#mum]",
-            detectorName.c_str(), gasLabel.c_str()));
-   resolutionGraph.Add(&resolutionX, "LP");
-   resolutionGraph.Add(&resolutionY, "LP");
-   resolutionGraph.Draw("A");
-   resolutionGraph.GetXaxis()->SetLimits(voltageMinimum, voltageMaximum);
-   resolutionGraph.SetMinimum(resolutionMinimum);
-   resolutionGraph.SetMaximum(resolutionMaximum);
-   resolutionGraph.GetXaxis()->SetLabelSize(0.0);
-   resolutionGraph.GetXaxis()->SetTickLength(0.0);
-   resolutionGraph.GetYaxis()->SetTitleSize(0.065);
-   resolutionGraph.GetYaxis()->SetLabelSize(0.055);
-   resolutionGraph.GetYaxis()->SetTitleOffset(0.82);
-   TLegend resolutionLegend(0.68, 0.68, 0.93, 0.86);
-   resolutionLegend.SetBorderSize(0);
-   resolutionLegend.SetFillStyle(0);
-   resolutionLegend.AddEntry(&resolutionX, "X resolution", "lp");
-   resolutionLegend.AddEntry(&resolutionY, "Y resolution", "lp");
-   resolutionLegend.Draw();
-
-   bottomPad.cd();
    TMultiGraph efficiencyGraph;
-   efficiencyGraph.SetTitle(";Voltage [V];Efficiency [%]");
+   efficiencyGraph.SetTitle(
+       Form("%s - %s;Voltage [V];Efficiency [%%]",
+            detectorName.c_str(), gasLabel.c_str()));
    efficiencyGraph.Add(&efficiencyX, "LP");
    efficiencyGraph.Add(&efficiencyY, "LP");
    efficiencyGraph.Add(&efficiency2D, "LP");
@@ -513,20 +513,71 @@ void PlotDUTRunSummary() {
    efficiencyGraph.GetXaxis()->SetLimits(voltageMinimum, voltageMaximum);
    efficiencyGraph.SetMinimum(efficiencyMinimum);
    efficiencyGraph.SetMaximum(efficiencyMaximum);
-   efficiencyGraph.GetXaxis()->SetTitleSize(0.065);
-   efficiencyGraph.GetXaxis()->SetLabelSize(0.055);
-   efficiencyGraph.GetYaxis()->SetTitleSize(0.065);
-   efficiencyGraph.GetYaxis()->SetLabelSize(0.055);
-   efficiencyGraph.GetYaxis()->SetTitleOffset(0.82);
-   TLegend efficiencyLegend(0.68, 0.66, 0.93, 0.89);
-   efficiencyLegend.SetBorderSize(0);
-   efficiencyLegend.SetFillStyle(0);
-   efficiencyLegend.AddEntry(&efficiencyX, "X efficiency", "lp");
-   efficiencyLegend.AddEntry(&efficiencyY, "Y efficiency", "lp");
-   efficiencyLegend.AddEntry(&efficiency2D, "2D efficiency", "lp");
-   efficiencyLegend.Draw();
+   constexpr int axisFont = 42;
+   constexpr double axisLabelSize = 0.038;
+   constexpr double axisTitleSize = 0.043;
+   efficiencyGraph.GetXaxis()->SetLabelFont(axisFont);
+   efficiencyGraph.GetXaxis()->SetTitleFont(axisFont);
+   efficiencyGraph.GetYaxis()->SetLabelFont(axisFont);
+   efficiencyGraph.GetYaxis()->SetTitleFont(axisFont);
+   efficiencyGraph.GetXaxis()->SetLabelSize(axisLabelSize);
+   efficiencyGraph.GetXaxis()->SetTitleSize(axisTitleSize);
+   efficiencyGraph.GetYaxis()->SetLabelSize(axisLabelSize);
+   efficiencyGraph.GetYaxis()->SetTitleSize(axisTitleSize);
+   efficiencyGraph.GetYaxis()->SetTitleOffset(1.15);
 
-   canvas.cd();
+   TGraphErrors scaledResolutionX(points), scaledResolutionY(points);
+   scaledResolutionX.SetName("resolutionXScaled");
+   scaledResolutionY.SetName("resolutionYScaled");
+   StyleGraph(scaledResolutionX, kBlue + 1, 20);
+   StyleGraph(scaledResolutionY, kRed + 1, 21);
+   for (int point = 0; point < points; ++point) {
+      const auto scaleResolution = [&](double resolution) {
+         return efficiencyMinimum +
+                (resolution - resolutionMinimum) /
+                    (resolutionMaximum - resolutionMinimum) *
+                    (efficiencyMaximum - efficiencyMinimum);
+      };
+      const double errorScale =
+          (efficiencyMaximum - efficiencyMinimum) /
+          (resolutionMaximum - resolutionMinimum);
+      scaledResolutionX.SetPoint(
+          point, resolutionX.GetPointX(point),
+          scaleResolution(resolutionX.GetPointY(point)));
+      scaledResolutionX.SetPointError(
+          point, 0.0, resolutionX.GetErrorY(point) * errorScale);
+      scaledResolutionY.SetPoint(
+          point, resolutionY.GetPointX(point),
+          scaleResolution(resolutionY.GetPointY(point)));
+      scaledResolutionY.SetPointError(
+          point, 0.0, resolutionY.GetErrorY(point) * errorScale);
+   }
+   scaledResolutionX.Draw("PL SAME");
+   scaledResolutionY.Draw("PL SAME");
+
+   TGaxis resolutionAxis(
+       voltageMaximum, efficiencyMinimum, voltageMaximum, efficiencyMaximum,
+       resolutionMinimum, resolutionMaximum, 510, "+L");
+   resolutionAxis.SetName("resolutionAxis");
+   resolutionAxis.SetTitle("Resolution [#mum]");
+   resolutionAxis.SetLabelFont(axisFont);
+   resolutionAxis.SetTitleFont(axisFont);
+   resolutionAxis.SetLabelSize(axisLabelSize);
+   resolutionAxis.SetTitleSize(axisTitleSize);
+   resolutionAxis.SetTitleOffset(1.15);
+   resolutionAxis.Draw();
+
+   TLegend summaryLegend(0.15, 0.69, 0.57, 0.87);
+   summaryLegend.SetBorderSize(0);
+   summaryLegend.SetFillStyle(0);
+   summaryLegend.SetNColumns(2);
+   summaryLegend.AddEntry(&efficiencyX, "X efficiency", "lp");
+   summaryLegend.AddEntry(&scaledResolutionX, "X resolution", "lp");
+   summaryLegend.AddEntry(&efficiencyY, "Y efficiency", "lp");
+   summaryLegend.AddEntry(&scaledResolutionY, "Y resolution", "lp");
+   summaryLegend.AddEntry(&efficiency2D, "2D efficiency", "lp");
+   summaryLegend.Draw();
+
    canvas.Modified();
    canvas.Update();
 
@@ -582,4 +633,11 @@ void PlotDUTRunSummary() {
 
    std::printf("\n[PlotDUTRunSummary] Saved:\n  %s.root\n",
                outputBase.c_str());
+}
+
+void PlotDUTRunSummary() {
+   if (dataDirectories.empty())
+      throw std::runtime_error("dataDirectories must not be empty");
+   for (const auto& directory : dataDirectories)
+      PlotDUTRunSummaryForDirectory(directory);
 }

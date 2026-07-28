@@ -589,6 +589,11 @@ Result Analyze(const std::vector<Event>& events,
     const auto eventWeighted = Calculate(
         efficiency, k2D, config.minEntriesPerBin);
     result.eligibleEvents = eventWeighted.total;
+    result.matchedEvents = eventWeighted.passed;
+    result.eventWeightedX = Calculate(
+        efficiency, kX, config.minEntriesPerBin).value;
+    result.eventWeightedY = Calculate(
+        efficiency, kY, config.minEntriesPerBin).value;
     result.eventWeighted2D = eventWeighted.value;
     result.nonuniformityX = CalculateNonuniformity(
         efficiency, kX, config.minEntriesPerBin).value;

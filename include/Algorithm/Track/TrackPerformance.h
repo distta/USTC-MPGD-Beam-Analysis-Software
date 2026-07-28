@@ -16,6 +16,16 @@ namespace Tracking {
 
 class PerformanceAnalyzer {
    public:
+    struct Summary {
+        double unbiasedResidualX{};
+        double unbiasedResidualY{};
+        double hitResolutionX{};
+        double hitResolutionY{};
+        double angularResolutionX{};
+        double angularResolutionY{};
+        std::map<int, std::pair<double, double>> pointingResolution;
+    };
+
     PerformanceAnalyzer(TDirectory* output, std::vector<std::shared_ptr<Detector>> detectors,
                         std::vector<std::shared_ptr<Detector>> referenceDetectors,
                         const Config& config, double residualRange = 2.0);
@@ -23,6 +33,7 @@ class PerformanceAnalyzer {
     void RecordTrack(const Event& event, const Result& result);
     void Reset();
     std::pair<double, double> EstimateHitResolution();
+    Summary GetSummary();
     void Write();
 
    private:

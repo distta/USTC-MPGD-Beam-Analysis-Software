@@ -35,6 +35,9 @@ struct Config {
 
 struct Result {
     long long eligibleEvents = 0;
+    long long matchedEvents = 0;
+    double eventWeightedX = 0.0;
+    double eventWeightedY = 0.0;
     double eventWeighted2D = 0.0;
     double fake2D = 0.0;
     double nonuniformityX = 0.0;

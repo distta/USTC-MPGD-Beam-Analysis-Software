@@ -42,6 +42,39 @@ struct DetectorTrackSamples {
     AxisTrackSamples y;
 };
 
+struct DetectorAvailability {
+    size_t x{};
+    size_t y{};
+    size_t xy{};
+};
+
+void UpdateProgress(const string& label, Long64_t completed, Long64_t total,
+                    int& lastPercent) {
+    const int percent =
+        total > 0 ? static_cast<int>(100 * completed / total) : 100;
+    const int displayedPercent =
+        completed >= total ? 100 : (Terminal::Interactive() ? percent
+                                                            : 25 * (percent / 25));
+    if (displayedPercent == lastPercent) return;
+    lastPercent = displayedPercent;
+
+    constexpr int barWidth = 30;
+    const int filled = barWidth * displayedPercent / 100;
+    const string bar = string(filled, '=') +
+                       (filled < barWidth ? ">" : "") +
+                       string(max(0, barWidth - filled - (filled < barWidth)),
+                              ' ');
+    if (Terminal::Interactive()) Terminal::ClearProgress();
+    cout << (Terminal::Interactive() ? "\r" : "  ")
+         << Terminal::Accent(label) << " [" << Terminal::Success(bar) << "] "
+         << setw(3) << displayedPercent << "%  " << Terminal::Count(completed)
+         << '/' << Terminal::Count(total);
+    if (completed >= total || !Terminal::Interactive())
+        cout << '\n';
+    else
+        cout << flush;
+}
+
 pair<int, int> FindPlanarAxisTypes(const Detector& detector) {
     const auto* config = detector.GetPlanarConfig();
     if (!config) return {-1, -1};
@@ -246,16 +279,10 @@ void TrackAnalysisScript::LoadConfig(const json& config) {
 }
 
 void TrackAnalysisScript::Print() const {
-    if (Terminal::Verbose()) {
-        Terminal::Detail(
-            "single-hit calibration · multi-hit reconstruction · alignment " +
-            string(m_runAlignment ? "on" : "off") +
-            " · estimated resolution " +
-            string(m_useEstimatedResolution ? "on" : "off"));
-    }
 }
 
 bool TrackAnalysisScript::Execute() {
+    const auto analysisStarted = chrono::steady_clock::now();
     auto parser = GetParser();
     if (!parser) {
         cerr << "[TrackAnalysis] parser not set\n";
@@ -286,25 +313,27 @@ bool TrackAnalysisScript::Execute() {
 
     vector<Event> calibrationEvents;
     calibrationEvents.reserve(total);
+    int calibrationProgress = -1;
     for (Long64_t i = 0; i < total; ++i) {
         auto event = loadEvent(i);
-        if (!event) continue;
-        bool singleHitOnEveryTracker = true;
-        for (const auto& detector : trackers) {
-            if (event->detectorFramesMap.at(detector->GetID())->LocalHits().size() != 1) {
-                singleHitOnEveryTracker = false;
-                break;
+        if (event) {
+            bool singleHitOnEveryTracker = true;
+            for (const auto& detector : trackers) {
+                if (event->detectorFramesMap.at(detector->GetID())
+                        ->LocalHits()
+                        .size() != 1) {
+                    singleHitOnEveryTracker = false;
+                    break;
+                }
             }
+            if (singleHitOnEveryTracker)
+                calibrationEvents.push_back(std::move(*event));
         }
-        if (!singleHitOnEveryTracker) continue;
-        calibrationEvents.push_back(std::move(*event));
+        UpdateProgress("Calibration scan", i + 1, total, calibrationProgress);
     }
-    if (Terminal::Verbose()) {
-        Terminal::Detail("calibration " +
-                         Terminal::Count(calibrationEvents.size()) + "/" +
-                         Terminal::Count(total) + " events");
-    }
+    UpdateProgress("Calibration scan", total, total, calibrationProgress);
     if (calibrationEvents.empty()) return false;
+    const size_t calibrationEventCount = calibrationEvents.size();
 
     Tracking::Reconstructor calibrationReconstructor(trackers, m_tracking);
     if (m_runAlignment) {
@@ -376,14 +405,6 @@ bool TrackAnalysisScript::Execute() {
         if (estimatedX > 0.0 && estimatedY > 0.0) {
             m_tracking.resolutionX = estimatedX;
             m_tracking.resolutionY = estimatedY;
-            if (Terminal::Verbose()) {
-                ostringstream estimate;
-                estimate << fixed << setprecision(1)
-                         << "estimated hit resolution "
-                         << 1000.0 * estimatedX << " × "
-                         << 1000.0 * estimatedY << " µm";
-                Terminal::Detail(estimate.str());
-            }
         } else {
             cerr << "[TrackAnalysis] hit-resolution fit failed; using configured resolution\n";
         }
@@ -397,7 +418,9 @@ bool TrackAnalysisScript::Execute() {
     Tracking::Reconstructor reconstructor(trackers, m_tracking);
 
     map<int, DetectorTrackSamples> trackHitSamples;
+    map<int, DetectorAvailability> availability;
     for (const auto& detector : trackers) {
+        availability.emplace(detector->GetID(), DetectorAvailability{});
         const auto [typeX, typeY] = FindPlanarAxisTypes(*detector);
         if (typeX < 0 || typeY < 0) {
             cerr << "[TrackAnalysis] detector " << detector->GetID()
@@ -410,20 +433,43 @@ bool TrackAnalysisScript::Execute() {
             DetectorTrackSamples{.typeX = typeX, .typeY = typeY});
     }
 
-    size_t savedTracks = 0, trackedEvents = 0, analyzedEvents = 0, multiHitEvents = 0;
+    size_t savedTracks = 0, trackedEvents = 0;
+    size_t requiredDataEvents = 0, singleTrackEvents = 0, multiTrackEvents = 0;
+    int reconstructionProgress = -1;
     for (Long64_t i = 0; i < total; ++i) {
         auto loaded = loadEvent(i);
-        if (!loaded) continue;
+        if (!loaded) {
+            UpdateProgress("Track reconstruction", i + 1, total,
+                           reconstructionProgress);
+            continue;
+        }
         auto& event = *loaded;
-        ++analyzedEvents;
-        const bool hasMultipleHits = any_of(
-            trackers.begin(), trackers.end(), [&](const auto& detector) {
-                return event.detectorFramesMap.at(detector->GetID())->LocalHits().size() > 1;
-            });
-        if (hasMultipleHits) ++multiHitEvents;
+        bool hasAllRequiredData = true;
+        for (const auto& detector : trackers) {
+            const int id = detector->GetID();
+            const auto types = FindPlanarAxisTypes(*detector);
+            bool hasX = false, hasY = false;
+            for (const auto& cluster :
+                 event.detectorFramesMap.at(id)->Clusters()) {
+                hasX = hasX || cluster.type == types.first;
+                hasY = hasY || cluster.type == types.second;
+            }
+            auto& counts = availability[id];
+            if (hasX) ++counts.x;
+            if (hasY) ++counts.y;
+            if (hasX && hasY) ++counts.xy;
+            hasAllRequiredData = hasAllRequiredData && hasX && hasY;
+        }
+        if (hasAllRequiredData) ++requiredDataEvents;
         const ULong64_t currentRawEventID = parser->GetCurrentEventID();
         auto results = reconstructor.Reconstruct(event);
-        if (!results.empty()) ++trackedEvents;
+        if (!results.empty()) {
+            ++trackedEvents;
+            if (results.size() == 1)
+                ++singleTrackEvents;
+            else
+                ++multiTrackEvents;
+        }
         for (size_t resultIndex = 0; resultIndex < results.size(); ++resultIndex) {
             const auto& result = results[resultIndex];
             eventID = event.eventID;
@@ -491,41 +537,155 @@ bool TrackAnalysisScript::Execute() {
                 validation->Fill();
             }
         }
+        UpdateProgress("Track reconstruction", i + 1, total,
+                       reconstructionProgress);
     }
-    ostringstream trackingSummary;
-    const double trackedFraction =
-        analyzedEvents > 0
-            ? 100.0 * static_cast<double>(trackedEvents) / analyzedEvents
-            : 0.0;
-    trackingSummary << Terminal::Count(trackedEvents) << '/'
-                    << Terminal::Count(analyzedEvents) << " events ("
-                    << fixed << setprecision(1) << trackedFraction
-                    << "%) · " << Terminal::Count(savedTracks) << " tracks";
-    Terminal::Detail(trackingSummary.str());
+    UpdateProgress("Track reconstruction", total, total,
+                   reconstructionProgress);
     output->cd();
     tracksTree.Write();
     if (validation) validation->Write();
-    if (performance && m_performanceHistograms) performance->Write();
-    WriteTrackHitDistributions(*output, trackers, trackHitSamples);
-    if (Terminal::Verbose()) {
-        for (const auto& detector : trackers) {
-            const auto sampleIt = trackHitSamples.find(detector->GetID());
-            if (sampleIt == trackHitSamples.end()) continue;
-            const auto& samples = sampleIt->second;
-            ostringstream detail;
-            detail << "tracker " << detector->GetID()
-                   << " clusters X/Y "
-                   << Terminal::Count(samples.x.clusterSize.size()) << '/'
-                   << Terminal::Count(samples.y.clusterSize.size())
-                   << " · hits X/Y "
-                   << Terminal::Count(samples.x.hitADC.size()) << '/'
-                   << Terminal::Count(samples.y.hitADC.size());
-            Terminal::Detail(Terminal::Muted(detail.str()));
-        }
+    Tracking::PerformanceAnalyzer::Summary performanceSummary;
+    if (performance && m_performanceHistograms) {
+        performanceSummary = performance->GetSummary();
+        performance->Write();
     }
+    WriteTrackHitDistributions(*output, trackers, trackHitSamples);
     tracksTree.SetDirectory(nullptr);
     if (validation) validation->SetDirectory(nullptr);
     output->Close();
+
+    const auto mean = [](const auto& values) {
+        if (values.empty()) return 0.0;
+        double sum = 0.0;
+        for (const auto value : values) sum += value;
+        return sum / static_cast<double>(values.size());
+    };
+    const auto count = [](size_t value) { return Terminal::Count(value); };
+    const auto row = [](const string& label, const string& value) {
+        cout << "  " << left << setw(47) << label << right << setw(30)
+             << value << '\n';
+    };
+    const auto separator = [] {
+        cout << string(100, '-') << '\n';
+    };
+    const double calibrationFraction =
+        total > 0 ? 100.0 * calibrationEventCount / total : 0.0;
+    const double runtime =
+        chrono::duration<double>(chrono::steady_clock::now() - analysisStarted)
+            .count();
+
+    cout << string(100, '=') << '\n'
+         << Terminal::Accent("Configuration") << '\n';
+    row("Reconstruction mode", "multi-hit");
+    row("Single-hit calibration", "enabled");
+    row("Alignment", m_runAlignment ? "enabled" : "disabled");
+    row("Resolution estimation",
+        m_useEstimatedResolution ? "enabled" : "disabled");
+    row("Tracker planes", to_string(trackers.size()));
+    {
+        ostringstream value;
+        value << "chi2/ndf < " << fixed << setprecision(1)
+              << m_tracking.maxChi2Ndf;
+        row("Track quality cut", value.str());
+    }
+    separator();
+    cout << Terminal::Accent("Input and Event Availability") << '\n';
+    row("Raw events", count(total));
+    cout << '\n';
+    for (const auto& detector : trackers) {
+        const auto& counts = availability.at(detector->GetID());
+        cout << "  " << detector->GetName() << '\n';
+        row("  X available events", count(counts.x));
+        row("  Y available events", count(counts.y));
+        row("  X/Y available events", count(counts.xy));
+        cout << '\n';
+    }
+    row("All required tracker data available", count(requiredDataEvents));
+    row("Events unavailable for reconstruction",
+        count(static_cast<size_t>(total) - requiredDataEvents));
+    separator();
+    cout << Terminal::Accent("Single-hit Calibration") << '\n';
+    {
+        ostringstream value;
+        value << count(calibrationEventCount) << " / " << count(total)
+              << "  (" << fixed << setprecision(2) << calibrationFraction
+              << "%)";
+        row("Calibration sample", value.str());
+    }
+    cout << "\n  Estimated single-plane hit resolution\n";
+    {
+        ostringstream x, y;
+        x << fixed << setprecision(1) << 1000.0 * m_tracking.resolutionX
+          << " um";
+        y << fixed << setprecision(1) << 1000.0 * m_tracking.resolutionY
+          << " um";
+        row("  X", x.str());
+        row("  Y", y.str());
+    }
+    separator();
+    cout << Terminal::Accent("Reconstruction Result") << '\n';
+    row("Events with reconstructed tracks", count(trackedEvents));
+    row("Single-track events", count(singleTrackEvents));
+    row("Multi-track events", count(multiTrackEvents));
+    row("Reconstructed tracks", count(savedTracks));
+    separator();
+    cout << Terminal::Accent("Tracker Statistics") << '\n'
+         << "  Detector      Mean cluster size X/Y       Mean hit ADC X/Y\n";
+    for (const auto& detector : trackers) {
+        const auto sampleIt = trackHitSamples.find(detector->GetID());
+        if (sampleIt == trackHitSamples.end()) {
+            cout << "  " << left << setw(14) << detector->GetName()
+                 << right << setw(33) << "n/a / n/a" << setw(25)
+                 << "n/a / n/a" << '\n';
+            continue;
+        }
+        const auto& samples = sampleIt->second;
+        cout << "  " << left << setw(14) << detector->GetName() << right
+             << fixed << setprecision(2) << setw(9) << mean(samples.x.clusterSize)
+             << " / " << setw(6) << mean(samples.y.clusterSize) << setw(14)
+             << mean(samples.x.hitADC) << " / " << setw(8)
+             << mean(samples.y.hitADC) << '\n';
+    }
+    separator();
+    cout << Terminal::Accent("Spatial Performance") << '\n'
+         << "  " << left << setw(45) << "Quantity" << right << setw(13) << "X"
+         << setw(18) << "Y" << '\n';
+    const auto spatialRow = [&](const string& label, double x, double y,
+                                double scale, const string& unit) {
+        ostringstream xValue, yValue;
+        xValue << fixed << setprecision(2) << x * scale << ' ' << unit;
+        yValue << fixed << setprecision(2) << y * scale << ' ' << unit;
+        cout << "  " << left << setw(45) << label << right << setw(13)
+             << xValue.str() << setw(18) << yValue.str() << '\n';
+    };
+    spatialRow("Telescope unbiased residual sigma",
+               performanceSummary.unbiasedResidualX,
+               performanceSummary.unbiasedResidualY, 1000.0, "um");
+    spatialRow("Estimated single-plane hit resolution",
+               performanceSummary.hitResolutionX,
+               performanceSummary.hitResolutionY, 1000.0, "um");
+    for (const auto& detector :
+         DetectorFactory::GetInstance().GetDetectorsByRole(Detector::Role::DUT)) {
+        const auto it =
+            performanceSummary.pointingResolution.find(detector->GetID());
+        if (it != performanceSummary.pointingResolution.end())
+            spatialRow("Pointing resolution at DUT" +
+                           to_string(detector->GetID()),
+                       it->second.first, it->second.second, 1000.0, "um");
+    }
+    spatialRow("Track angular resolution",
+               performanceSummary.angularResolutionX,
+               performanceSummary.angularResolutionY, 1.0e6, "urad");
+    separator();
+    cout << Terminal::Accent("Status") << '\n';
+    row(Terminal::Success("[PASS] Track Analysis completed"), "");
+    {
+        ostringstream value;
+        value << fixed << setprecision(1) << runtime << " s";
+        row("Runtime", value.str());
+    }
+    cout << string(100, '=') << '\n';
     return true;
 }
 

@@ -19,9 +19,7 @@ inline bool& ColorOverrideFlag() {
     return enabled;
 }
 
-inline void SetVerbose(bool enabled) { VerboseFlag() = enabled; }
 inline bool Verbose() { return VerboseFlag(); }
-inline void SetColor(bool enabled) { ColorOverrideFlag() = enabled; }
 
 inline bool Interactive() {
     static const bool interactive = ::isatty(STDOUT_FILENO) != 0;

@@ -36,7 +36,7 @@ constexpr int kExecutionError = 6;
 
 void PrintUsage() {
    std::cout << "Usage:\n"
-             << "  ./BeamAnalysis [--verbose] [--no-color] <base_dir> <run_id>\n\n"
+             << "  ./BeamAnalysis <base_dir> <run_id>\n\n"
              << "Example:\n"
              << "  ./BeamAnalysis /data/beam 1591\n";
 }
@@ -262,7 +262,14 @@ bool RunAnalysis(const json& config,
       const std::string name = scriptConfig["name"].get<std::string>();
       const std::string type = scriptConfig["type"].get<std::string>();
       const auto started = std::chrono::steady_clock::now();
-      Terminal::StageStart(stageOffset + index + 1, totalStages, name);
+      std::string stageName = name;
+      if (type == "DUTAnalysis" || type == "PadDUTAnalysis") {
+         const auto duts = DetectorFactory::GetInstance().GetDetectorsByRole(
+             Detector::Role::DUT);
+         if (duts.size() == 1)
+            stageName += " — DUT" + std::to_string(duts.front()->GetID());
+      }
+      Terminal::StageStart(stageOffset + index + 1, totalStages, stageName);
 
       std::shared_ptr<IScript> script;
       bool finalizeAttempted = false;
@@ -327,7 +334,10 @@ bool RunAnalysis(const json& config,
                    << "s: " << scriptError << '\n';
          return false;
       }
-      Terminal::StageDone(elapsedSeconds);
+      // These analyses print their own full status and runtime tables.
+      if (type != "TrackAnalysis" && type != "DUTAnalysis" &&
+          type != "PadDUTAnalysis")
+         Terminal::StageDone(elapsedSeconds);
    }
    return true;
 }
@@ -354,33 +364,14 @@ int main(int argc, char* argv[]) {
       return 0;
    }
 
-   bool verbose = false;
-   bool color = true;
-   std::vector<std::string> positional;
-   for (int index = 1; index < argc; ++index) {
-      const std::string argument = argv[index];
-      if (argument == "--verbose" || argument == "-v") {
-         verbose = true;
-      } else if (argument == "--no-color") {
-         color = false;
-      } else if (!argument.empty() && argument.front() == '-') {
-         std::cerr << "Unknown option: " << argument << '\n';
-         PrintUsage();
-         return kUsageError;
-      } else {
-         positional.push_back(argument);
-      }
-   }
-   if (positional.size() != 2) {
+   if (argc != 3) {
       PrintUsage();
       return kUsageError;
    }
 
-   Terminal::SetVerbose(verbose);
-   Terminal::SetColor(color);
    gErrorIgnoreLevel = kWarning;
 
-   const std::string runID = positional[1];
+   const std::string runID = argv[2];
    if (runID.empty() ||
        !std::all_of(runID.begin(), runID.end(),
                     [](unsigned char c) { return std::isdigit(c); })) {
@@ -391,7 +382,7 @@ int main(int argc, char* argv[]) {
 
    const auto runStarted = std::chrono::steady_clock::now();
 
-   const fs::path baseDir = fs::absolute(positional[0]).lexically_normal();
+   const fs::path baseDir = fs::absolute(argv[1]).lexically_normal();
    const fs::path rawDirectory = baseDir / "raw";
    const fs::path rootConfigFile = baseDir / "config.json";
    const fs::path rawConfigFile = rawDirectory / "config.json";

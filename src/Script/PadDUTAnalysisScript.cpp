@@ -1298,34 +1298,10 @@ void PadDUTAnalysisScript::LoadConfig(const json& config) {
 }
 
 void PadDUTAnalysisScript::Print() const {
-    if (!Terminal::Verbose()) return;
-    std::cout << "PadDUTAnalysisScript Configuration:\n"
-              << "  Run Alignment: " << (m_runAlignment ? "Yes" : "No") << '\n'
-              << "  Alignment Parameters:";
-    if (m_alignment.parameters.empty()) {
-        std::cout << " none";
-    } else {
-        for (const auto& parameter : m_alignment.parameters) {
-            std::cout << ' ' << parameter;
-        }
-    }
-    std::cout << '\n'
-              << "  Alignment Min Matches: " << m_alignment.minMatches << '\n'
-              << "  Alignment Max Passes: " << m_alignment.maxPasses << '\n'
-              << "  Cluster Match: track inside cluster envelope + margin\n"
-              << "  Efficiency X: [" << m_effXMin << ", " << m_effXMax
-              << "] mm, bins=" << m_effXBins << '\n'
-              << "  Efficiency Y: [" << m_effYMin << ", " << m_effYMax
-              << "] mm, bins=" << m_effYBins << '\n'
-              << "  Pad Envelope Margin: " << m_margin << " mm\n"
-              << "  Fake Efficiency: "
-              << (m_enableFakeEfficiency ? "enabled" : "disabled") << '\n'
-              << "  Max Events: "
-              << (m_maxEvents > 0 ? std::to_string(m_maxEvents) : "All")
-              << '\n';
 }
 
 bool PadDUTAnalysisScript::Execute() {
+    const auto analysisStarted = std::chrono::steady_clock::now();
     auto parser = GetParser();
     if (!parser) {
         std::cerr << "[PadDUTAnalysis] Parser is not set\n";
@@ -1477,6 +1453,8 @@ bool PadDUTAnalysisScript::Execute() {
         std::vector<double> matchedClusterCharges;
         std::vector<int> matchedClusterSizes;
         std::vector<double> matchedHitADCs;
+        std::vector<int> eligibleMatchedClusterSizes;
+        std::vector<double> eligibleMatchedHitADCs;
         TH2D reconstructedHitMap(
             "hReconstructedHitMap",
             "All reconstructed DUT hits;Reconstructed X [mm];Reconstructed Y [mm]",
@@ -1508,6 +1486,11 @@ bool PadDUTAnalysisScript::Execute() {
                 detector->CalcHitFromTrack(event.track));
             predX = predicted.X();
             predY = predicted.Y();
+            const int flatBin = FindFlatBin(
+                predX, predY,
+                m_effXMin, m_effXMax, m_effXBins,
+                m_effYMin, m_effYMax, m_effYBins,
+                m_effExcludedXBins, m_effExcludedYBins);
             const auto frameIt = event.detectorFramesMap.find(dutID);
             if (frameIt != event.detectorFramesMap.end()) {
                 const auto& frame = *frameIt->second;
@@ -1534,6 +1517,9 @@ bool PadDUTAnalysisScript::Execute() {
                     if (std::isfinite(selectedCluster.charge))
                         matchedClusterCharges.push_back(selectedCluster.charge);
                     matchedClusterSizes.push_back(selectedCluster.size);
+                    if (flatBin >= 0)
+                        eligibleMatchedClusterSizes.push_back(
+                            selectedCluster.size);
                     matchedHitMap.Fill(hitX, hitY);
                     for (int index : selectedCluster.channelHitIndices) {
                         if (index >= 0 &&
@@ -1542,8 +1528,12 @@ bool PadDUTAnalysisScript::Execute() {
                                 channelHits[static_cast<size_t>(index)];
                             selectedChannelHits.push_back(selectedHit);
                             if (selectedHit.isValid &&
-                                std::isfinite(selectedHit.amp))
+                                std::isfinite(selectedHit.amp)) {
                                 matchedHitADCs.push_back(selectedHit.amp);
+                                if (flatBin >= 0)
+                                    eligibleMatchedHitADCs.push_back(
+                                        selectedHit.amp);
+                            }
                         }
                     }
                     residualsX.push_back(resX);
@@ -1552,11 +1542,6 @@ bool PadDUTAnalysisScript::Execute() {
                         {predX, predY, resX, resY});
                 }
 
-                const int flatBin = FindFlatBin(
-                    predX, predY,
-                    m_effXMin, m_effXMax, m_effXBins,
-                    m_effYMin, m_effYMax, m_effYBins,
-                    m_effExcludedXBins, m_effExcludedYBins);
                 if (flatBin >= 0) {
                     EfficiencySample sample;
                     sample.eventID = eventID;
@@ -1687,26 +1672,123 @@ bool PadDUTAnalysisScript::Execute() {
             efficiency, kY, m_effMinEntriesPerBin);
         const auto efficiency2D = EstimateEfficiency(
             efficiency, k2D, m_effMinEntriesPerBin);
-        std::ostringstream summary;
-        summary << "DUT" << dutID << " · "
-                << Terminal::Count(matchedClusterSizes.size()) << '/'
-                << Terminal::Count(efficiency2D.total) << " matched · "
-                << std::fixed << std::setprecision(2)
-                << "efficiency " << 100.0 * efficiency2D.value << "% · "
-                << std::setprecision(3)
-                << "fake " << 100.0 * fake2D.value << "% · "
-                << std::setprecision(2)
-                << "σ68 " << resultX.sigma68 << " × "
-                << resultY.sigma68 << " mm";
-        Terminal::Detail(summary.str());
-        if (Terminal::Verbose()) {
-            std::ostringstream axes;
-            axes << std::fixed << std::setprecision(2)
-                 << "DUT" << dutID << " efficiency X/Y "
-                 << 100.0 * efficiencyX.value << "% / "
-                 << 100.0 * efficiencyY.value << '%';
-            Terminal::Detail(Terminal::Muted(axes.str()));
+        const auto mean = [](const auto& values) {
+            if (values.empty()) return 0.0;
+            return std::accumulate(values.begin(), values.end(), 0.0) /
+                   static_cast<double>(values.size());
+        };
+        const auto row = [](const std::string& label,
+                            const std::string& value) {
+            std::cout << "  " << std::left << std::setw(38) << label
+                      << std::right << std::setw(39) << value << '\n';
+        };
+        const auto separator = [] {
+            std::cout << std::string(100, '-') << '\n';
+        };
+        const auto fixedValue = [](double value, int precision,
+                                   const std::string& suffix = "") {
+            std::ostringstream text;
+            text << std::fixed << std::setprecision(precision) << value
+                 << suffix;
+            return text.str();
+        };
+        std::ostringstream parameters;
+        for (size_t index = 0; index < m_alignment.parameters.size(); ++index) {
+            if (index) parameters << ", ";
+            parameters << m_alignment.parameters[index];
         }
+        const double efficiencyError =
+            efficiency2D.total > 0
+                ? 100.0 * std::sqrt(
+                              efficiency2D.value *
+                              (1.0 - efficiency2D.value) /
+                              static_cast<double>(efficiency2D.total))
+                : 0.0;
+        const double runtime = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() -
+                                   analysisStarted)
+                                   .count();
+
+        std::cout << std::string(100, '=') << '\n'
+                  << Terminal::Accent("Configuration") << '\n';
+        row("Detector", detector->GetName());
+        row("Detector ID", std::to_string(dutID));
+        row("Detector type", "planar_pad");
+        row("Alignment", m_runAlignment ? "enabled" : "disabled");
+        row("Alignment parameters",
+            parameters.str().empty() ? "none" : parameters.str());
+        row("Matching method", "track inside cluster envelope");
+        row("Matching margin", fixedValue(m_margin, 2, " mm"));
+        row("Fiducial region X",
+            "[" + fixedValue(m_effXMin, 1) + ", " +
+                fixedValue(m_effXMax, 1) + "] mm");
+        row("Fiducial region Y",
+            "[" + fixedValue(m_effYMin, 1) + ", " +
+                fixedValue(m_effYMax, 1) + "] mm");
+        row("Efficiency bins", std::to_string(m_effXBins) + " x " +
+                                   std::to_string(m_effYBins));
+        row("Fake-efficiency estimation",
+            m_enableFakeEfficiency ? "enabled" : "disabled");
+        separator();
+        std::cout << Terminal::Accent("Input") << '\n';
+        row("Reconstructed events",
+            Terminal::Count(trackMultiplicity.size()));
+        row("Reconstructed tracks",
+            Terminal::Count(trackTree->GetEntries()));
+        row("Tracks inside fiducial region",
+            Terminal::Count(efficiency2D.total));
+        separator();
+        std::cout << Terminal::Accent("DUT Response") << '\n';
+        row("Reconstructed clusters",
+            Terminal::Count(eligibleMatchedClusterSizes.size()));
+        row("Channel hits", Terminal::Count(eligibleMatchedHitADCs.size()));
+        row("Mean cluster size",
+            fixedValue(mean(eligibleMatchedClusterSizes), 3, " pads"));
+        row("Mean hit ADC", fixedValue(mean(eligibleMatchedHitADCs), 2));
+        separator();
+        std::cout << Terminal::Accent("Efficiency") << '\n';
+        row("Matched tracks", Terminal::Count(efficiency2D.passed));
+        row("Eligible tracks", Terminal::Count(efficiency2D.total));
+        {
+            std::ostringstream value;
+            value << Terminal::Count(efficiency2D.passed) << " / "
+                  << Terminal::Count(efficiency2D.total) << " = "
+                  << std::fixed << std::setprecision(2)
+                  << 100.0 * efficiency2D.value << " ± "
+                  << efficiencyError << '%';
+            row("Overall efficiency", value.str());
+        }
+        row("Efficiency X",
+            fixedValue(100.0 * efficiencyX.value, 2, "%"));
+        row("Efficiency Y",
+            fixedValue(100.0 * efficiencyY.value, 2, "%"));
+        row("Fake-match probability",
+            fixedValue(100.0 * fake2D.value, 3, "%"));
+        separator();
+        std::cout << Terminal::Accent("Spatial Performance") << '\n'
+                  << "  " << std::left << std::setw(38) << "Quantity"
+                  << std::right << std::setw(19) << "X" << std::setw(20)
+                  << "Y" << '\n';
+        const auto spatialRow = [](const std::string& label, double x,
+                                   double y, const std::string& unit) {
+            std::ostringstream xValue, yValue;
+            xValue << std::fixed << std::setprecision(2) << x << ' ' << unit;
+            yValue << std::fixed << std::setprecision(2) << y << ' ' << unit;
+            std::cout << "  " << std::left << std::setw(38) << label
+                      << std::right << std::setw(19) << xValue.str()
+                      << std::setw(20) << yValue.str() << '\n';
+        };
+        spatialRow("Residual mean", 1000.0 * resultX.mean,
+                   1000.0 * resultY.mean, "um");
+        spatialRow("Residual sigma68", 1000.0 * resultX.sigma68,
+                   1000.0 * resultY.sigma68, "um");
+        spatialRow("Residual RMS", 1000.0 * resultX.rms,
+                   1000.0 * resultY.rms, "um");
+        separator();
+        std::cout << Terminal::Accent("Status") << '\n';
+        row(Terminal::Success("[PASS] DUT Analysis completed"), "");
+        row("Runtime", fixedValue(runtime, 1, " s"));
+        std::cout << std::string(100, '=') << '\n';
     }
 
     outputFile.cd();

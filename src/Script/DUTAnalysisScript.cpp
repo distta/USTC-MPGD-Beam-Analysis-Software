@@ -1,4 +1,5 @@
 #include "Script/DUTAnalysisScript.h"
+#include "Terminal.h"
 #include "Algorithm/AnalysisUtils.h"
 #include "Detector/DetectorFactory.h"
 #include "Event/DataModel.h"
@@ -64,6 +65,7 @@ struct ResidualAnalysisResult {
    double sigmaFit = 0;
    double sigmaFitError = 0;
    double mean = 0;
+   double rms = 0;
    double efficiency = 0;  // valid reconstruction / total events
    double eff3S = 0;
    double eff5S = 0;
@@ -418,31 +420,6 @@ void DUTAnalysisScript::LoadConfig(const json& config) {
 }
 
 void DUTAnalysisScript::Print() const {
-   cout << "DUTAnalysisScript Configuration:" << endl;
-   cout << "  Run Alignment: " << (m_runAlignment ? "Yes" : "No") << endl;
-   cout << "  Efficiency Region X: [" << m_effXMin << ", " << m_effXMax << "] mm, bins=" << m_effXBins << endl;
-   cout << "  Efficiency Region Y: [" << m_effYMin << ", " << m_effYMax << "] mm, bins=" << m_effYBins << endl;
-   cout << "  Efficiency Minimum Entries/Bin: "
-        << m_effMinEntriesPerBin << endl;
-   cout << "  Efficiency Averaging: Event-weighted" << endl;
-   cout << "  Cluster Envelope Margin: "
-        << m_efficiencyConfig.margin << " mm" << endl;
-   cout << "  Fake Efficiency: "
-        << (m_efficiencyConfig.enableFakeEfficiency ? "enabled" : "disabled")
-        << ", random partners/event="
-        << m_efficiencyConfig.fakePartnersPerEvent << endl;
-   if (!m_effExcludedXBins.empty() || !m_effExcludedYBins.empty()) {
-      cout << "  Efficiency Excluded X bins:";
-      for (int bin : m_effExcludedXBins) cout << " " << bin;
-      if (m_effExcludedXBins.empty()) cout << " none";
-      cout << endl;
-      cout << "  Efficiency Excluded Y bins:";
-      for (int bin : m_effExcludedYBins) cout << " " << bin;
-      if (m_effExcludedYBins.empty()) cout << " none";
-      cout << endl;
-   }
-   cout << "  Progress Interval: " << m_progressInterval << endl;
-   cout << "  Max Events: " << (m_maxEvents > 0 ? to_string(m_maxEvents) : "All") << endl;
 }
 
 bool DUTAnalysisScript::Execute() {
@@ -460,8 +437,6 @@ bool DUTAnalysisScript::Execute() {
 
    // 加载track信息
    string trackFile = GetOutputDir() + "TrackInfo.root";
-   cout << "Loading track info..." << endl;
-   cout << "File: " << trackFile << endl;
 
    TFile* f = TFile::Open(trackFile.c_str(), "READ");
    if (!f || f->IsZombie()) {
@@ -505,14 +480,10 @@ bool DUTAnalysisScript::Execute() {
    trackTree->SetBranchAddress("track", &track);
    if (trackTree->GetBranch("t0")) trackTree->SetBranchAddress("t0", &sigTime);
 
-   cout << "\nProcessing DUT data..." << endl;
    std::vector<Event> events;  // Script本地数据
 
    int processed = 0;
 
-   cout << "[DUTAnalysis] track entries=" << totalTrackEntries
-        << ", unique events: " << tracksPerEvent.size()
-        << ", single-track events: " << singleTrackEvents << endl;
 
    const auto& duts = factory.GetDetectorsByRole(Detector::Role::DUT);
    const auto& trackers = factory.GetDetectorsByRole(Detector::Role::Tracker);
@@ -585,8 +556,7 @@ bool DUTAnalysisScript::Execute() {
       }
    }
    if (lastProgress != processed) printProgress(processed);
-   cout << "\n[DUTAnalysis] processed " << events.size()
-        << " single-track DUT events" << endl;
+   cout << '\n';
 
    // 运行DUT对齐
    if (m_runAlignment) {
@@ -595,7 +565,6 @@ bool DUTAnalysisScript::Execute() {
       }
    }
 
-   cout << "\nSaving DUT results..." << endl;
 
    // DUT数据分支
    Int_t dutID;
@@ -738,14 +707,12 @@ bool DUTAnalysisScript::Execute() {
    tDut->SetBranchAddress("resX", &resX);
    tDut->SetBranchAddress("resY", &resY);
 
-   printf("\n%-5s %8s %10s %10s %11s %10s %11s %11s %12s\n",
-          "DUT", "Events", "Xres[um]", "Yres[um]", "EventEff[%]",
-          "Fake2D[%]", "NonUniX[%]", "NonUniY[%]", "NonUni2D[%]");
-
    for (const auto& det : duts) {
       const int id = det->GetID();
       vector<double> residualsX, residualsY;
       vector<DUTAlignmentQAPoint> alignmentPoints;
+      vector<int> selectedClusterSizesX, selectedClusterSizesY;
+      vector<double> selectedHitADCsX, selectedHitADCsY;
       for (Long64_t entry = 0; entry < tDut->GetEntries(); ++entry) {
          tDut->GetEntry(entry);
          if (dutID != id) continue;
@@ -757,6 +724,18 @@ bool DUTAnalysisScript::Execute() {
                              resY != DUTAnalysisConfig::kInvalidValue;
          residualsX.push_back(resX);
          residualsY.push_back(resY);
+         if (clusterX.size > 0) {
+            selectedClusterSizesX.push_back(clusterX.size);
+            for (const auto& hit : channelHitsX)
+               if (hit.isValid && std::isfinite(hit.amp))
+                  selectedHitADCsX.push_back(hit.amp);
+         }
+         if (clusterY.size > 0) {
+            selectedClusterSizesY.push_back(clusterY.size);
+            for (const auto& hit : channelHitsY)
+               if (hit.isValid && std::isfinite(hit.amp))
+                  selectedHitADCsY.push_back(hit.amp);
+         }
          if (validX || validY) {
             alignmentPoints.push_back(
                 {predX, predY, hitX, hitY, resX, resY, validX, validY});
@@ -775,19 +754,120 @@ bool DUTAnalysisScript::Execute() {
       const auto timing = WriteDUTXYMeanTimeResolution(
           fDut, id, xyMeanTimesByDUT[id]);
 
-      printf("%-5d %8lld %10.1f %10.1f %11.3f %10.4f %11.3f %11.3f %12.3f\n",
-             id, efficiency.eligibleEvents,
-             1000.0 * resolutionX.sigmaFit, 1000.0 * resolutionY.sigmaFit,
-             100.0 * efficiency.eventWeighted2D,
-             100.0 * efficiency.fake2D,
-             100.0 * efficiency.nonuniformityX,
-             100.0 * efficiency.nonuniformityY,
-             100.0 * efficiency.nonuniformity2D);
-      cout << "[DUTAnalysis] DUT " << id
-           << " XYMean timing: entries=" << timing.entries
-           << ", mean=" << timing.mean << " ns, sigma="
-           << timing.sigma << " +/- " << timing.sigmaError
-           << " ns, sigma68=" << timing.sigma68 << " ns\n";
+      (void)timing;
+
+      const auto mean = [](const auto& values) {
+         if (values.empty()) return 0.0;
+         return std::accumulate(values.begin(), values.end(), 0.0) /
+                static_cast<double>(values.size());
+      };
+      const auto row = [](const string& label, const string& value) {
+         cout << "  " << left << setw(38) << label << right << setw(39)
+              << value << '\n';
+      };
+      const auto separator = [] { cout << string(100, '-') << '\n'; };
+      const auto fixedValue = [](double value, int precision,
+                                 const string& suffix = "") {
+         ostringstream text;
+         text << fixed << setprecision(precision) << value << suffix;
+         return text.str();
+      };
+      const double efficiencyError =
+          efficiency.eligibleEvents > 0
+              ? 100.0 * sqrt(efficiency.eventWeighted2D *
+                             (1.0 - efficiency.eventWeighted2D) /
+                             efficiency.eligibleEvents)
+              : 0.0;
+      const double runtime = chrono::duration<double>(
+                                 chrono::high_resolution_clock::now() - t0)
+                                 .count();
+      cout << string(100, '=') << '\n'
+           << Terminal::Accent("Configuration") << '\n';
+      row("Detector", det->GetName());
+      row("Detector ID", to_string(id));
+      row("Detector type",
+          det->GetPlanarPadConfig() ? "planar_pad" : "planar");
+      row("Alignment", m_runAlignment ? "enabled" : "disabled");
+      row("Alignment parameters", "dx, dy, dz, rotX, rotY, rotZ");
+      row("Matching method", "track inside cluster envelope");
+      row("Matching margin",
+          fixedValue(m_efficiencyConfig.margin, 2, " mm"));
+      row("Fiducial region X",
+          "[" + fixedValue(m_effXMin, 1) + ", " +
+              fixedValue(m_effXMax, 1) + "] mm");
+      row("Fiducial region Y",
+          "[" + fixedValue(m_effYMin, 1) + ", " +
+              fixedValue(m_effYMax, 1) + "] mm");
+      row("Efficiency bins",
+          to_string(m_effXBins) + " x " + to_string(m_effYBins));
+      row("Fake-efficiency estimation",
+          m_efficiencyConfig.enableFakeEfficiency ? "enabled" : "disabled");
+      separator();
+      cout << Terminal::Accent("Input") << '\n';
+      row("Reconstructed events", Terminal::Count(tracksPerEvent.size()));
+      row("Reconstructed tracks", Terminal::Count(totalTrackEntries));
+      row("Tracks inside fiducial region",
+          Terminal::Count(efficiency.eligibleEvents));
+      separator();
+      cout << Terminal::Accent("DUT Response") << '\n';
+      cout << "  " << left << setw(38) << "Quantity" << right << setw(19)
+           << "X" << setw(20) << "Y" << '\n';
+      const auto responseRow = [](const string& label, const string& x,
+                                  const string& y) {
+         cout << "  " << left << setw(38) << label << right << setw(19) << x
+              << setw(20) << y << '\n';
+      };
+      responseRow("Reconstructed clusters",
+                  Terminal::Count(selectedClusterSizesX.size()),
+                  Terminal::Count(selectedClusterSizesY.size()));
+      responseRow("Channel hits",
+                  Terminal::Count(selectedHitADCsX.size()),
+                  Terminal::Count(selectedHitADCsY.size()));
+      responseRow("Mean cluster size",
+                  fixedValue(mean(selectedClusterSizesX), 3, " strips"),
+                  fixedValue(mean(selectedClusterSizesY), 3, " strips"));
+      responseRow("Mean hit ADC",
+                  fixedValue(mean(selectedHitADCsX), 2),
+                  fixedValue(mean(selectedHitADCsY), 2));
+      separator();
+      cout << Terminal::Accent("Efficiency") << '\n';
+      row("Matched tracks", Terminal::Count(efficiency.matchedEvents));
+      row("Eligible tracks", Terminal::Count(efficiency.eligibleEvents));
+      {
+         ostringstream value;
+         value << Terminal::Count(efficiency.matchedEvents) << " / "
+               << Terminal::Count(efficiency.eligibleEvents) << " = "
+               << fixed << setprecision(2)
+               << 100.0 * efficiency.eventWeighted2D << " ± "
+               << efficiencyError << '%';
+         row("Overall efficiency", value.str());
+      }
+      row("Efficiency X",
+          fixedValue(100.0 * efficiency.eventWeightedX, 2, "%"));
+      row("Efficiency Y",
+          fixedValue(100.0 * efficiency.eventWeightedY, 2, "%"));
+      row("Fake-match probability",
+          fixedValue(100.0 * efficiency.fake2D, 3, "%"));
+      separator();
+      cout << Terminal::Accent("Spatial Performance") << '\n'
+           << "  " << left << setw(38) << "Quantity" << right << setw(19)
+           << "X" << setw(20) << "Y" << '\n';
+      const auto spatialRow = [](const string& label, double x, double y) {
+         ostringstream xValue, yValue;
+         xValue << fixed << setprecision(2) << 1000.0 * x << " um";
+         yValue << fixed << setprecision(2) << 1000.0 * y << " um";
+         cout << "  " << left << setw(38) << label << right << setw(19)
+              << xValue.str() << setw(20) << yValue.str() << '\n';
+      };
+      spatialRow("Residual mean", resolutionX.mean, resolutionY.mean);
+      spatialRow("Residual sigma68", resolutionX.sigma68,
+                 resolutionY.sigma68);
+      spatialRow("Residual RMS", resolutionX.rms, resolutionY.rms);
+      separator();
+      cout << Terminal::Accent("Status") << '\n';
+      row(Terminal::Success("[PASS] DUT Analysis completed"), "");
+      row("Runtime", fixedValue(runtime, 1, " s"));
+      cout << string(100, '=') << '\n';
    }
 
    fDut->Close();
@@ -795,14 +875,6 @@ bool DUTAnalysisScript::Execute() {
 
    f->Close();
    delete f;
-
-   cout << "DUT data saved to: " << dutFile << endl;
-
-   auto t1 = chrono::high_resolution_clock::now();
-   double sec = chrono::duration<double>(t1 - t0).count();
-
-   cout << "[DUTAnalysis] wrote DUTInfo.root in "
-        << fixed << setprecision(2) << sec << " s" << endl;
 
    return true;
 }
@@ -1216,6 +1288,7 @@ ResidualAnalysisResult AnalyzeResidualSequence(const std::vector<double>& rawRes
    result.sigmaFit = sigS;
    result.sigmaFitError = fSingle->GetParError(2);
    result.mean = muS;
+   result.rms = rms;
    result.efficiency = double(N) / totalEvents;
    result.eff3S = eff3S;
    result.eff5S = eff5S;

@@ -252,6 +252,57 @@ std::pair<double, double> PerformanceAnalyzer::EstimateHitResolution() {
     return {fitX.sigma, fitY.sigma};
 }
 
+PerformanceAnalyzer::Summary PerformanceAnalyzer::GetSummary() {
+    Summary summary;
+    const auto hitX = FitSingleGaussian(m_commonEquivalentHitX);
+    const auto hitY = FitSingleGaussian(m_commonEquivalentHitY);
+    summary.hitResolutionX = hitX.sigma;
+    summary.hitResolutionY = hitY.sigma;
+
+    TH1D combinedX("hSummaryUnbiasedResidualX", "", 240,
+                   m_commonEquivalentHitX->GetXaxis()->GetXmin(),
+                   m_commonEquivalentHitX->GetXaxis()->GetXmax());
+    TH1D combinedY("hSummaryUnbiasedResidualY", "", 240,
+                   m_commonEquivalentHitY->GetXaxis()->GetXmin(),
+                   m_commonEquivalentHitY->GetXaxis()->GetXmax());
+    combinedX.SetDirectory(nullptr);
+    combinedY.SetDirectory(nullptr);
+    for (const auto& [id, histograms] : m_detectorHistograms) {
+        (void)id;
+        combinedX.Add(histograms.residualX);
+        combinedY.Add(histograms.residualY);
+    }
+    summary.unbiasedResidualX = FitSingleGaussian(&combinedX).sigma;
+    summary.unbiasedResidualY = FitSingleGaussian(&combinedY).sigma;
+
+    if (summary.hitResolutionX <= 0.0 || summary.hitResolutionY <= 0.0 ||
+        m_detectors.size() < 3) {
+        return summary;
+    }
+    double meanZ = 0.0;
+    for (const auto& detector : m_detectors) meanZ += detector->GetPos().Z();
+    meanZ /= static_cast<double>(m_detectors.size());
+    double szz = 0.0;
+    for (const auto& detector : m_detectors) {
+        const double dz = detector->GetPos().Z() - meanZ;
+        szz += dz * dz;
+    }
+    if (szz <= 1e-12) return summary;
+    const auto pointingScale = [&](double z) {
+        const double dz = z - meanZ;
+        return std::sqrt(1.0 / static_cast<double>(m_detectors.size()) +
+                         dz * dz / szz);
+    };
+    for (const auto& detector : m_referenceDetectors) {
+        const double scale = pointingScale(detector->GetPos().Z());
+        summary.pointingResolution[detector->GetID()] = {
+            summary.hitResolutionX * scale, summary.hitResolutionY * scale};
+    }
+    summary.angularResolutionX = summary.hitResolutionX / std::sqrt(szz);
+    summary.angularResolutionY = summary.hitResolutionY / std::sqrt(szz);
+    return summary;
+}
+
 void PerformanceAnalyzer::Write() {
     for (auto& [id, h] : m_detectorHistograms) {
         const auto residualFitX = FitSingleGaussian(h.residualX);
@@ -357,25 +408,6 @@ void PerformanceAnalyzer::Write() {
     legend.Draw();
     curveCanvas.Write();
 
-    std::ostringstream report;
-    report << std::fixed << std::setprecision(2)
-           << "resolution " << 1000.0 * sigmaHitX << " × "
-           << 1000.0 * sigmaHitY << " µm";
-    for (const auto& detector : m_referenceDetectors) {
-        const double scale = pointingScale(detector->GetPos().Z());
-        report << " · DUT" << detector->GetID() << " pointing "
-               << 1000.0 * sigmaHitX * scale << " × "
-               << 1000.0 * sigmaHitY * scale << " µm";
-    }
-    Terminal::Detail(report.str());
-    if (Terminal::Verbose()) {
-        std::ostringstream angle;
-        angle << std::fixed << std::setprecision(2)
-              << "track angle resolution "
-              << 1.0e6 * sigmaHitX / std::sqrt(szz) << " × "
-              << 1.0e6 * sigmaHitY / std::sqrt(szz) << " µrad";
-        Terminal::Detail(Terminal::Muted(angle.str()));
-    }
     m_output->Write();
 }
 
