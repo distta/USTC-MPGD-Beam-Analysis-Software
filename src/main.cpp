@@ -336,7 +336,7 @@ bool RunAnalysis(const json& config,
       }
       // These analyses print their own full status and runtime tables.
       if (type != "TrackAnalysis" && type != "DUTAnalysis" &&
-          type != "PadDUTAnalysis")
+          type != "PadDUTAnalysis" && type != "TimeResolution")
          Terminal::StageDone(elapsedSeconds);
    }
    return true;

@@ -759,14 +759,6 @@ OscilloscopeT0Result LoadOscilloscopeT0(
             }
         }
         result.duplicateEventIDs = ambiguousEventIDs.size();
-        cout << "[TimeResolution] oscilloscope reference time: input="
-             << result.inputEntries
-             << ", matched raw event IDs=" << result.references.size()
-             << ", ambiguous event IDs=" << result.duplicateEventIDs
-             << ", weights=(" << result.channelWeight[0] << ','
-             << result.channelWeight[1] << ','
-             << result.channelWeight[2] << ')'
-             << ", resolution=" << result.resolution << " ns\n";
         return result;
     }
 
@@ -942,17 +934,6 @@ OscilloscopeT0Result LoadOscilloscopeT0(
         }
     }
     result.duplicateEventIDs = ambiguousEventIDs.size();
-    cout << "[TimeResolution] oscilloscope T0: input=" << result.inputEntries
-         << ", matched raw event IDs=" << result.references.size()
-         << ", invalid event IDs=" << result.invalidEventIDs
-         << ", ambiguous event IDs=" << result.duplicateEventIDs
-         << ", channel offsets=(0," << result.channelOffset[1] << ','
-         << result.channelOffset[2] << ") ns"
-         << ", weights=(" << result.channelWeight[0] << ','
-         << result.channelWeight[1] << ','
-         << result.channelWeight[2] << ')'
-         << ", three-channel T0 resolution=" << result.resolution
-         << " ns\n";
     return result;
 }
 
@@ -2273,6 +2254,469 @@ bool WriteTimingOutput(const string& outputPath,
     return !trackTimes.empty();
 }
 
+void WriteRawTimeHistogram(const vector<double>& values, TDirectory& directory,
+                           const string& name, const string& title, int bins) {
+    vector<double> finiteValues;
+    copy_if(values.begin(), values.end(), back_inserter(finiteValues),
+            [](double value) { return isfinite(value); });
+    if (finiteValues.empty()) return;
+    const auto [robustLow, robustHigh] = RobustRange(finiteValues);
+    double low = robustLow;
+    double high = robustHigh;
+    const double padding = 0.05 * max(1.0e-6, high - low);
+    low -= padding;
+    high += padding;
+    TDirectory::TContext context(&directory);
+    TH1D histogram(name.c_str(), title.c_str(), bins, low, high);
+    for (double value : finiteValues) histogram.Fill(value);
+    histogram.Write();
+}
+
+TimingEfficiencyResult WriteCompactTimingEfficiency(
+    const vector<double>& residuals, size_t denominator,
+    double windowWidthNs, double stepNs, int histogramBins,
+    TDirectory& directory) {
+    TimingEfficiencyResult result;
+    vector<double> sorted;
+    copy_if(residuals.begin(), residuals.end(), back_inserter(sorted),
+            [](double value) { return isfinite(value); });
+    sort(sorted.begin(), sorted.end());
+    result.denominator = denominator;
+    result.validTimes = sorted.size();
+    if (sorted.empty() || denominator == 0 || windowWidthNs <= 0.0 ||
+        stepNs <= 0.0)
+        return result;
+
+    const auto [low, high] = RobustRange(sorted);
+    const double scanLow = low - windowWidthNs;
+    const double scanHigh = high;
+    const int scanBins = max(
+        1, min(20000, static_cast<int>(
+                          ceil((scanHigh - scanLow) / stepNs))));
+    const double effectiveStep = (scanHigh - scanLow) / scanBins;
+    vector<double> efficiencies(static_cast<size_t>(scanBins), 0.0);
+    for (int bin = 0; bin < scanBins; ++bin) {
+        const double start = scanLow + (bin + 0.5) * effectiveStep;
+        const auto first = lower_bound(sorted.begin(), sorted.end(), start);
+        const auto last =
+            upper_bound(sorted.begin(), sorted.end(), start + windowWidthNs);
+        const size_t count = static_cast<size_t>(last - first);
+        efficiencies[static_cast<size_t>(bin)] =
+            static_cast<double>(count) / denominator;
+        if (count > result.bestCount) {
+            result.bestCount = count;
+            result.bestWindowStart = start;
+        }
+    }
+    result.bestWindowEnd = result.bestWindowStart + windowWidthNs;
+    result.bestWindowCenter =
+        result.bestWindowStart + 0.5 * windowWidthNs;
+    result.bestEfficiency =
+        static_cast<double>(result.bestCount) / denominator;
+    result.valid = true;
+
+    WriteAndFit(
+        sorted, directory, "hTimeResidual",
+        "DUT cluster time relative to external T0;"
+        "t_{DUT}-T0 [ns];Entries",
+        histogramBins);
+    TDirectory::TContext context(&directory);
+    TH1D efficiency(
+        "hWindowEfficiency25ns",
+        "DUT 25 ns timing-window efficiency;"
+        "Window start [ns];Efficiency",
+        scanBins, scanLow, scanHigh);
+    efficiency.SetMinimum(0.0);
+    efficiency.SetMaximum(1.05);
+    for (int bin = 1; bin <= scanBins; ++bin)
+        efficiency.SetBinContent(
+            bin, efficiencies[static_cast<size_t>(bin - 1)]);
+    efficiency.Write();
+    return result;
+}
+
+bool WriteCompactTimingOutput(
+    const string& outputPath,
+    const map<TrackKey, map<int, DetectorTimes>>& trackTimes,
+    const OscilloscopeT0Result& oscilloscopeT0,
+    const array<int, 3>& trackerIDs,
+    const DUTTimingResult& dutTiming,
+    const TrackTimeWeights& trackWeights,
+    double timingEfficiencyWindowNs,
+    double timingEfficiencyStepNs,
+    int histogramBins,
+    chrono::steady_clock::time_point analysisStarted) {
+    unique_ptr<TFile> output(TFile::Open(outputPath.c_str(), "RECREATE"));
+    if (!output || output->IsZombie()) {
+        cerr << "[TimeResolution] cannot create " << outputPath << '\n';
+        return false;
+    }
+
+    map<int, vector<double>> rawDetectorTimes;
+    map<int, vector<double>> externalResiduals;
+    array<vector<double>, 3> trackerPairResiduals;
+    vector<double> trackTimeSamples;
+    vector<double> trackExternalResiduals;
+    const array<pair<size_t, size_t>, 3> pairIndices = {
+        pair<size_t, size_t>{0, 1}, {0, 2}, {1, 2}};
+
+    for (const auto& [key, detectors] : trackTimes) {
+        const auto external = oscilloscopeT0.references.find(key.first);
+        for (const auto& [detectorID, times] : detectors) {
+            const double time = times.value[kTrackerTimingEstimator];
+            if (!isfinite(time)) continue;
+            rawDetectorTimes[detectorID].push_back(time);
+            if (external != oscilloscopeT0.references.end())
+                externalResiduals[detectorID].push_back(
+                    time - external->second.time);
+        }
+
+        array<double, 3> selectedTimes{};
+        bool complete = true;
+        for (size_t index = 0; index < trackerIDs.size(); ++index) {
+            const auto detector = detectors.find(trackerIDs[index]);
+            if (detector == detectors.end() ||
+                !isfinite(detector->second.value[kTrackerTimingEstimator])) {
+                complete = false;
+                break;
+            }
+            selectedTimes[index] =
+                detector->second.value[kTrackerTimingEstimator];
+        }
+        if (!complete) continue;
+        for (size_t pairIndex = 0; pairIndex < pairIndices.size();
+             ++pairIndex) {
+            const auto [first, second] = pairIndices[pairIndex];
+            trackerPairResiduals[pairIndex].push_back(
+                selectedTimes[first] - selectedTimes[second]);
+        }
+        const double trackTime =
+            inner_product(selectedTimes.begin(), selectedTimes.end(),
+                          trackWeights.value.begin(), 0.0);
+        trackTimeSamples.push_back(trackTime);
+        if (external != oscilloscopeT0.references.end())
+            trackExternalResiduals.push_back(
+                trackTime - external->second.time);
+    }
+
+    map<int, vector<double>> dutTimes;
+    map<int, vector<double>> dutMinusTrack;
+    map<int, vector<double>> dutExternalResiduals;
+    map<int, vector<double>> dutEfficiencyExternalResiduals;
+    for (const auto& [dutID, samples] : dutTiming.samplesByDetector) {
+        for (const DUTTimingSample& sample : samples) {
+            if (isfinite(sample.dutTime))
+                dutTimes[dutID].push_back(sample.dutTime);
+            if (isfinite(sample.residual))
+                dutMinusTrack[dutID].push_back(sample.residual);
+            const auto external =
+                oscilloscopeT0.references.find(sample.rawEventID);
+            if (external == oscilloscopeT0.references.end() ||
+                !isfinite(sample.dutTime))
+                continue;
+            const double residual =
+                sample.dutTime - external->second.time;
+            dutExternalResiduals[dutID].push_back(residual);
+            if (sample.insideActiveArea)
+                dutEfficiencyExternalResiduals[dutID].push_back(residual);
+        }
+    }
+
+    TDirectory* rawDirectory = output->mkdir("RawTimeDistributions");
+    for (const auto& [detectorID, samples] : rawDetectorTimes) {
+        const auto detector =
+            DetectorFactory::GetInstance().GetDetector(detectorID);
+        const string label =
+            detector ? detector->GetName()
+                     : "Detector" + to_string(detectorID);
+        WriteRawTimeHistogram(
+            samples, *rawDirectory,
+            SafeName("hClusterTime_" + label),
+            label + " cluster time;t [ns];Entries", histogramBins);
+    }
+    for (const auto& [dutID, samples] : dutTimes) {
+        const string label = "DUT" + to_string(dutID);
+        WriteRawTimeHistogram(
+            samples, *rawDirectory,
+            "hClusterTime_" + label,
+            label + " cluster time;t [ns];Entries", histogramBins);
+    }
+    WriteRawTimeHistogram(
+        trackTimeSamples, *rawDirectory, "hTrackTime",
+        "Weighted tracker time;t_{track} [ns];Entries", histogramBins);
+
+    TDirectory* internalDirectory =
+        output->mkdir("WithoutExternalT0");
+    TDirectory* pairDirectory =
+        internalDirectory->mkdir("TrackerPairDifferences");
+    array<FitResult, 3> pairFits;
+    for (size_t pairIndex = 0; pairIndex < pairIndices.size(); ++pairIndex) {
+        const auto [first, second] = pairIndices[pairIndex];
+        const string firstName =
+            DetectorFactory::GetInstance().GetDetector(
+                trackerIDs[first])->GetName();
+        const string secondName =
+            DetectorFactory::GetInstance().GetDetector(
+                trackerIDs[second])->GetName();
+        pairFits[pairIndex] = WriteAndFit(
+            trackerPairResiduals[pairIndex], *pairDirectory,
+            SafeName("hDeltaT_" + firstName + "_" + secondName),
+            firstName + " - " + secondName +
+                ";#Deltat [ns];Entries",
+            histogramBins);
+    }
+    TDirectory* internalDUTDirectory =
+        internalDirectory->mkdir("DUT");
+    map<int, double> internalDUTResolutions;
+    for (const auto& [dutID, samples] : dutMinusTrack) {
+        TDirectory* detectorDirectory =
+            internalDUTDirectory->mkdir(
+                ("DUT" + to_string(dutID)).c_str());
+        const FitResult fit = WriteAndFit(
+            samples, *detectorDirectory, "hDUTMinusTrackTime",
+            "DUT cluster time relative to track time;"
+            "t_{DUT}-t_{track} [ns];Entries",
+            histogramBins);
+        const double variance =
+            fit.sigma * fit.sigma -
+            trackWeights.resolution * trackWeights.resolution;
+        const double resolution =
+            isfinite(variance) && variance >= 0.0
+                ? sqrt(variance)
+                : numeric_limits<double>::quiet_NaN();
+        internalDUTResolutions[dutID] = resolution;
+    }
+
+    double externalTrackResolution =
+        numeric_limits<double>::quiet_NaN();
+    map<int, double> externalDUTResolutions;
+    map<int, TimingEfficiencyResult> efficiencyResults;
+    map<int, size_t> efficiencyDenominators;
+    map<int, size_t> spatiallyMatchedTracks;
+    if (!oscilloscopeT0.references.empty()) {
+        TDirectory* externalDirectory =
+            output->mkdir("WithExternalT0");
+        for (const auto& [detectorID, samples] : externalResiduals) {
+            const auto detector =
+                DetectorFactory::GetInstance().GetDetector(detectorID);
+            const string label =
+                detector ? detector->GetName()
+                         : "Detector" + to_string(detectorID);
+            TDirectory* detectorDirectory =
+                externalDirectory->mkdir(SafeName(label).c_str());
+            const FitResult fit = WriteAndFit(
+                samples, *detectorDirectory,
+                "hClusterTimeMinusT0",
+                label + " cluster time relative to external T0;"
+                        "t-T0 [ns];Entries",
+                histogramBins);
+            (void)fit;
+        }
+        TDirectory* trackDirectory =
+            externalDirectory->mkdir("TrackTime");
+        const FitResult trackFit = WriteAndFit(
+            trackExternalResiduals, *trackDirectory,
+            "hTrackTimeMinusT0",
+            "Track time relative to external T0;"
+            "t_{track}-T0 [ns];Entries",
+            histogramBins);
+        externalTrackResolution = trackFit.sigma;
+
+        for (const auto& [dutID, samples] : dutExternalResiduals) {
+            TDirectory* detectorDirectory =
+                externalDirectory->mkdir(
+                    ("DUT" + to_string(dutID)).c_str());
+            const FitResult fit = WriteAndFit(
+                samples, *detectorDirectory,
+                "hClusterTimeMinusT0",
+                "DUT cluster time relative to external T0;"
+                "t_{DUT}-T0 [ns];Entries",
+                histogramBins);
+            externalDUTResolutions[dutID] = fit.sigma;
+        }
+
+        TDirectory* efficiencyRoot =
+            externalDirectory->mkdir("DUTTimingEfficiency");
+        for (const auto& [dutID, residuals] :
+             dutEfficiencyExternalResiduals) {
+            size_t denominator = 0;
+            const auto cases = dutTiming.activeAreaTrackCases.find(dutID);
+            if (cases != dutTiming.activeAreaTrackCases.end()) {
+                denominator = static_cast<size_t>(count_if(
+                    cases->second.begin(), cases->second.end(),
+                    [&](const TrackKey& key) {
+                        return oscilloscopeT0.references.count(
+                                   key.first) != 0;
+                    }));
+            }
+            efficiencyDenominators[dutID] = denominator;
+            const auto matchedCases =
+                dutTiming.activeAreaMatchedHitCases.find(dutID);
+            if (matchedCases != dutTiming.activeAreaMatchedHitCases.end()) {
+                spatiallyMatchedTracks[dutID] =
+                    static_cast<size_t>(count_if(
+                        matchedCases->second.begin(),
+                        matchedCases->second.end(),
+                        [&](const TrackKey& key) {
+                            return oscilloscopeT0.references.count(
+                                       key.first) != 0;
+                        }));
+            }
+            TDirectory* detectorDirectory =
+                efficiencyRoot->mkdir(
+                    ("DUT" + to_string(dutID)).c_str());
+            const TimingEfficiencyResult result =
+                WriteCompactTimingEfficiency(
+                    residuals, denominator,
+                    timingEfficiencyWindowNs, timingEfficiencyStepNs,
+                    histogramBins, *detectorDirectory);
+            if (result.valid) efficiencyResults[dutID] = result;
+        }
+    }
+
+    output->Write();
+    output->Close();
+
+    const auto row = [](const string& label, const string& value) {
+        cout << "  " << left << setw(38) << label << right << setw(39)
+             << value << '\n';
+    };
+    const auto separator = [] { cout << string(100, '-') << '\n'; };
+    const auto count = [](size_t value) { return Terminal::Count(value); };
+    const auto fixedValue = [](double value, int precision,
+                               const string& suffix = "") {
+        if (!isfinite(value)) return string("—");
+        ostringstream text;
+        text << fixed << setprecision(precision) << value << suffix;
+        return text.str();
+    };
+    cout << string(100, '=') << '\n'
+         << Terminal::Accent("Configuration") << '\n';
+    row("External reference",
+        oscilloscopeT0.references.empty() ? "disabled"
+                                          : "oscilloscope T0");
+    row("Timing-window width",
+        fixedValue(timingEfficiencyWindowNs, 2, " ns"));
+    if (!oscilloscopeT0.references.empty()) {
+        separator();
+        cout << Terminal::Accent("Oscilloscope T0 Matching") << '\n';
+        {
+            const double fraction =
+                oscilloscopeT0.inputEntries > 0
+                    ? 100.0 * oscilloscopeT0.references.size() /
+                          oscilloscopeT0.inputEntries
+                    : 0.0;
+            ostringstream value;
+            value << count(oscilloscopeT0.inputEntries) << " / "
+                  << count(oscilloscopeT0.references.size()) << "  ("
+                  << fixed << setprecision(2) << fraction << "%)";
+            row("Input / matched raw event IDs", value.str());
+        }
+        row("Ambiguous event IDs",
+            count(oscilloscopeT0.duplicateEventIDs));
+        row("Associated tracks", count(trackExternalResiduals.size()));
+        {
+            ostringstream weights;
+            weights << fixed << setprecision(2)
+                    << oscilloscopeT0.channelWeight[0] << " / "
+                    << oscilloscopeT0.channelWeight[1] << " / "
+                    << oscilloscopeT0.channelWeight[2];
+            row("T0 channel weights", weights.str());
+        }
+        row("Combined T0 resolution",
+            fixedValue(oscilloscopeT0.resolution, 2, " ns"));
+
+        for (const auto& [dutID, result] : efficiencyResults) {
+            separator();
+            cout << Terminal::Accent(
+                        "DUT" + to_string(dutID) +
+                        " Timing-Window Efficiency")
+                 << '\n';
+            const size_t denominator = efficiencyDenominators[dutID];
+            const size_t matched = spatiallyMatchedTracks[dutID];
+            row("Active-area tracks with valid T0", count(denominator));
+            row("Spatially matched tracks", count(matched));
+            row("Tracks inside best " +
+                    fixedValue(timingEfficiencyWindowNs, 0) +
+                    " ns window",
+                count(result.bestCount));
+            cout << '\n';
+            const auto efficiencyText = [&](size_t passed, size_t total) {
+                ostringstream text;
+                const double efficiency =
+                    total > 0 ? 100.0 * passed / total : 0.0;
+                text << count(passed) << " / " << count(total) << " = "
+                     << fixed << setprecision(2) << efficiency << '%';
+                return text.str();
+            };
+            row("Spatial-match efficiency",
+                efficiencyText(matched, denominator));
+            row("Conditional timing efficiency",
+                efficiencyText(result.bestCount, matched));
+            row("Combined efficiency",
+                efficiencyText(result.bestCount, denominator));
+            cout << '\n';
+            row("Losses",
+                count(denominator > matched ? denominator - matched : 0) +
+                    " no spatial match");
+            row("",
+                count(matched > result.bestCount
+                          ? matched - result.bestCount
+                          : 0) +
+                    " outside timing window");
+            row("Best " + fixedValue(timingEfficiencyWindowNs, 0) +
+                    " ns window",
+                "[" + fixedValue(result.bestWindowStart, 2) + ", " +
+                    fixedValue(result.bestWindowEnd, 2) + "] ns");
+        }
+    }
+
+    separator();
+    cout << Terminal::Accent("Time Resolution") << '\n'
+         << "  " << left << setw(31) << "Detector / Reference" << right
+         << setw(23) << "Self-calibration" << setw(20) << "External T0"
+         << '\n';
+    const auto resolutionRow = [&](const string& label,
+                                   const string& self,
+                                   const string& external) {
+        cout << "  " << left << setw(31) << label << right << setw(23)
+             << self << setw(20) << external << '\n';
+    };
+    for (size_t index = 0; index < trackerIDs.size(); ++index) {
+        const auto detector =
+            DetectorFactory::GetInstance().GetDetector(trackerIDs[index]);
+        resolutionRow(
+            detector ? detector->GetName()
+                     : "Tracker" + to_string(index + 1),
+            fixedValue(sqrt(trackWeights.detectorVariance[index]), 2,
+                       " ns"),
+            "—");
+    }
+    resolutionRow(
+        "Combined tracker reference",
+        fixedValue(trackWeights.resolution, 2, " ns"),
+        fixedValue(externalTrackResolution, 2, " ns"));
+    for (const auto& [dutID, selfResolution] : internalDUTResolutions) {
+        const auto external = externalDUTResolutions.find(dutID);
+        resolutionRow(
+            "DUT" + to_string(dutID),
+            fixedValue(selfResolution, 2, " ns"),
+            external == externalDUTResolutions.end()
+                ? "—"
+                : fixedValue(external->second, 2, " ns"));
+    }
+    separator();
+    cout << Terminal::Accent("Status") << '\n';
+    row(Terminal::Success("[PASS] Time Resolution completed"), "");
+    const double runtime = chrono::duration<double>(
+                               chrono::steady_clock::now() -
+                               analysisStarted)
+                               .count();
+    row("Runtime", fixedValue(runtime, 1, " s"));
+    cout << string(100, '=') << '\n';
+    return !trackTimes.empty();
+}
+
 }  // namespace
 
 void TimeResolutionScript::LoadConfig(const json& config) {
@@ -2325,6 +2769,7 @@ bool TimeResolutionScript::Validate() const {
 }
 
 bool TimeResolutionScript::Execute() {
+    const auto analysisStarted = chrono::steady_clock::now();
     const string trackPath = m_trackFile.empty() ? GetOutputDir() + "TrackInfo.root" : m_trackFile;
     const string outputPath = filesystem::path(m_outputFile).is_absolute()
                                   ? m_outputFile
@@ -2381,11 +2826,6 @@ bool TimeResolutionScript::Execute() {
             Terminal::Count(reconstruction.wantedEventIDs.size()) +
             " raw event IDs");
     }
-    if (reconstruction.missingRawDetectors > 0 || reconstruction.emptyTimingDetectors > 0)
-        cout << "[TimeResolution] Fit timing diagnostics: missing raw detector entries="
-             << reconstruction.missingRawDetectors
-             << ", empty detector times=" << reconstruction.emptyTimingDetectors << '\n';
-
     const TrackTimeWeights trackWeights =
         CalculateTrackTimeWeights(reconstruction.trackTimes, trackerIDs);
     if (!trackWeights.valid) {
@@ -2428,31 +2868,15 @@ bool TimeResolutionScript::Execute() {
         dutTiming = LoadDUTTiming(
             *dutTree, *parser, references, m_timingWaveformConfig,
             waveformFits);
-        size_t totalDUTSamples = 0;
-        for (const auto& [detectorID, samples] : dutTiming.samplesByDetector) {
-            (void)detectorID;
-            totalDUTSamples += samples.size();
-        }
-        if (Terminal::Verbose() || dutTiming.unmatchedTrackTimes > 0 ||
-            dutTiming.invalidDUTTimes > 0) {
-            ostringstream diagnostics;
-            diagnostics << Terminal::Count(totalDUTSamples)
-                        << " DUT timing samples · "
-                        << dutTiming.unmatchedTrackTimes
-                        << " unmatched · " << dutTiming.invalidDUTTimes
-                        << " invalid";
-            Terminal::Detail(Terminal::Muted(diagnostics.str()));
-        }
     }
 
     const auto& trackTimes = reconstruction.trackTimes;
 
     const bool wroteOutput =
-        WriteTimingOutput(outputPath, trackTimes, reconstruction.eventIDs,
-                          oscilloscopeT0, trackerIDs, dutTiming, trackWeights,
-                          m_timingEfficiencyWindowNs,
-                          m_timingEfficiencyStepNs,
-                          m_histogramBins);
+        WriteCompactTimingOutput(
+            outputPath, trackTimes, oscilloscopeT0, trackerIDs,
+            dutTiming, trackWeights, m_timingEfficiencyWindowNs,
+            m_timingEfficiencyStepNs, m_histogramBins, analysisStarted);
     if (Terminal::Verbose()) {
         Terminal::Detail(Terminal::Muted(
             Terminal::Count(waveformFits) + " waveform fits"));
