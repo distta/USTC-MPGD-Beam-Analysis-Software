@@ -2338,6 +2338,7 @@ TimingEfficiencyResult WriteCompactTimingEfficiency(
 bool WriteCompactTimingOutput(
     const string& outputPath,
     const map<TrackKey, map<int, DetectorTimes>>& trackTimes,
+    const map<TrackKey, int>& eventIDs,
     const OscilloscopeT0Result& oscilloscopeT0,
     const array<int, 3>& trackerIDs,
     const DUTTimingResult& dutTiming,
@@ -2350,6 +2351,54 @@ bool WriteCompactTimingOutput(
     if (!output || output->IsZombie()) {
         cerr << "[TimeResolution] cannot create " << outputPath << '\n';
         return false;
+    }
+
+    Int_t treeEventID = -1;
+    ULong64_t treeRawEventID = 0;
+    Int_t treeTrackIndex = -1;
+    Int_t treeTracker1ID = trackerIDs[0];
+    Int_t treeTracker2ID = trackerIDs[1];
+    Int_t treeTracker3ID = trackerIDs[2];
+    Double_t treeTracker1Time = numeric_limits<double>::quiet_NaN();
+    Double_t treeTracker2Time = numeric_limits<double>::quiet_NaN();
+    Double_t treeTracker3Time = numeric_limits<double>::quiet_NaN();
+    Double_t treeTrackTime = numeric_limits<double>::quiet_NaN();
+    Int_t treeDUTID = -1;
+    Double_t treeDUTTime = numeric_limits<double>::quiet_NaN();
+    Double_t treeDUTMinusTrackTime = numeric_limits<double>::quiet_NaN();
+    Bool_t treeHasExternalT0 = false;
+    Double_t treeExternalT0 = numeric_limits<double>::quiet_NaN();
+    Double_t treeTrackMinusExternalT0 =
+        numeric_limits<double>::quiet_NaN();
+    Double_t treeDUTMinusExternalT0 =
+        numeric_limits<double>::quiet_NaN();
+    TTree timingTree("TimingTree", "Per-track detector timing values");
+    timingTree.Branch("eventID", &treeEventID);
+    timingTree.Branch("rawEventID", &treeRawEventID);
+    timingTree.Branch("trackIndex", &treeTrackIndex);
+    timingTree.Branch("tracker1ID", &treeTracker1ID);
+    timingTree.Branch("tracker2ID", &treeTracker2ID);
+    timingTree.Branch("tracker3ID", &treeTracker3ID);
+    timingTree.Branch("tracker1Time", &treeTracker1Time);
+    timingTree.Branch("tracker2Time", &treeTracker2Time);
+    timingTree.Branch("tracker3Time", &treeTracker3Time);
+    timingTree.Branch("trackTime", &treeTrackTime);
+    timingTree.Branch("dutID", &treeDUTID);
+    timingTree.Branch("dutTime", &treeDUTTime);
+    timingTree.Branch("dutMinusTrackTime", &treeDUTMinusTrackTime);
+    timingTree.Branch("hasExternalT0", &treeHasExternalT0);
+    timingTree.Branch("externalT0", &treeExternalT0);
+    timingTree.Branch(
+        "trackMinusExternalT0", &treeTrackMinusExternalT0);
+    timingTree.Branch(
+        "dutMinusExternalT0", &treeDUTMinusExternalT0);
+
+    map<TrackKey, vector<const DUTTimingSample*>> dutSamplesByTrack;
+    for (const auto& [dutID, samples] : dutTiming.samplesByDetector) {
+        (void)dutID;
+        for (const DUTTimingSample& sample : samples)
+            dutSamplesByTrack[
+                {sample.rawEventID, sample.trackIndex}].push_back(&sample);
     }
 
     map<int, vector<double>> rawDetectorTimes;
@@ -2397,6 +2446,47 @@ bool WriteCompactTimingOutput(
         if (external != oscilloscopeT0.references.end())
             trackExternalResiduals.push_back(
                 trackTime - external->second.time);
+
+        treeRawEventID = key.first;
+        treeTrackIndex = key.second;
+        const auto event = eventIDs.find(key);
+        treeEventID = event == eventIDs.end() ? -1 : event->second;
+        treeTracker1Time = selectedTimes[0];
+        treeTracker2Time = selectedTimes[1];
+        treeTracker3Time = selectedTimes[2];
+        treeTrackTime = trackTime;
+        treeHasExternalT0 =
+            external != oscilloscopeT0.references.end();
+        treeExternalT0 =
+            treeHasExternalT0
+                ? external->second.time
+                : numeric_limits<double>::quiet_NaN();
+        treeTrackMinusExternalT0 =
+            treeHasExternalT0
+                ? treeTrackTime - treeExternalT0
+                : numeric_limits<double>::quiet_NaN();
+        const auto dutSamples = dutSamplesByTrack.find(key);
+        if (dutSamples == dutSamplesByTrack.end() ||
+            dutSamples->second.empty()) {
+            treeDUTID = -1;
+            treeDUTTime = numeric_limits<double>::quiet_NaN();
+            treeDUTMinusTrackTime =
+                numeric_limits<double>::quiet_NaN();
+            treeDUTMinusExternalT0 =
+                numeric_limits<double>::quiet_NaN();
+            timingTree.Fill();
+        } else {
+            for (const DUTTimingSample* sample : dutSamples->second) {
+                treeDUTID = sample->detectorID;
+                treeDUTTime = sample->dutTime;
+                treeDUTMinusTrackTime = sample->residual;
+                treeDUTMinusExternalT0 =
+                    treeHasExternalT0 && isfinite(treeDUTTime)
+                        ? treeDUTTime - treeExternalT0
+                        : numeric_limits<double>::quiet_NaN();
+                timingTree.Fill();
+            }
+        }
     }
 
     map<int, vector<double>> dutTimes;
@@ -2468,6 +2558,7 @@ bool WriteCompactTimingOutput(
     TDirectory* internalDUTDirectory =
         internalDirectory->mkdir("DUT");
     map<int, double> internalDUTResolutions;
+    map<int, FitResult> internalDUTFits;
     for (const auto& [dutID, samples] : dutMinusTrack) {
         TDirectory* detectorDirectory =
             internalDUTDirectory->mkdir(
@@ -2477,6 +2568,7 @@ bool WriteCompactTimingOutput(
             "DUT cluster time relative to track time;"
             "t_{DUT}-t_{track} [ns];Entries",
             histogramBins);
+        internalDUTFits[dutID] = fit;
         const double variance =
             fit.sigma * fit.sigma -
             trackWeights.resolution * trackWeights.resolution;
@@ -2490,6 +2582,8 @@ bool WriteCompactTimingOutput(
     double externalTrackResolution =
         numeric_limits<double>::quiet_NaN();
     map<int, double> externalDUTResolutions;
+    map<int, FitResult> externalDetectorFits;
+    map<int, FitResult> externalDUTFits;
     map<int, TimingEfficiencyResult> efficiencyResults;
     map<int, size_t> efficiencyDenominators;
     map<int, size_t> spatiallyMatchedTracks;
@@ -2510,7 +2604,7 @@ bool WriteCompactTimingOutput(
                 label + " cluster time relative to external T0;"
                         "t-T0 [ns];Entries",
                 histogramBins);
-            (void)fit;
+            externalDetectorFits[detectorID] = fit;
         }
         TDirectory* trackDirectory =
             externalDirectory->mkdir("TrackTime");
@@ -2532,6 +2626,7 @@ bool WriteCompactTimingOutput(
                 "DUT cluster time relative to external T0;"
                 "t_{DUT}-T0 [ns];Entries",
                 histogramBins);
+            externalDUTFits[dutID] = fit;
             externalDUTResolutions[dutID] = fit.sigma;
         }
 
@@ -2575,6 +2670,117 @@ bool WriteCompactTimingOutput(
     }
 
     output->Write();
+
+    string resultAnalysis;
+    string resultObject;
+    Int_t resultDetectorA = -1;
+    Int_t resultDetectorB = -1;
+    Long64_t resultEntries = 0;
+    Double_t resultMean = numeric_limits<double>::quiet_NaN();
+    Double_t resultSigma = numeric_limits<double>::quiet_NaN();
+    Double_t resultSigmaError = numeric_limits<double>::quiet_NaN();
+    Double_t resultResolution = numeric_limits<double>::quiet_NaN();
+    Long64_t resultNumerator = 0;
+    Long64_t resultDenominator = 0;
+    Double_t resultEfficiency = numeric_limits<double>::quiet_NaN();
+    Double_t resultWindowStart = numeric_limits<double>::quiet_NaN();
+    Double_t resultWindowEnd = numeric_limits<double>::quiet_NaN();
+    TTree resultsTree("TimingResults", "Timing fit and efficiency results");
+    resultsTree.Branch("analysis", &resultAnalysis);
+    resultsTree.Branch("object", &resultObject);
+    resultsTree.Branch("detectorA", &resultDetectorA);
+    resultsTree.Branch("detectorB", &resultDetectorB);
+    resultsTree.Branch("entries", &resultEntries);
+    resultsTree.Branch("meanNs", &resultMean);
+    resultsTree.Branch("sigmaNs", &resultSigma);
+    resultsTree.Branch("sigmaErrorNs", &resultSigmaError);
+    resultsTree.Branch("resolutionNs", &resultResolution);
+    resultsTree.Branch("numerator", &resultNumerator);
+    resultsTree.Branch("denominator", &resultDenominator);
+    resultsTree.Branch("efficiency", &resultEfficiency);
+    resultsTree.Branch("windowStartNs", &resultWindowStart);
+    resultsTree.Branch("windowEndNs", &resultWindowEnd);
+    const auto fillResult = [&](const string& analysis,
+                                const string& object, int detectorA,
+                                int detectorB, const FitResult& fit,
+                                double resolution) {
+        resultAnalysis = analysis;
+        resultObject = object;
+        resultDetectorA = detectorA;
+        resultDetectorB = detectorB;
+        resultEntries = fit.entries;
+        resultMean = fit.mean;
+        resultSigma = fit.sigma;
+        resultSigmaError = fit.sigmaError;
+        resultResolution = resolution;
+        resultNumerator = 0;
+        resultDenominator = 0;
+        resultEfficiency = numeric_limits<double>::quiet_NaN();
+        resultWindowStart = numeric_limits<double>::quiet_NaN();
+        resultWindowEnd = numeric_limits<double>::quiet_NaN();
+        resultsTree.Fill();
+    };
+    for (size_t index = 0; index < pairFits.size(); ++index) {
+        const auto [first, second] = pairIndices[index];
+        fillResult("without_external_t0", "tracker_pair",
+                   trackerIDs[first], trackerIDs[second],
+                   pairFits[index], pairFits[index].sigma);
+    }
+    for (size_t index = 0; index < trackerIDs.size(); ++index) {
+        FitResult derived;
+        derived.entries = static_cast<long long>(
+            min({trackerPairResiduals[0].size(),
+                 trackerPairResiduals[1].size(),
+                 trackerPairResiduals[2].size()}));
+        derived.sigma = sqrt(trackWeights.detectorVariance[index]);
+        fillResult("without_external_t0", "tracker_resolution",
+                   trackerIDs[index], -1, derived, derived.sigma);
+    }
+    {
+        FitResult derived;
+        derived.entries = static_cast<long long>(trackTimeSamples.size());
+        derived.sigma = trackWeights.resolution;
+        fillResult("without_external_t0", "track_time", -1, -1,
+                   derived, trackWeights.resolution);
+    }
+    for (const auto& [dutID, fit] : internalDUTFits)
+        fillResult("without_external_t0", "dut", dutID, -1, fit,
+                   internalDUTResolutions[dutID]);
+    for (const auto& [detectorID, fit] : externalDetectorFits)
+        fillResult("with_external_t0", "detector", detectorID, -1,
+                   fit, fit.sigma);
+    if (isfinite(externalTrackResolution)) {
+        FitResult fit;
+        fit.entries =
+            static_cast<long long>(trackExternalResiduals.size());
+        fit.sigma = externalTrackResolution;
+        fillResult("with_external_t0", "track_time", -1, -1, fit,
+                   externalTrackResolution);
+    }
+    for (const auto& [dutID, fit] : externalDUTFits)
+        fillResult("with_external_t0", "dut", dutID, -1, fit,
+                   fit.sigma);
+    for (const auto& [dutID, efficiency] : efficiencyResults) {
+        resultAnalysis = "with_external_t0";
+        resultObject = "dut_timing_window";
+        resultDetectorA = dutID;
+        resultDetectorB = -1;
+        resultEntries = static_cast<Long64_t>(efficiency.validTimes);
+        resultMean = numeric_limits<double>::quiet_NaN();
+        resultSigma = numeric_limits<double>::quiet_NaN();
+        resultSigmaError = numeric_limits<double>::quiet_NaN();
+        resultResolution = numeric_limits<double>::quiet_NaN();
+        resultNumerator = static_cast<Long64_t>(efficiency.bestCount);
+        resultDenominator =
+            static_cast<Long64_t>(efficiency.denominator);
+        resultEfficiency = efficiency.bestEfficiency;
+        resultWindowStart = efficiency.bestWindowStart;
+        resultWindowEnd = efficiency.bestWindowEnd;
+        resultsTree.Fill();
+    }
+    output->cd();
+    timingTree.Write();
+    resultsTree.Write();
     output->Close();
 
     const auto row = [](const string& label, const string& value) {
@@ -2874,8 +3080,9 @@ bool TimeResolutionScript::Execute() {
 
     const bool wroteOutput =
         WriteCompactTimingOutput(
-            outputPath, trackTimes, oscilloscopeT0, trackerIDs,
-            dutTiming, trackWeights, m_timingEfficiencyWindowNs,
+            outputPath, trackTimes, reconstruction.eventIDs,
+            oscilloscopeT0, trackerIDs, dutTiming, trackWeights,
+            m_timingEfficiencyWindowNs,
             m_timingEfficiencyStepNs, m_histogramBins, analysisStarted);
     if (Terminal::Verbose()) {
         Terminal::Detail(Terminal::Muted(

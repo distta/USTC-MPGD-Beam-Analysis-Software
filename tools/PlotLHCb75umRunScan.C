@@ -176,6 +176,43 @@ TimingResult ReadTiming(const std::string& path, int dutID) {
 
    TFile file(path.c_str(), "READ");
    if (file.IsZombie()) return result;
+   auto* results = dynamic_cast<TTree*>(file.Get("TimingResults"));
+   if (results && results->GetBranch("analysis") &&
+       results->GetBranch("object") &&
+       results->GetBranch("detectorA") &&
+       results->GetBranch("entries") &&
+       results->GetBranch("resolutionNs")) {
+      std::string* analysis = nullptr;
+      std::string* object = nullptr;
+      Int_t detectorA = -1;
+      Long64_t entries = 0;
+      Double_t resolution =
+          std::numeric_limits<double>::quiet_NaN();
+      Double_t error = 0.0;
+      results->SetBranchAddress("analysis", &analysis);
+      results->SetBranchAddress("object", &object);
+      results->SetBranchAddress("detectorA", &detectorA);
+      results->SetBranchAddress("entries", &entries);
+      results->SetBranchAddress("resolutionNs", &resolution);
+      if (results->GetBranch("sigmaErrorNs"))
+         results->SetBranchAddress("sigmaErrorNs", &error);
+      for (Long64_t entry = 0; entry < results->GetEntries(); ++entry) {
+         results->GetEntry(entry);
+         if (!analysis || !object ||
+             *analysis != "without_external_t0" ||
+             *object != "dut" || detectorA != dutID ||
+             !std::isfinite(resolution)) {
+            continue;
+         }
+         result.valid = true;
+         result.entries = entries;
+         result.resolution = resolution;
+         result.error = std::isfinite(error) ? error : 0.0;
+         return result;
+      }
+   }
+
+   // Backward-compatible fallback for results produced before TimingResults.
    const std::string treePath =
        "DUTTimeResolution/DUT_" + std::to_string(dutID) + "/DUTResolution";
    auto* tree = dynamic_cast<TTree*>(file.Get(treePath.c_str()));
