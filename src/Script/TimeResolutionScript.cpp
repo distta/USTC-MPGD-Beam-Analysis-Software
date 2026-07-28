@@ -2581,6 +2581,7 @@ bool WriteCompactTimingOutput(
 
     double externalTrackResolution =
         numeric_limits<double>::quiet_NaN();
+    FitResult externalTrackFit;
     map<int, double> externalDUTResolutions;
     map<int, FitResult> externalDetectorFits;
     map<int, FitResult> externalDUTFits;
@@ -2608,13 +2609,13 @@ bool WriteCompactTimingOutput(
         }
         TDirectory* trackDirectory =
             externalDirectory->mkdir("TrackTime");
-        const FitResult trackFit = WriteAndFit(
+        externalTrackFit = WriteAndFit(
             trackExternalResiduals, *trackDirectory,
             "hTrackTimeMinusT0",
             "Track time relative to external T0;"
             "t_{track}-T0 [ns];Entries",
             histogramBins);
-        externalTrackResolution = trackFit.sigma;
+        externalTrackResolution = externalTrackFit.sigma;
 
         for (const auto& [dutID, samples] : dutExternalResiduals) {
             TDirectory* detectorDirectory =
@@ -2748,11 +2749,8 @@ bool WriteCompactTimingOutput(
         fillResult("with_external_t0", "detector", detectorID, -1,
                    fit, fit.sigma);
     if (isfinite(externalTrackResolution)) {
-        FitResult fit;
-        fit.entries =
-            static_cast<long long>(trackExternalResiduals.size());
-        fit.sigma = externalTrackResolution;
-        fillResult("with_external_t0", "track_time", -1, -1, fit,
+        fillResult("with_external_t0", "track_time", -1, -1,
+                   externalTrackFit,
                    externalTrackResolution);
     }
     for (const auto& [dutID, fit] : externalDUTFits)
