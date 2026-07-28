@@ -1,5 +1,6 @@
 #include "Detector/Detector.h"
 #include "Algorithm/AlgorithmFactory.h"
+#include "Terminal.h"
 #include "Algorithm/Analyzer/ClusterBuilder.h"
 #include "Algorithm/Analyzer/ClusterReconstructor.h"
 #include "Algorithm/Analyzer/HitProcessor.h"
@@ -43,8 +44,11 @@ Detector::Detector(int id, const std::string& name, const nlohmann::json& config
                 auto algorithm = factory.CreateAlgorithm(algoName, cfg);
                 algorithm->SetDetector(this);  // 设置算法所属的探测器
                 m_algorithms[algoName] = algorithm;
-                std::cout << "[Detector " << m_name << "] Loaded algorithm '" << algoName << std::endl;
-                algorithm->Print();
+                if (Terminal::Verbose()) {
+                    std::cout << "[Detector " << m_name
+                              << "] Loaded algorithm '" << algoName << "'\n";
+                    algorithm->Print();
+                }
             } catch (const std::exception& e) {
                 std::cerr << "[Detector " << m_name << "] Failed to create algorithm '" << algoName
                           << "': " << e.what() << std::endl;

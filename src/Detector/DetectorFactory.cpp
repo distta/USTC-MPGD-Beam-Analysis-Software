@@ -1,4 +1,5 @@
 #include "Detector/DetectorFactory.h"
+#include "Terminal.h"
 #include "Detector/Cylinder.h"
 #include "Detector/Planar.h"
 #include "Detector/PlanarPad.h"
@@ -51,7 +52,7 @@ void PrintGeometry(const map<int, shared_ptr<Detector>>& detectors) {
         }
     }
 
-    const size_t blockWidth = max<size_t>(89, nameWidth + 83);
+    const size_t blockWidth = max<size_t>(92, nameWidth + 86);
     const string border(blockWidth, '=');
     const string divider(blockWidth, '-');
 
@@ -63,14 +64,14 @@ void PrintGeometry(const map<int, shared_ptr<Detector>>& detectors) {
          << ignoredCount << " Ignored\n"
          << divider << '\n'
          << "  " << left << setw(5) << "ID" << setw(9) << "Role"
-         << setw(9) << "Type"
+         << setw(12) << "Type"
          << setw(static_cast<int>(nameWidth + 2)) << "Name"
          << setw(31) << "Position (x, y, z)" << "Rotation (x, y, z)\n"
          << divider << '\n';
 
     for (const auto& [id, detector] : detectors) {
         cout << "  " << left << setw(5) << id << setw(9) << RoleName(*detector)
-             << setw(9) << TypeName(detector)
+             << setw(12) << TypeName(detector)
              << setw(static_cast<int>(nameWidth + 2)) << detector->GetName()
              << setw(31) << FormatVector(detector->GetPos())
              << FormatVector(detector->GetRot()) << '\n';
@@ -104,7 +105,7 @@ bool DetectorFactory::Initialize(const json& config) {
             }
         }
 
-        PrintGeometry(m_detectors);
+        if (Terminal::Verbose()) PrintGeometry(m_detectors);
         return true;
 
     } catch (const exception& e) {

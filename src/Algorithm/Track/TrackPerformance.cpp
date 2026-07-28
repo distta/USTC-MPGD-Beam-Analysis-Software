@@ -1,6 +1,7 @@
 #include "Algorithm/Track/TrackPerformance.h"
 #include "Detector/Detector.h"
 #include "Event/DetectorFrame.h"
+#include "Terminal.h"
 
 #include <TCanvas.h>
 #include <TDirectory.h>
@@ -358,17 +359,23 @@ void PerformanceAnalyzer::Write() {
 
     std::ostringstream report;
     report << std::fixed << std::setprecision(2)
-           << "[Resolution] hit(X,Y)=(" << 1000.0 * sigmaHitX << ", "
-           << 1000.0 * sigmaHitY << ") um, angle(X,Y)=("
-           << 1.0e6 * sigmaHitX / std::sqrt(szz) << ", "
-           << 1.0e6 * sigmaHitY / std::sqrt(szz) << ") urad";
+           << "resolution " << 1000.0 * sigmaHitX << " × "
+           << 1000.0 * sigmaHitY << " µm";
     for (const auto& detector : m_referenceDetectors) {
         const double scale = pointingScale(detector->GetPos().Z());
-        report << ", DUT" << detector->GetID() << "@z=" << detector->GetPos().Z()
-               << " mm pointing(X,Y)=(" << 1000.0 * sigmaHitX * scale << ", "
-               << 1000.0 * sigmaHitY * scale << ") um";
+        report << " · DUT" << detector->GetID() << " pointing "
+               << 1000.0 * sigmaHitX * scale << " × "
+               << 1000.0 * sigmaHitY * scale << " µm";
     }
-    std::cout << report.str() << '\n';
+    Terminal::Detail(report.str());
+    if (Terminal::Verbose()) {
+        std::ostringstream angle;
+        angle << std::fixed << std::setprecision(2)
+              << "track angle resolution "
+              << 1.0e6 * sigmaHitX / std::sqrt(szz) << " × "
+              << 1.0e6 * sigmaHitY / std::sqrt(szz) << " µrad";
+        Terminal::Detail(Terminal::Muted(angle.str()));
+    }
     m_output->Write();
 }
 

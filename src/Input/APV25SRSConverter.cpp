@@ -1,4 +1,5 @@
 #include "Input/APV25SRSConverter.h"
+#include "Terminal.h"
 
 #include <TDirectory.h>
 #include <TFile.h>
@@ -322,11 +323,10 @@ bool APV25SRSConverter::Convert(const std::string& outputPath) {
    short maximumObservedMaximum = std::numeric_limits<short>::min();
    std::set<int> observedDetectors;
 
-   std::cout << "  Input:             " << inputPath << '\n'
-             << "  Output:            " << outputPath << '\n'
-             << "  Events:            " << FormatCount(entries) << '\n'
-             << "  Pedestals:         " << (hasPedestals ? "available" : "unavailable")
-             << "\n------------------------------------------------------------\n";
+   if (Terminal::Verbose()) {
+      Terminal::Detail("input " + inputPath);
+      Terminal::Detail("output " + outputPath);
+   }
 
    for (Long64_t entry = 0; entry < entries; ++entry) {
       rawTree->GetEntry(entry);
@@ -476,7 +476,8 @@ bool APV25SRSConverter::Convert(const std::string& outputPath) {
       eventTree.Fill();
 
       const Long64_t processed = entry + 1;
-      if (processed % progressInterval == 0 || processed == entries) {
+      if (Terminal::Interactive() &&
+          (processed % progressInterval == 0 || processed == entries)) {
          const double elapsed = std::chrono::duration<double>(
                                     std::chrono::steady_clock::now() - conversionStarted)
                                     .count();
@@ -484,19 +485,16 @@ bool APV25SRSConverter::Convert(const std::string& outputPath) {
          const double eta = rate > 0.0 ? (entries - processed) / rate : 0.0;
          const double percent = entries > 0 ? 100.0 * processed / entries : 100.0;
          std::ostringstream progress;
-         progress << "  Progress: " << FormatCount(processed) << " / "
+         progress << "      " << FormatCount(processed) << " / "
                   << FormatCount(entries) << " (" << std::fixed
                   << std::setprecision(1) << percent << "%)  "
                   << std::setprecision(0) << rate << " evt/s  ETA "
                   << std::setprecision(1) << eta << " s";
          std::cout << '\r' << std::left << std::setw(88) << progress.str()
-                   << std::right;
-         if (processed == entries)
-            std::cout << '\n';
-         else
-            std::cout << std::flush;
+                   << std::right << std::flush;
       }
    }
+   Terminal::ClearProgress();
 
    TTree* pedestalTree = static_cast<TTree*>(inputFile.Get("pedestals"));
    if (pedestalTree && pedestalTree->GetEntries() > 0) {
@@ -617,25 +615,26 @@ bool APV25SRSConverter::Convert(const std::string& outputPath) {
    const double elapsed = std::chrono::duration<double>(
                               std::chrono::steady_clock::now() - conversionStarted)
                               .count();
-   const size_t qaHistogramCount = 3 + 4 * planeQA.size();
-   std::cout << "------------------------------------------------------------\n"
-             << "  Conversion summary\n"
-             << "  Events written:      " << FormatCount(entries) << '\n'
-             << "  Channel waveforms:   " << FormatCount(waveformCount) << '\n'
-             << "  Detectors observed:  " << observedDetectors.size() << '\n'
-             << "  Active channels:     " << observedChannels.size() << '\n';
-   if (waveformLength > 0)
-      std::cout << "  Waveform length:     " << waveformLength << " samples\n";
-   if (waveformCount > emptyWaveformCount) {
-      std::cout << "  Raw maximum range:   " << minimumObservedMaximum << " .. "
-                << maximumObservedMaximum << " ADC\n";
+   std::ostringstream summary;
+   summary << FormatCount(entries) << " events · "
+           << FormatCount(waveformCount) << " waveforms · "
+           << FormatCount(static_cast<Long64_t>(observedChannels.size()))
+           << " channels · " << std::fixed << std::setprecision(0)
+           << (elapsed > 0.0 ? entries / elapsed : 0.0) << " evt/s";
+   Terminal::Detail(summary.str());
+   if (emptyWaveformCount > 0) {
+      Terminal::Note(FormatCount(emptyWaveformCount) + " empty waveforms");
    }
-   if (emptyWaveformCount > 0)
-      std::cout << "  Empty waveforms:     " << FormatCount(emptyWaveformCount) << '\n';
-   std::cout << "  QA histograms:       " << qaHistogramCount << '\n'
-             << "  Elapsed:             " << std::fixed << std::setprecision(1)
-             << elapsed << " s\n"
-             << "  Average rate:        " << std::setprecision(0)
-             << (elapsed > 0.0 ? entries / elapsed : 0.0) << " events/s\n";
+   if (Terminal::Verbose()) {
+      std::ostringstream detail;
+      detail << observedDetectors.size() << " detectors · "
+             << waveformLength << " samples/waveform · pedestals "
+             << (hasPedestals ? "available" : "unavailable");
+      if (waveformCount > emptyWaveformCount) {
+         detail << " · ADC max " << minimumObservedMaximum << ".."
+                << maximumObservedMaximum;
+      }
+      Terminal::Detail(Terminal::Muted(detail.str()));
+   }
    return true;
 }

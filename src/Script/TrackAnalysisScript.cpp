@@ -3,20 +3,218 @@
 #include "Event/DetectorFrame.h"
 #include "Script/Base/RawDataParser.h"
 #include "Script/Base/ScriptFactory.h"
+#include "Terminal.h"
 
+#include <TCanvas.h>
+#include <TDirectory.h>
 #include <TFile.h>
+#include <TH1D.h>
+#include <TLegend.h>
 #include <TTree.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 using namespace std;
+
+namespace {
+
+struct AxisTrackSamples {
+    vector<double> clusterCharge;
+    vector<int> clusterSize;
+    vector<double> hitADC;
+};
+
+struct DetectorTrackSamples {
+    int typeX = -1;
+    int typeY = -1;
+    AxisTrackSamples x;
+    AxisTrackSamples y;
+};
+
+pair<int, int> FindPlanarAxisTypes(const Detector& detector) {
+    const auto* config = detector.GetPlanarConfig();
+    if (!config) return {-1, -1};
+
+    int typeX = -1;
+    int typeY = -1;
+    double bestX = numeric_limits<double>::infinity();
+    double bestY = numeric_limits<double>::infinity();
+    constexpr double degreesToRadians = 3.14159265358979323846 / 180.0;
+    for (const int type : config->readoutPlaneType) {
+        const auto angleIt = config->readoutPlaneAngle.find(type);
+        if (angleIt == config->readoutPlaneAngle.end()) continue;
+        const double angle = angleIt->second * degreesToRadians;
+        const double xScore = abs(sin(angle));
+        const double yScore = abs(cos(angle));
+        if (xScore < bestX) {
+            bestX = xScore;
+            typeX = type;
+        }
+        if (yScore < bestY) {
+            bestY = yScore;
+            typeY = type;
+        }
+    }
+    if (typeX == typeY) return {-1, -1};
+    return {typeX, typeY};
+}
+
+AxisTrackSamples* AxisSamplesForType(DetectorTrackSamples& samples, int type) {
+    if (type == samples.typeX) return &samples.x;
+    if (type == samples.typeY) return &samples.y;
+    return nullptr;
+}
+
+pair<double, double> CommonRange(const vector<double>& x,
+                                 const vector<double>& y) {
+    double minimum = numeric_limits<double>::infinity();
+    double maximum = -numeric_limits<double>::infinity();
+    const auto update = [&](const vector<double>& values) {
+        for (const double value : values) {
+            if (!isfinite(value)) continue;
+            minimum = min(minimum, value);
+            maximum = max(maximum, value);
+        }
+    };
+    update(x);
+    update(y);
+    if (!isfinite(minimum) || !isfinite(maximum)) return {0.0, 1.0};
+
+    double low = min(0.0, minimum);
+    double high = max(0.0, maximum);
+    if (high <= low) return {low - 0.5, high + 0.5};
+    const double padding = 0.05 * (high - low);
+    if (low < 0.0) low -= padding;
+    high += padding;
+    return {low, high};
+}
+
+void StyleAxisHistogram(TH1D& histogram, Color_t color) {
+    histogram.SetDirectory(nullptr);
+    histogram.SetStats(false);
+    histogram.SetLineColor(color);
+    histogram.SetMarkerColor(color);
+    histogram.SetLineWidth(2);
+}
+
+void WriteOverlayCanvas(TDirectory* directory, TH1D& histogramX,
+                        TH1D& histogramY, const string& canvasName,
+                        const string& canvasTitle) {
+    if (!directory) return;
+    TDirectory::TContext context(directory);
+
+    TCanvas canvas(canvasName.c_str(), canvasTitle.c_str(), 900, 700);
+    histogramX.SetMaximum(max(1.0, 1.15 * max(histogramX.GetMaximum(),
+                                             histogramY.GetMaximum())));
+    histogramX.Draw("HIST");
+    histogramY.Draw("HIST SAME");
+    TLegend legend(0.68, 0.75, 0.88, 0.88);
+    legend.SetBorderSize(1);
+    legend.SetFillColor(kWhite);
+    legend.AddEntry(&histogramX,
+                    ("X (N=" + to_string(
+                         static_cast<long long>(histogramX.GetEntries())) + ")").c_str(),
+                    "l");
+    legend.AddEntry(&histogramY,
+                    ("Y (N=" + to_string(
+                         static_cast<long long>(histogramY.GetEntries())) + ")").c_str(),
+                    "l");
+    legend.Draw();
+    canvas.Write();
+}
+
+void WriteTrackHitDistributions(
+    TFile& output, const vector<shared_ptr<Detector>>& trackers,
+    const map<int, DetectorTrackSamples>& allSamples) {
+    auto* propertiesDirectory = output.mkdir("TrackHitProperties");
+    if (!propertiesDirectory) return;
+
+    for (const auto& detector : trackers) {
+        const auto sampleIt = allSamples.find(detector->GetID());
+        if (sampleIt == allSamples.end()) continue;
+        const auto& samples = sampleIt->second;
+        auto* detectorDirectory = propertiesDirectory->mkdir(
+            ("Detector_" + to_string(detector->GetID())).c_str());
+        if (!detectorDirectory) continue;
+
+        const auto chargeRange =
+            CommonRange(samples.x.clusterCharge, samples.y.clusterCharge);
+        TH1D chargeX(
+            "hClusterChargeX",
+            ("Detector " + to_string(detector->GetID()) +
+             " selected-track cluster charge;Cluster charge [ADC];Entries").c_str(),
+            100, chargeRange.first, chargeRange.second);
+        TH1D chargeY(
+            "hClusterChargeY",
+            ("Detector " + to_string(detector->GetID()) +
+             " selected-track cluster charge;Cluster charge [ADC];Entries").c_str(),
+            100, chargeRange.first, chargeRange.second);
+
+        int maximumClusterSize = 1;
+        for (const int size : samples.x.clusterSize)
+            maximumClusterSize = max(maximumClusterSize, size);
+        for (const int size : samples.y.clusterSize)
+            maximumClusterSize = max(maximumClusterSize, size);
+        TH1D sizeX(
+            "hClusterSizeX",
+            ("Detector " + to_string(detector->GetID()) +
+             " selected-track cluster size;Cluster size [channels];Entries").c_str(),
+            maximumClusterSize, 0.5, maximumClusterSize + 0.5);
+        TH1D sizeY(
+            "hClusterSizeY",
+            ("Detector " + to_string(detector->GetID()) +
+             " selected-track cluster size;Cluster size [channels];Entries").c_str(),
+            maximumClusterSize, 0.5, maximumClusterSize + 0.5);
+
+        const auto adcRange = CommonRange(samples.x.hitADC, samples.y.hitADC);
+        TH1D adcX(
+            "hHitADCX",
+            ("Detector " + to_string(detector->GetID()) +
+             " selected-track hit amplitude;Hit amplitude [ADC];Entries").c_str(),
+            100, adcRange.first, adcRange.second);
+        TH1D adcY(
+            "hHitADCY",
+            ("Detector " + to_string(detector->GetID()) +
+             " selected-track hit amplitude;Hit amplitude [ADC];Entries").c_str(),
+            100, adcRange.first, adcRange.second);
+
+        StyleAxisHistogram(chargeX, kBlue + 1);
+        StyleAxisHistogram(chargeY, kRed + 1);
+        StyleAxisHistogram(sizeX, kBlue + 1);
+        StyleAxisHistogram(sizeY, kRed + 1);
+        StyleAxisHistogram(adcX, kBlue + 1);
+        StyleAxisHistogram(adcY, kRed + 1);
+        for (const double value : samples.x.clusterCharge) chargeX.Fill(value);
+        for (const double value : samples.y.clusterCharge) chargeY.Fill(value);
+        for (const int value : samples.x.clusterSize) sizeX.Fill(value);
+        for (const int value : samples.y.clusterSize) sizeY.Fill(value);
+        for (const double value : samples.x.hitADC) adcX.Fill(value);
+        for (const double value : samples.y.hitADC) adcY.Fill(value);
+
+        WriteOverlayCanvas(
+            detectorDirectory, chargeX, chargeY, "cClusterChargeXY",
+            "Selected-track cluster charge: X vs Y");
+        WriteOverlayCanvas(
+            detectorDirectory, sizeX, sizeY, "cClusterSizeXY",
+            "Selected-track cluster size: X vs Y");
+        WriteOverlayCanvas(
+            detectorDirectory, adcX, adcY, "cHitADCXY",
+            "Selected-track hit amplitude: X vs Y");
+    }
+}
+
+}  // namespace
 
 void TrackAnalysisScript::LoadConfig(const json& config) {
     m_runAlignment = config.value(
@@ -48,13 +246,16 @@ void TrackAnalysisScript::LoadConfig(const json& config) {
 }
 
 void TrackAnalysisScript::Print() const {
-    cout << "[Tracking] single-hit calibration, multi-hit reconstruction, alignment="
-         << (m_runAlignment ? "on" : "off")
-         << ", estimated-resolution=" << (m_useEstimatedResolution ? "on" : "off") << '\n';
+    if (Terminal::Verbose()) {
+        Terminal::Detail(
+            "single-hit calibration · multi-hit reconstruction · alignment " +
+            string(m_runAlignment ? "on" : "off") +
+            " · estimated resolution " +
+            string(m_useEstimatedResolution ? "on" : "off"));
+    }
 }
 
 bool TrackAnalysisScript::Execute() {
-    const auto start = chrono::steady_clock::now();
     auto parser = GetParser();
     if (!parser) {
         cerr << "[TrackAnalysis] parser not set\n";
@@ -66,8 +267,6 @@ bool TrackAnalysisScript::Execute() {
         cerr << "[TrackAnalysis] at least three trackers are required\n";
         return false;
     }
-    cout << "[Tracking] input=" << parser->GetTotalEvents()
-         << " events, trackers=" << trackers.size() << '\n';
     Print();
 
     const Long64_t total = parser->GetTotalEvents();
@@ -100,7 +299,11 @@ bool TrackAnalysisScript::Execute() {
         if (!singleHitOnEveryTracker) continue;
         calibrationEvents.push_back(std::move(*event));
     }
-    cout << "[Tracking] calibration events=" << calibrationEvents.size() << '/' << total << '\n';
+    if (Terminal::Verbose()) {
+        Terminal::Detail("calibration " +
+                         Terminal::Count(calibrationEvents.size()) + "/" +
+                         Terminal::Count(total) + " events");
+    }
     if (calibrationEvents.empty()) return false;
 
     Tracking::Reconstructor calibrationReconstructor(trackers, m_tracking);
@@ -173,8 +376,14 @@ bool TrackAnalysisScript::Execute() {
         if (estimatedX > 0.0 && estimatedY > 0.0) {
             m_tracking.resolutionX = estimatedX;
             m_tracking.resolutionY = estimatedY;
-            cout << "[Tracking] estimated hit resolution X=" << 1000.0 * estimatedX
-                 << " um, Y=" << 1000.0 * estimatedY << " um\n";
+            if (Terminal::Verbose()) {
+                ostringstream estimate;
+                estimate << fixed << setprecision(1)
+                         << "estimated hit resolution "
+                         << 1000.0 * estimatedX << " × "
+                         << 1000.0 * estimatedY << " µm";
+                Terminal::Detail(estimate.str());
+            }
         } else {
             cerr << "[TrackAnalysis] hit-resolution fit failed; using configured resolution\n";
         }
@@ -186,6 +395,20 @@ bool TrackAnalysisScript::Execute() {
     calibrationEvents.clear();
     calibrationEvents.shrink_to_fit();
     Tracking::Reconstructor reconstructor(trackers, m_tracking);
+
+    map<int, DetectorTrackSamples> trackHitSamples;
+    for (const auto& detector : trackers) {
+        const auto [typeX, typeY] = FindPlanarAxisTypes(*detector);
+        if (typeX < 0 || typeY < 0) {
+            cerr << "[TrackAnalysis] detector " << detector->GetID()
+                 << " has no distinct planar X/Y readout; "
+                    "track-hit distributions will be skipped\n";
+            continue;
+        }
+        trackHitSamples.emplace(
+            detector->GetID(),
+            DetectorTrackSamples{.typeX = typeX, .typeY = typeY});
+    }
 
     size_t savedTracks = 0, trackedEvents = 0, analyzedEvents = 0, multiHitEvents = 0;
     for (Long64_t i = 0; i < total; ++i) {
@@ -212,6 +435,38 @@ bool TrackAnalysisScript::Execute() {
             if (performance && m_performanceHistograms)
                 performance->RecordTrack(event, result);
 
+            for (const auto& [id, hitIndex] : result.hitIndices) {
+                const auto sampleIt = trackHitSamples.find(id);
+                if (sampleIt == trackHitSamples.end()) continue;
+                const auto& frame = event.detectorFramesMap.at(id);
+                const auto& localHit = frame->LocalHits().at(hitIndex);
+                const auto& frameClusters = frame->Clusters();
+                const auto& frameChannelHits = frame->ChannelHits();
+                for (const int clusterIndex : localHit.clusterIndices) {
+                    if (clusterIndex < 0 ||
+                        clusterIndex >= static_cast<int>(frameClusters.size()))
+                        continue;
+                    const auto& selectedCluster = frameClusters[clusterIndex];
+                    auto* axis =
+                        AxisSamplesForType(sampleIt->second, selectedCluster.type);
+                    if (!axis) continue;
+                    if (isfinite(selectedCluster.charge))
+                        axis->clusterCharge.push_back(selectedCluster.charge);
+                    axis->clusterSize.push_back(selectedCluster.size);
+                    for (const int channelHitIndex :
+                         selectedCluster.channelHitIndices) {
+                        if (channelHitIndex < 0 ||
+                            channelHitIndex >=
+                                static_cast<int>(frameChannelHits.size()))
+                            continue;
+                        const auto& selectedHit =
+                            frameChannelHits[channelHitIndex];
+                        if (selectedHit.isValid && isfinite(selectedHit.amp))
+                            axis->hitADC.push_back(selectedHit.amp);
+                    }
+                }
+            }
+
             if (!validation) continue;
             for (const auto& [id, hitIndex] : result.hitIndices) {
                 const auto detector = DetectorFactory::GetInstance().GetDetector(id);
@@ -237,18 +492,40 @@ bool TrackAnalysisScript::Execute() {
             }
         }
     }
-    cout << "[Tracking] reconstructed=" << trackedEvents << '/' << analyzedEvents
-         << " events, multi-hit input=" << multiHitEvents
-         << ", tracks=" << savedTracks << '\n';
+    ostringstream trackingSummary;
+    const double trackedFraction =
+        analyzedEvents > 0
+            ? 100.0 * static_cast<double>(trackedEvents) / analyzedEvents
+            : 0.0;
+    trackingSummary << Terminal::Count(trackedEvents) << '/'
+                    << Terminal::Count(analyzedEvents) << " events ("
+                    << fixed << setprecision(1) << trackedFraction
+                    << "%) · " << Terminal::Count(savedTracks) << " tracks";
+    Terminal::Detail(trackingSummary.str());
     output->cd();
     tracksTree.Write();
     if (validation) validation->Write();
     if (performance && m_performanceHistograms) performance->Write();
+    WriteTrackHitDistributions(*output, trackers, trackHitSamples);
+    if (Terminal::Verbose()) {
+        for (const auto& detector : trackers) {
+            const auto sampleIt = trackHitSamples.find(detector->GetID());
+            if (sampleIt == trackHitSamples.end()) continue;
+            const auto& samples = sampleIt->second;
+            ostringstream detail;
+            detail << "tracker " << detector->GetID()
+                   << " clusters X/Y "
+                   << Terminal::Count(samples.x.clusterSize.size()) << '/'
+                   << Terminal::Count(samples.y.clusterSize.size())
+                   << " · hits X/Y "
+                   << Terminal::Count(samples.x.hitADC.size()) << '/'
+                   << Terminal::Count(samples.y.hitADC.size());
+            Terminal::Detail(Terminal::Muted(detail.str()));
+        }
+    }
     tracksTree.SetDirectory(nullptr);
     if (validation) validation->SetDirectory(nullptr);
     output->Close();
-    cout << "[Tracking] output=TrackInfo.root, elapsed="
-         << fixed << setprecision(2) << chrono::duration<double>(chrono::steady_clock::now() - start).count() << " s\n";
     return true;
 }
 

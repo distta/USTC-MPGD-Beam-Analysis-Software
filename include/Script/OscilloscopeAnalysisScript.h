@@ -2,6 +2,7 @@
 
 #include "Script/Base/IScript.h"
 
+#include <array>
 #include <string>
 
 class OscilloscopeAnalysisScript : public IScript {
@@ -25,4 +26,7 @@ class OscilloscopeAnalysisScript : public IScript {
     double m_minPulseAmplitude = 0.1;
     int m_histogramBins = 160;
     int m_maxWaveformFiles = -1;
+    std::array<double, 2> m_eventIDTimeWindowNs = {-100.0, 0.0};
+    int m_eventIDMedianFilterSamples = 5;
+    std::array<double, 2> m_signalTimeWindowNs = {-160.0, -80.0};
 };

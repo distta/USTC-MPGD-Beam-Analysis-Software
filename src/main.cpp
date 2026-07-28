@@ -3,6 +3,9 @@
 #include "Input/ConverterFactory.h"
 #include "Script/Base/RawDataParser.h"
 #include "Script/Base/ScriptFactory.h"
+#include "Terminal.h"
+
+#include <TError.h>
 
 #include <algorithm>
 #include <cctype>
@@ -33,7 +36,7 @@ constexpr int kExecutionError = 6;
 
 void PrintUsage() {
    std::cout << "Usage:\n"
-             << "  ./BeamAnalysis <base_dir> <run_id>\n\n"
+             << "  ./BeamAnalysis [--verbose] [--no-color] <base_dir> <run_id>\n\n"
              << "Example:\n"
              << "  ./BeamAnalysis /data/beam 1591\n";
 }
@@ -193,11 +196,6 @@ std::string FormatCount(Long64_t value) {
    return text;
 }
 
-std::string DetectorSummary(size_t trackers, size_t dut, size_t ignored) {
-   return std::to_string(trackers) + " Tracker, " + std::to_string(dut) +
-          " DUT, " + std::to_string(ignored) + " Ignored";
-}
-
 void PrintRunPlan(const std::string& runID, const json& config,
                   const fs::path& configFile, const fs::path& baseDir,
                   const fs::path& outputDirectory,
@@ -214,27 +212,31 @@ void PrintRunPlan(const std::string& runID, const json& config,
       else
          ++ignored;
    }
-   std::cout << "BeamAnalysis run " << runID << '\n'
-             << "Mode     : " << config.value("mode", "analysis") << '\n'
-             << "Base     : " << DisplayPath(baseDir) << '\n'
-             << "Config   : " << DisplayPath(configFile) << '\n'
-             << "Input    : " << inputSummary << '\n'
-             << "Output   : " << DisplayPath(outputDirectory) << '\n'
-             << "Geometry : " << DetectorSummary(trackers, dut, ignored)
-             << '\n'
-             << "Scripts  : ";
    const auto scripts = EnabledScripts(config);
-   if (scripts.empty()) {
-      std::cout << "(none)\n";
-   } else {
+   std::cout << '\n'
+             << Terminal::Bold("BeamAnalysis") << Terminal::Muted(" · run ")
+             << Terminal::Accent(runID) << Terminal::Muted(" · ")
+             << config.value("mode", "analysis") << '\n'
+             << Terminal::Muted("  Input   ") << inputSummary << '\n'
+             << Terminal::Muted("  Output  ") << DisplayPath(outputDirectory)
+             << '\n'
+             << Terminal::Muted("  Setup   ")
+             << trackers << " trackers · " << dut << " DUT";
+   if (ignored > 0) std::cout << " · " << ignored << " ignored";
+   std::cout << " · " << scripts.size() << " analyses\n";
+
+   if (Terminal::Verbose()) {
+      std::cout << Terminal::Muted("  Base    ") << DisplayPath(baseDir) << '\n'
+                << Terminal::Muted("  Config  ") << DisplayPath(configFile)
+                << '\n'
+                << Terminal::Muted("  Scripts ");
       for (size_t index = 0; index < scripts.size(); ++index) {
          if (index > 0) std::cout << ", ";
          std::cout << (*scripts[index])["name"].get<std::string>();
       }
       std::cout << '\n';
    }
-   std::cout << '\n'
-             << std::flush;
+   std::cout << '\n' << std::flush;
 }
 
 bool EnsureDirectory(const fs::path& directory, std::string& error) {
@@ -251,17 +253,16 @@ bool EnsureDirectory(const fs::path& directory, std::string& error) {
 bool RunAnalysis(const json& config,
                  const std::shared_ptr<RawDataParser>& parser,
                  const fs::path& outputDirectory,
-                 std::string& failure) {
+                 std::string& failure,
+                 size_t stageOffset,
+                 size_t totalStages) {
    const auto enabled = EnabledScripts(config);
    for (size_t index = 0; index < enabled.size(); ++index) {
       const auto& scriptConfig = *enabled[index];
       const std::string name = scriptConfig["name"].get<std::string>();
       const std::string type = scriptConfig["type"].get<std::string>();
       const auto started = std::chrono::steady_clock::now();
-      std::cout << "------------------------------------------------------------\n"
-                << "Script " << index + 1 << '/' << enabled.size() << ": "
-                << name << '\n'
-                << "------------------------------------------------------------\n";
+      Terminal::StageStart(stageOffset + index + 1, totalStages, name);
 
       std::shared_ptr<IScript> script;
       bool finalizeAttempted = false;
@@ -321,17 +322,12 @@ bool RunAnalysis(const json& config,
               .count();
       if (!success) {
          failure = name + ": " + scriptError;
-         std::cerr << "\nScript " << index + 1 << '/' << enabled.size()
-                   << " failed: " << name << " after " << std::fixed
-                   << std::setprecision(1) << elapsedSeconds << " s: "
-                   << scriptError << "\n"
-                   << "------------------------------------------------------------\n";
+         std::cerr << Terminal::Failure("      ✗ failed") << " after "
+                   << std::fixed << std::setprecision(1) << elapsedSeconds
+                   << "s: " << scriptError << '\n';
          return false;
       }
-      std::cout << "\nScript " << index + 1 << '/' << enabled.size()
-                << " complete: " << name << " in " << std::fixed
-                << std::setprecision(1) << elapsedSeconds << " s\n"
-                << "------------------------------------------------------------\n\n";
+      Terminal::StageDone(elapsedSeconds);
    }
    return true;
 }
@@ -351,16 +347,40 @@ bool RunEventDisplay(const std::shared_ptr<RawDataParser>& parser,
 }  // namespace
 
 int main(int argc, char* argv[]) {
-   if (argc == 2 && std::string(argv[1]) == "--help") {
+   if (argc == 2 &&
+       (std::string(argv[1]) == "--help" ||
+        std::string(argv[1]) == "-h")) {
       PrintUsage();
       return 0;
    }
-   if (argc != 3) {
+
+   bool verbose = false;
+   bool color = true;
+   std::vector<std::string> positional;
+   for (int index = 1; index < argc; ++index) {
+      const std::string argument = argv[index];
+      if (argument == "--verbose" || argument == "-v") {
+         verbose = true;
+      } else if (argument == "--no-color") {
+         color = false;
+      } else if (!argument.empty() && argument.front() == '-') {
+         std::cerr << "Unknown option: " << argument << '\n';
+         PrintUsage();
+         return kUsageError;
+      } else {
+         positional.push_back(argument);
+      }
+   }
+   if (positional.size() != 2) {
       PrintUsage();
       return kUsageError;
    }
 
-   const std::string runID = argv[2];
+   Terminal::SetVerbose(verbose);
+   Terminal::SetColor(color);
+   gErrorIgnoreLevel = kWarning;
+
+   const std::string runID = positional[1];
    if (runID.empty() ||
        !std::all_of(runID.begin(), runID.end(),
                     [](unsigned char c) { return std::isdigit(c); })) {
@@ -371,7 +391,7 @@ int main(int argc, char* argv[]) {
 
    const auto runStarted = std::chrono::steady_clock::now();
 
-   const fs::path baseDir = fs::absolute(argv[1]).lexically_normal();
+   const fs::path baseDir = fs::absolute(positional[0]).lexically_normal();
    const fs::path rawDirectory = baseDir / "raw";
    const fs::path rootConfigFile = baseDir / "config.json";
    const fs::path rawConfigFile = rawDirectory / "config.json";
@@ -451,6 +471,9 @@ int main(int argc, char* argv[]) {
    PrintRunPlan(runID, config, configFile, baseDir, outputDirectory,
                 inputSummary);
 
+   const size_t totalStages =
+       EnabledScripts(config).size() + (shouldConvert ? 1 : 0);
+   const size_t analysisStageOffset = shouldConvert ? 1 : 0;
    if (shouldConvert) {
       const auto started = std::chrono::steady_clock::now();
       const std::string converterType =
@@ -459,9 +482,7 @@ int main(int argc, char* argv[]) {
          std::cerr << "Input/conversion error: " << error << '\n';
          return kInputError;
       }
-      std::cout << "\n============================================================\n"
-                << "  Conversion started: " << converterType << '\n'
-                << "============================================================\n";
+      Terminal::StageStart(1, totalStages, "Convert · " + converterType);
       if (!converter->Convert(processedInput.string())) {
          std::cerr << "Input/conversion error: conversion failed\n";
          return kInputError;
@@ -472,14 +493,9 @@ int main(int argc, char* argv[]) {
                    << processedInput << '\n';
          return kInputError;
       }
-      std::cout << "============================================================\n"
-                << "  Conversion completed in " << std::fixed
-                << std::setprecision(1)
-                << std::chrono::duration<double>(
-                       std::chrono::steady_clock::now() - started)
-                       .count()
-                << " s\n"
-                << "============================================================\n";
+      Terminal::StageDone(std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - started)
+                              .count());
    }
 
    auto& detectorFactory = DetectorFactory::GetInstance();
@@ -496,7 +512,8 @@ int main(int argc, char* argv[]) {
    bool success = false;
    try {
       if (config["mode"] == "analysis") {
-         success = RunAnalysis(config, parser, outputDirectory, error);
+         success = RunAnalysis(config, parser, outputDirectory, error,
+                               analysisStageOffset, totalStages);
       } else {
          success = RunEventDisplay(parser, outputDirectory, error);
       }
@@ -514,11 +531,12 @@ int main(int argc, char* argv[]) {
        std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                      runStarted)
            .count();
-   std::cout << "\nSummary\n"
-             << "Status  : " << (success ? "OK" : "FAILED") << '\n'
-             << "Run ID  : " << runID << '\n'
-             << "Output  : " << DisplayPath(outputDirectory) << '\n'
-             << "Elapsed : " << std::fixed << std::setprecision(1)
-             << elapsed << " s\n";
+   std::ostringstream elapsedText;
+   elapsedText << std::fixed << std::setprecision(1) << elapsed << "s";
+   std::cout << (success ? Terminal::Success("✓ Done")
+                         : Terminal::Failure("✗ Failed"))
+             << Terminal::Muted(" · " + elapsedText.str()) << '\n'
+             << Terminal::Muted("  Output  ")
+             << DisplayPath(outputDirectory) << '\n';
    return success ? 0 : kExecutionError;
 }

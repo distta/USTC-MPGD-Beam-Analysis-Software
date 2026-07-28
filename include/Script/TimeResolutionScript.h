@@ -19,10 +19,12 @@ class TimeResolutionScript : public IScript {
    private:
     std::string m_trackFile;
     std::string m_dutFile = "PadDUTInfo.root";
+    std::string m_oscilloscopeFile = "OscilloscopeAnalysis.root";
     std::string m_outputFile = "TimeResolution.root";
     int m_histogramBins = 160;
     std::vector<int> m_trackerIDs;
     bool m_analyzeDUTTiming = false;
-    bool m_applyDUTTimeWalkCorrection = false;
+    double m_timingEfficiencyWindowNs = 25.0;
+    double m_timingEfficiencyStepNs = 0.5;
     json m_timingWaveformConfig = json{{"mode", "Fit"}};
 };

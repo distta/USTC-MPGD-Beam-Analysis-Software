@@ -36,11 +36,11 @@
 namespace {
 
 // ======================== USER CONFIGURATION ========================
-const std::string dataDirectory = "data/Beam202607/LHCb_75um";
+const std::string dataDirectory = "data/LHCb";
 const std::string detectorName = "75 #mum #muRGroove Pad readout";
-const std::string gas = "Ar/CF4/CO2=45:40:15";
+const std::string gas = "Ar/CF4/ISO=88:10:2";
 const int configuredDUTID = 10;
-const double driftFieldVPerCm = 3500.0;
+const double driftFieldVPerCm = 600.0;
 const std::string configuredOutputDirectory = "auto";
 
 struct ScanSetting {
@@ -50,26 +50,34 @@ struct ScanSetting {
 };
 
 // Only the explicitly listed settings are plotted.
-const std::array<ScanSetting, 12> kScanSettings = {{
-    {-2030, -980, 97},
-    {-2040, -990, 99},
-    {-2050, -1000, 101},
-    {-2060, -1010, 103},
-    {-2070, -1020, 105},
-    {-2080, -1030, 107},
-    {-2090, -1040, 109},
-    {-2100, -1050, 111},
-    {-2110, -1060, 113},
-    {-2120, -1070, 115},
-    {-2020, -970, 117},
-    {-2010, -960, 119},
+const std::array<ScanSetting, 20> kScanSettings = {{
+    {-800, -600, 149},
+    {-800, -610, 151},
+    {-800, -620, 153},
+    {-800, -630, 155},
+    {-800, -640, 157},
+    {-800, -650, 159},
+    {-800, -660, 161},
+    {-800, -670, 163},
+    {-800, -680, 165},
+    {-800, -690, 167},
+    {-800, -700, 169},
+    {-800, -710, 171},
+    {-800, -720, 173},
+    {-800, -730, 175},
+    {-800, -740, 177},
+    {-800, -750, 179},
+    {-800, -760, 181},
+    {-800, -770, 183},
+    {-800, -780, 185},
 }};
 
 // One-based (column, row) pad bins. These four bins remain near zero
 // efficiency across the voltage scan and are therefore excluded explicitly.
 // Edit this set if the channel mask changes.
 const std::set<std::pair<int, int>> kBadPads = {
-    {3, 9},
+    {5, 9},
+    {5, 5},
     {7, 4},
     {9, 3},
     {9, 7},

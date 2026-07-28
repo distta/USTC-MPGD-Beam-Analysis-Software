@@ -5,6 +5,7 @@
 #include "Event/DetectorFrame.h"
 #include "Script/Base/RawDataParser.h"
 #include "Script/Base/ScriptFactory.h"
+#include "Terminal.h"
 
 #include "Math/Factory.h"
 #include "Math/Functor.h"
@@ -82,6 +83,86 @@ struct FakeEfficiencySample {
     double partnerPredX{0.0};
     double partnerPredY{0.0};
 };
+
+std::pair<double, double> DistributionRange(
+    const std::vector<double>& values) {
+    double minimum = std::numeric_limits<double>::infinity();
+    double maximum = -std::numeric_limits<double>::infinity();
+    for (double value : values) {
+        if (!std::isfinite(value)) continue;
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+    }
+    if (!std::isfinite(minimum) || !std::isfinite(maximum))
+        return {0.0, 1.0};
+
+    double low = std::min(0.0, minimum);
+    double high = std::max(0.0, maximum);
+    if (high <= low) return {low - 0.5, high + 0.5};
+    const double padding = 0.05 * (high - low);
+    if (low < 0.0) low -= padding;
+    high += padding;
+    return {low, high};
+}
+
+void StyleDistribution(TH1D& histogram) {
+    histogram.SetDirectory(nullptr);
+    histogram.SetStats(false);
+    histogram.SetLineColor(kBlue + 1);
+    histogram.SetLineWidth(2);
+}
+
+void WriteDUTHitProperties(
+    TDirectory* detectorDirectory, int dutID,
+    const std::vector<double>& clusterCharges,
+    const std::vector<int>& clusterSizes,
+    const std::vector<double>& hitADCs) {
+    if (!detectorDirectory) return;
+    auto* directory = detectorDirectory->mkdir("HitProperties");
+    if (!directory) return;
+    TDirectory::TContext context(directory);
+
+    const auto chargeRange = DistributionRange(clusterCharges);
+    TH1D charge(
+        "hClusterCharge",
+        ("DUT " + std::to_string(dutID) +
+         " track-matched cluster charge;Cluster charge [ADC];Entries").c_str(),
+        100, chargeRange.first, chargeRange.second);
+    StyleDistribution(charge);
+    for (double value : clusterCharges) charge.Fill(value);
+    TCanvas chargeCanvas(
+        "cClusterCharge", "Track-matched DUT cluster charge", 900, 700);
+    charge.Draw("HIST");
+    chargeCanvas.Write();
+
+    int maximumClusterSize = 1;
+    for (int size : clusterSizes)
+        maximumClusterSize = std::max(maximumClusterSize, size);
+    TH1D size(
+        "hClusterSize",
+        ("DUT " + std::to_string(dutID) +
+         " track-matched cluster size;Cluster size [channels];Entries").c_str(),
+        maximumClusterSize, 0.5, maximumClusterSize + 0.5);
+    StyleDistribution(size);
+    for (int value : clusterSizes) size.Fill(value);
+    TCanvas sizeCanvas(
+        "cClusterSize", "Track-matched DUT cluster size", 900, 700);
+    size.Draw("HIST");
+    sizeCanvas.Write();
+
+    const auto adcRange = DistributionRange(hitADCs);
+    TH1D adc(
+        "hHitADC",
+        ("DUT " + std::to_string(dutID) +
+         " track-matched hit amplitude;Hit amplitude [ADC];Entries").c_str(),
+        100, adcRange.first, adcRange.second);
+    StyleDistribution(adc);
+    for (double value : hitADCs) adc.Fill(value);
+    TCanvas adcCanvas(
+        "cHitADC", "Track-matched DUT hit amplitude", 900, 700);
+    adc.Draw("HIST");
+    adcCanvas.Write();
+}
 
 struct EfficiencyGrid {
     std::vector<long long> denominator;
@@ -1217,6 +1298,7 @@ void PadDUTAnalysisScript::LoadConfig(const json& config) {
 }
 
 void PadDUTAnalysisScript::Print() const {
+    if (!Terminal::Verbose()) return;
     std::cout << "PadDUTAnalysisScript Configuration:\n"
               << "  Run Alignment: " << (m_runAlignment ? "Yes" : "No") << '\n'
               << "  Alignment Parameters:";
@@ -1244,7 +1326,6 @@ void PadDUTAnalysisScript::Print() const {
 }
 
 bool PadDUTAnalysisScript::Execute() {
-    const auto started = std::chrono::steady_clock::now();
     auto parser = GetParser();
     if (!parser) {
         std::cerr << "[PadDUTAnalysis] Parser is not set\n";
@@ -1334,13 +1415,14 @@ bool PadDUTAnalysisScript::Execute() {
         }
         events.push_back(std::move(event));
         ++processed;
-        if (m_progressInterval > 0 && processed % m_progressInterval == 0) {
-            std::cout << "\r[PadDUTAnalysis] processed " << processed
+        if (Terminal::Interactive() && m_progressInterval > 0 &&
+            processed % (5 * m_progressInterval) == 0) {
+            std::cout << "\r      processing "
+                      << Terminal::Count(processed)
                       << " single-track events" << std::flush;
         }
     }
-    std::cout << "\r[PadDUTAnalysis] processed " << processed
-              << " single-track events\n";
+    Terminal::ClearProgress();
 
     std::unordered_map<int, AlignmentResult> alignmentResults;
     if (m_runAlignment) {
@@ -1392,6 +1474,9 @@ bool PadDUTAnalysisScript::Execute() {
         std::vector<double> residualsY;
         std::vector<PadAlignmentQAPoint> alignmentQAPoints;
         std::vector<EfficiencySample> samples;
+        std::vector<double> matchedClusterCharges;
+        std::vector<int> matchedClusterSizes;
+        std::vector<double> matchedHitADCs;
         TH2D reconstructedHitMap(
             "hReconstructedHitMap",
             "All reconstructed DUT hits;Reconstructed X [mm];Reconstructed Y [mm]",
@@ -1446,12 +1531,19 @@ bool PadDUTAnalysisScript::Execute() {
                     resX = match.residualX;
                     resY = match.residualY;
                     selectedCluster = clusters[static_cast<size_t>(clusterIndex)];
+                    if (std::isfinite(selectedCluster.charge))
+                        matchedClusterCharges.push_back(selectedCluster.charge);
+                    matchedClusterSizes.push_back(selectedCluster.size);
                     matchedHitMap.Fill(hitX, hitY);
                     for (int index : selectedCluster.channelHitIndices) {
                         if (index >= 0 &&
                             static_cast<size_t>(index) < channelHits.size()) {
-                            selectedChannelHits.push_back(
-                                channelHits[static_cast<size_t>(index)]);
+                            const auto& selectedHit =
+                                channelHits[static_cast<size_t>(index)];
+                            selectedChannelHits.push_back(selectedHit);
+                            if (selectedHit.isValid &&
+                                std::isfinite(selectedHit.amp))
+                                matchedHitADCs.push_back(selectedHit.amp);
                         }
                     }
                     residualsX.push_back(resX);
@@ -1481,6 +1573,16 @@ bool PadDUTAnalysisScript::Execute() {
 
         auto* detectorDirectory = GetOrCreateDirectory(
             &outputFile, "DUT_" + std::to_string(dutID));
+        WriteDUTHitProperties(
+            detectorDirectory, dutID, matchedClusterCharges,
+            matchedClusterSizes, matchedHitADCs);
+        if (Terminal::Verbose()) {
+            Terminal::Detail(
+                "DUT" + std::to_string(dutID) + " hit properties · " +
+                Terminal::Count(matchedClusterSizes.size()) +
+                " clusters · " + Terminal::Count(matchedHitADCs.size()) +
+                " channel hits");
+        }
         const auto alignment = alignmentResults.find(dutID);
         if (alignment != alignmentResults.end()) {
             WriteAlignmentDiagnostics(
@@ -1585,25 +1687,31 @@ bool PadDUTAnalysisScript::Execute() {
             efficiency, kY, m_effMinEntriesPerBin);
         const auto efficiency2D = EstimateEfficiency(
             efficiency, k2D, m_effMinEntriesPerBin);
-        std::cout << std::fixed << std::setprecision(4)
-                  << "[PadDUTAnalysis] DUT " << dutID
-                  << ": events=" << efficiency2D.total
-                  << ", sigma68X=" << resultX.sigma68 << " mm"
-                  << ", sigma68Y=" << resultY.sigma68 << " mm"
-                  << ", effX=" << 100.0 * efficiencyX.value << "%"
-                  << ", effY=" << 100.0 * efficiencyY.value << "%"
-                  << ", eff2D=" << 100.0 * efficiency2D.value << "%"
-                  << ", fake2D=" << 100.0 * fake2D.value << "%\n";
+        std::ostringstream summary;
+        summary << "DUT" << dutID << " · "
+                << Terminal::Count(matchedClusterSizes.size()) << '/'
+                << Terminal::Count(efficiency2D.total) << " matched · "
+                << std::fixed << std::setprecision(2)
+                << "efficiency " << 100.0 * efficiency2D.value << "% · "
+                << std::setprecision(3)
+                << "fake " << 100.0 * fake2D.value << "% · "
+                << std::setprecision(2)
+                << "σ68 " << resultX.sigma68 << " × "
+                << resultY.sigma68 << " mm";
+        Terminal::Detail(summary.str());
+        if (Terminal::Verbose()) {
+            std::ostringstream axes;
+            axes << std::fixed << std::setprecision(2)
+                 << "DUT" << dutID << " efficiency X/Y "
+                 << 100.0 * efficiencyX.value << "% / "
+                 << 100.0 * efficiencyY.value << '%';
+            Terminal::Detail(Terminal::Muted(axes.str()));
+        }
     }
 
     outputFile.cd();
     outputTree.Write();
     outputFile.Close();
     trackFile.Close();
-    const double elapsed = std::chrono::duration<double>(
-                               std::chrono::steady_clock::now() - started)
-                               .count();
-    std::cout << "[PadDUTAnalysis] wrote " << outputPath << " in "
-              << std::fixed << std::setprecision(1) << elapsed << " s\n";
     return true;
 }

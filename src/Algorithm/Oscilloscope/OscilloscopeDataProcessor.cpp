@@ -1,36 +1,52 @@
 #include "Algorithm/Oscilloscope/OscilloscopeDataProcessor.h"
 
-#include "Algorithm/AlgorithmFactory.h"
-
-#include <TCanvas.h>
-#include <TDirectory.h>
-#include <TFile.h>
-#include <TGraph.h>
-#include <TLatex.h>
-#include <TLine.h>
-#include <TNamed.h>
-#include <TTree.h>
-
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
-#include <iomanip>
-#include <iostream>
 #include <limits>
+#include <map>
 #include <regex>
 #include <sstream>
-#include <utility>
+#include <string>
 #include <vector>
 
 using namespace std;
 
 namespace {
 
-constexpr int kTimingCacheVersion = 6;
+constexpr int kEventIDBits = 16;
+constexpr int kFrameBits = kEventIDBits + 2;
 constexpr double kEventBitPeriodSeconds = 25.0e-9;
+
+struct Waveform {
+    vector<double> time;
+    vector<double> amplitude;
+};
+
+enum class TimingStatus {
+    NoWindow,
+    BelowAmplitude,
+    NoCrossing,
+    Valid,
+};
+
+struct TimingResult {
+    double timeNs = numeric_limits<double>::quiet_NaN();
+    double amplitude = numeric_limits<double>::quiet_NaN();
+    double baseline = numeric_limits<double>::quiet_NaN();
+    double threshold = numeric_limits<double>::quiet_NaN();
+    TimingStatus status = TimingStatus::NoWindow;
+};
+
+struct EventIDResult {
+    uint64_t eventID = 0;
+    double frameStartNs = numeric_limits<double>::quiet_NaN();
+    double threshold = numeric_limits<double>::quiet_NaN();
+    bool valid = false;
+};
 
 bool ParsePair(const string& line, double& first, double& second) {
     const char* begin = line.c_str();
@@ -43,497 +59,417 @@ bool ParsePair(const string& line, double& first, double& second) {
     return end != secondBegin;
 }
 
-bool ParseTraceHeader(ifstream& input, const filesystem::path& path,
-                      int& segmentCount, int& segmentSize, string& error) {
-    string line;
-    if (!getline(input, line) || !getline(input, line)) {
-        error = "incomplete header in " + path.string();
-        return false;
-    }
-    replace(line.begin(), line.end(), '\r', ' ');
-    vector<string> fields;
-    string field;
-    stringstream header(line);
-    while (getline(header, field, ',')) fields.push_back(field);
-    if (fields.size() < 4 || fields[0] != "Segments") {
-        error = "invalid segment header in " + path.string();
-        return false;
-    }
-    try {
-        segmentCount = stoi(fields[1]);
-        segmentSize = stoi(fields[3]);
-    } catch (...) {
-        error = "invalid segment counts in " + path.string();
-        return false;
-    }
-    if (segmentCount <= 0 || segmentSize <= 1) {
-        error = "non-positive segment dimensions in " + path.string();
-        return false;
-    }
-
-    while (getline(input, line)) {
-        if (line.rfind("Time,Ampl", 0) == 0) return true;
-    }
-    error = "Time,Ampl header missing in " + path.string();
-    return false;
-}
-
-}  // namespace
-
-struct OscilloscopeDataProcessor::StreamTraceReader {
-    ifstream input;
-    filesystem::path path;
-    int segmentCount = 0;
-    int segmentSize = 0;
-    double timeMin = 0.0;
-    double timeMax = 0.0;
-
-    bool Open(const filesystem::path& inputPath, double minTime,
-              double maxTime, string& error) {
-        path = inputPath;
-        timeMin = minTime;
-        timeMax = maxTime;
-        input.open(path);
-        if (!input) {
+class TraceReader {
+   public:
+    bool Open(const filesystem::path& path, string& error) {
+        m_input.open(path);
+        if (!m_input) {
             error = "cannot open " + path.string();
             return false;
         }
-        return ParseTraceHeader(input, path, segmentCount, segmentSize, error);
+
+        string line;
+        if (!getline(m_input, line) || !getline(m_input, line)) {
+            error = "incomplete header in " + path.string();
+            return false;
+        }
+        replace(line.begin(), line.end(), '\r', ' ');
+        vector<string> fields;
+        string field;
+        stringstream header(line);
+        while (getline(header, field, ',')) fields.push_back(field);
+        if (fields.size() < 4 || fields[0] != "Segments") {
+            error = "invalid segment header in " + path.string();
+            return false;
+        }
+        try {
+            m_segmentCount = stoi(fields[1]);
+            m_segmentSize = stoi(fields[3]);
+        } catch (...) {
+            error = "invalid segment counts in " + path.string();
+            return false;
+        }
+        if (m_segmentCount <= 0 || m_segmentSize <= 1) {
+            error = "non-positive segment dimensions in " + path.string();
+            return false;
+        }
+        while (getline(m_input, line)) {
+            if (line.rfind("Time,Ampl", 0) == 0) return true;
+        }
+        error = "Time,Ampl header missing in " + path.string();
+        return false;
     }
 
-    bool ReadSegment(int segmentIndex, WaveformSegment& segment) {
-        segment.time.clear();
-        segment.amplitude.clear();
-        segment.time.reserve(static_cast<size_t>(segmentSize / 2));
-        segment.amplitude.reserve(static_cast<size_t>(segmentSize / 2));
+    bool ReadSegment(Waveform& waveform) {
+        waveform.time.clear();
+        waveform.amplitude.clear();
+        waveform.time.reserve(m_segmentSize);
+        waveform.amplitude.reserve(m_segmentSize);
 
         string line;
         double firstTime = 0.0;
         double pitch = 0.0;
-        for (int localSample = 0; localSample < segmentSize; ++localSample) {
-            if (!getline(input, line)) {
-                return false;
-            }
-
+        for (int sample = 0; sample < m_segmentSize; ++sample) {
+            if (!getline(m_input, line)) return false;
             double time = 0.0;
             double amplitude = 0.0;
-            if (localSample < 2) {
+            if (sample < 2) {
                 if (!ParsePair(line, time, amplitude)) continue;
-                if (localSample == 0) {
+                if (sample == 0)
                     firstTime = time;
-                } else {
+                else
                     pitch = time - firstTime;
-                }
             } else {
-                time = firstTime + localSample * pitch;
+                time = firstTime + sample * pitch;
                 const char* comma = strchr(line.c_str(), ',');
                 if (!comma) continue;
                 char* end = nullptr;
                 amplitude = strtod(comma + 1, &end);
                 if (end == comma + 1) continue;
             }
-
-            if (time >= timeMin && time <= timeMax) {
-                segment.time.push_back(time);
-                segment.amplitude.push_back(amplitude);
-            }
+            waveform.time.push_back(time);
+            waveform.amplitude.push_back(amplitude);
         }
         return true;
     }
+
+    int SegmentCount() const { return m_segmentCount; }
+
+   private:
+    ifstream m_input;
+    int m_segmentCount = 0;
+    int m_segmentSize = 0;
 };
 
-double OscilloscopeDataProcessor::DecodeArriveTime(const WaveformSegment& waveform,
-                                                   double threshold, double startTime, bool risingFlag) const {
-    const size_t count = min(waveform.time.size(), waveform.amplitude.size());
-    if (count < 2) return numeric_limits<double>::quiet_NaN();
-
-    auto timeIt = lower_bound(waveform.time.begin(), waveform.time.begin() + count, startTime);
-    size_t begin = timeIt == waveform.time.begin()
-                       ? 1
-                       : static_cast<size_t>(timeIt - waveform.time.begin());
-    for (size_t i = begin; i < count; ++i) {
-        const double y0 = waveform.amplitude[i - 1];
-        const double y1 = waveform.amplitude[i];
-
-        const bool rising = y0 < threshold && y1 >= threshold;
-        const bool falling = y0 >= threshold && y1 < threshold;
-
-        if (risingFlag) {
-            if (!rising) continue;
-        } else {
-            if (!rising && !falling) continue;
-        }
-
-        const double fraction = (threshold - y0) / (y1 - y0);
-        const double crossing = waveform.time[i - 1] +
-                                fraction * (waveform.time[i] - waveform.time[i - 1]);
-        if (crossing >= startTime) return crossing;
-    }
-    return numeric_limits<double>::quiet_NaN();
+double Quantile(vector<double> values, double fraction) {
+    if (values.empty()) return numeric_limits<double>::quiet_NaN();
+    const size_t index = min(
+        values.size() - 1,
+        static_cast<size_t>(fraction * static_cast<double>(values.size())));
+    nth_element(values.begin(), values.begin() + index, values.end());
+    return values[index];
 }
 
-uint64_t OscilloscopeDataProcessor::DecodeEventID(const WaveformSegment& eventCode, double startTime) const {
-    uint64_t decodedEventID = 0;
-    const size_t count = min(eventCode.time.size(), eventCode.amplitude.size());
-    if (count == 0) return numeric_limits<uint64_t>::max();
+double InterpolatedCrossing(const vector<double>& time,
+                            const vector<double>& amplitude,
+                            size_t second, double threshold) {
+    if (second == 0 || second >= time.size() ||
+        second >= amplitude.size())
+        return numeric_limits<double>::quiet_NaN();
+    const double firstAmplitude = amplitude[second - 1];
+    const double secondAmplitude = amplitude[second];
+    const double difference = secondAmplitude - firstAmplitude;
+    if (difference == 0.0) return time[second];
+    const double fraction = (threshold - firstAmplitude) / difference;
+    return time[second - 1] +
+           fraction * (time[second] - time[second - 1]);
+}
 
-    for (int bit = 0; bit < m_eventBits; ++bit) {
-        const double sampleTime = startTime + (bit + 0.5) * kEventBitPeriodSeconds;
-        auto sampleIt = lower_bound(eventCode.time.begin(), eventCode.time.begin() + count,
-                                    sampleTime);
-        if (sampleIt == eventCode.time.begin() + count || sampleTime < eventCode.time.front())
-            return numeric_limits<uint64_t>::max();
+double InterpolatedCrossing(const Waveform& waveform, size_t second,
+                            double threshold) {
+    return InterpolatedCrossing(waveform.time, waveform.amplitude,
+                                second, threshold);
+}
 
-        size_t sample = static_cast<size_t>(sampleIt - eventCode.time.begin());
-        if (sample > 0 && sampleTime - eventCode.time[sample - 1] <= eventCode.time[sample] - sampleTime)
+vector<double> MedianFilter(const vector<double>& values, size_t count,
+                            int windowSamples) {
+    vector<double> filtered(count);
+    vector<double> neighborhood;
+    neighborhood.reserve(static_cast<size_t>(windowSamples));
+    const size_t radius = static_cast<size_t>(windowSamples / 2);
+    for (size_t sample = 0; sample < count; ++sample) {
+        const size_t begin = sample > radius ? sample - radius : 0;
+        const size_t end = min(count, sample + radius + 1);
+        neighborhood.assign(values.begin() + begin, values.begin() + end);
+        const size_t middle = neighborhood.size() / 2;
+        nth_element(neighborhood.begin(), neighborhood.begin() + middle,
+                    neighborhood.end());
+        filtered[sample] = neighborhood[middle];
+    }
+    return filtered;
+}
+
+EventIDResult DecodeEventID(const Waveform& waveform,
+                            const OscilloscopeProcessingConfig& config) {
+    EventIDResult result;
+    const size_t count =
+        min(waveform.time.size(), waveform.amplitude.size());
+    if (count < static_cast<size_t>(kFrameBits)) return result;
+
+    const vector<double> filteredAmplitude = MedianFilter(
+        waveform.amplitude, count, config.eventIDMedianFilterSamples);
+    const double low = Quantile(filteredAmplitude, 0.05);
+    const double high = Quantile(filteredAmplitude, 0.95);
+    result.threshold = 0.5 * (low + high);
+    if (!isfinite(result.threshold) || high - low < 0.2) return result;
+
+    const double timeWindowMin =
+        config.eventIDTimeWindowNs[0] * 1.0e-9;
+    const double timeWindowMax =
+        config.eventIDTimeWindowNs[1] * 1.0e-9;
+    const auto windowBegin =
+        lower_bound(waveform.time.begin(), waveform.time.begin() + count,
+                    timeWindowMin);
+    const auto windowEnd =
+        upper_bound(waveform.time.begin(), waveform.time.begin() + count,
+                    timeWindowMax);
+    size_t firstSample =
+        static_cast<size_t>(windowBegin - waveform.time.begin());
+    const size_t lastSample =
+        static_cast<size_t>(windowEnd - waveform.time.begin());
+    firstSample = max<size_t>(1, firstSample);
+
+    size_t firstFalling = count;
+    for (size_t sample = firstSample; sample < lastSample; ++sample) {
+        if (filteredAmplitude[sample - 1] > result.threshold &&
+            filteredAmplitude[sample] <= result.threshold) {
+            firstFalling = sample;
+            break;
+        }
+    }
+    if (firstFalling == count) return result;
+
+    const double frameStart =
+        InterpolatedCrossing(waveform.time, filteredAmplitude,
+                             firstFalling, result.threshold);
+    array<int, kFrameBits> bits{};
+    for (int bit = 0; bit < kFrameBits; ++bit) {
+        const double sampleTime =
+            frameStart + (bit + 0.5) * kEventBitPeriodSeconds;
+        auto found = lower_bound(waveform.time.begin(),
+                                 waveform.time.begin() + count, sampleTime);
+        if (found == waveform.time.begin() + count) return result;
+        size_t sample = static_cast<size_t>(found - waveform.time.begin());
+        if (sample > 0 &&
+            sampleTime - waveform.time[sample - 1] <=
+                waveform.time[sample] - sampleTime)
             --sample;
-
-        const double amplitude = eventCode.amplitude[sample];
-        const bool value = amplitude >= m_eventThreshold;
-        decodedEventID = (decodedEventID << 1U) | static_cast<uint64_t>(value);
-    }
-    return decodedEventID;
-}
-
-bool OscilloscopeDataProcessor::DecodeOscilloscopeData(
-    const WaveformSegment& eventCode, const WaveformSegment& trigger,
-    OscilloscopeData& oscilloscopeData) const {
-    if (eventCode.time.empty() || trigger.time.empty()) return false;
-
-    const double triggerTime =
-        DecodeArriveTime(trigger, m_triggerThreshold, trigger.time.front(), true);
-
-    if (!isfinite(triggerTime)) return false;
-
-    const double firstEventTransition =
-        DecodeArriveTime(eventCode, m_eventThreshold, triggerTime, false);
-    if (!isfinite(firstEventTransition)) return false;
-
-    const uint64_t decodedEventID =
-        DecodeEventID(eventCode, firstEventTransition);
-    if (decodedEventID == numeric_limits<uint64_t>::max()) return false;
-
-    oscilloscopeData.decodedEventID = decodedEventID;
-    oscilloscopeData.triggerTime = triggerTime * 1.0e9;
-    oscilloscopeData.EvnentIDtime = firstEventTransition * 1.0e9;
-    oscilloscopeData.truthT0 = oscilloscopeData.triggerTime - oscilloscopeData.EvnentIDtime;
-    return true;
-}
-
-void OscilloscopeDataProcessor::WriteWaveformDiagnostic(
-    const WaveformSegment& eventCode,
-    const WaveformSegment& trigger,
-    const OscilloscopeData* oscilloscopeData, int fileIndex, int segmentIndex,
-    TDirectory& directory) const {
-    auto makeGraph = [](const WaveformSegment& waveform) {
-        const size_t count = min(waveform.time.size(), waveform.amplitude.size());
-        vector<double> timeNs(count);
-        for (size_t i = 0; i < count; ++i) timeNs[i] = waveform.time[i] * 1.0e9;
-        return TGraph(static_cast<int>(count), timeNs.data(), waveform.amplitude.data());
-    };
-    auto amplitudeRange = [](const WaveformSegment& waveform) {
-        if (waveform.amplitude.empty()) return pair<double, double>{-1.0, 1.0};
-        const auto [low, high] = minmax_element(waveform.amplitude.begin(), waveform.amplitude.end());
-        const double margin = max(0.05, 0.05 * (*high - *low));
-        return pair<double, double>{*low - margin, *high + margin};
-    };
-    auto drawThreshold = [](const WaveformSegment& waveform, double threshold, int color) {
-        if (waveform.time.empty()) return;
-        TLine line(waveform.time.front() * 1.0e9, threshold,
-                   waveform.time.back() * 1.0e9, threshold);
-        line.SetLineColor(color);
-        line.SetLineStyle(2);
-        line.DrawClone();
-    };
-
-    ostringstream baseName;
-    baseName << "segment_" << setw(2) << setfill('0') << segmentIndex + 1;
-    directory.cd();
-    TCanvas canvas(baseName.str().c_str(), "C3/C4 waveform decoding", 1400, 1000);
-    canvas.Divide(1, 2);
-
-    TGraph eventGraph = makeGraph(eventCode);
-    eventGraph.SetLineColor(kMagenta + 1);
-    eventGraph.SetTitle("C3 event code;Time relative to oscilloscope trigger [ns];Amplitude [V]");
-    canvas.cd(1);
-    eventGraph.Draw("AL");
-    drawThreshold(eventCode, m_eventThreshold, kRed + 1);
-
-    TGraph triggerGraph = makeGraph(trigger);
-    triggerGraph.SetLineColor(kOrange + 7);
-    triggerGraph.SetTitle("C4 trigger;Time relative to oscilloscope trigger [ns];Amplitude [V]");
-    canvas.cd(2);
-    triggerGraph.Draw("AL");
-    drawThreshold(trigger, m_triggerThreshold, kRed + 1);
-    if (oscilloscopeData) {
-        const auto [low, high] = amplitudeRange(trigger);
-        TLine crossing(oscilloscopeData->triggerTime, low, oscilloscopeData->triggerTime, high);
-        crossing.SetLineColor(kGreen + 2);
-        crossing.SetLineWidth(2);
-        crossing.DrawClone();
+        bits[bit] = filteredAmplitude[sample] < result.threshold ? 1 : 0;
     }
 
-    canvas.cd(1);
-    TLatex label;
-    label.SetNDC();
-    label.SetTextSize(0.045);
-    ostringstream annotation;
-    annotation << "Trace " << setw(5) << setfill('0') << fileIndex
-               << ", segment " << segmentIndex + 1;
-    if (oscilloscopeData) {
-        annotation << ", eventID=" << oscilloscopeData->decodedEventID
-                   << ", EventID Arrive Time=" << fixed << setprecision(3)
-                   << oscilloscopeData->EvnentIDtime << " ns"
-                   << ", T0=" << fixed << setprecision(3) << oscilloscopeData->truthT0
-                   << " ns";
-    } else {
-        annotation << ", decode FAILED";
-    }
-    label.DrawLatex(0.10, 0.92, annotation.str().c_str());
-    canvas.Write();
-    string metadataText = annotation.str();
-    TNamed metadata((baseName.str() + "_decoding").c_str(), metadataText.c_str());
-    metadata.Write();
-}
-
-bool OscilloscopeDataProcessor::LoadOscilloscopeDataCache(const string& cachePath) {
-
-    unique_ptr<TFile> cache(TFile::Open(cachePath.c_str(), "READ"));
-    auto* cacheTree = cache ? dynamic_cast<TTree*>(cache->Get("OscilloscopeData")) : nullptr;
-    if (!cacheTree) {
-        return false;
-    }
-
-    ULong64_t eventID = 0;
-    Double_t triggerTime = 0.0, EventIDTime = 0.0, t0 = 0.0;
-    Int_t file = 0, segment = 0;
-    cacheTree->SetBranchAddress("eventID", &eventID);
-    cacheTree->SetBranchAddress("triggerTime", &triggerTime);
-    cacheTree->SetBranchAddress("EventIDTime", &EventIDTime);
-    cacheTree->SetBranchAddress("truthT0", &t0);
-    cacheTree->SetBranchAddress("traceFileIndex", &file);
-    cacheTree->SetBranchAddress("segmentIndex", &segment);
-    for (Long64_t entry = 0; entry < cacheTree->GetEntries(); ++entry) {
-        cacheTree->GetEntry(entry);
-        m_dataByEventID.emplace(eventID, OscilloscopeData{eventID, triggerTime, EventIDTime, t0, file, segment});
-    }
-    cout << "[OscilloscopeData] data cache=" << cachePath << ", entries=" << m_dataByEventID.size() << '\n';
-    return true;
-}
-
-void OscilloscopeDataProcessor::WriteOscilloscopeDataCache(
-    const string& cachePath, const vector<OscilloscopeData>& decodedData) const {
-    unique_ptr<TFile> cache(TFile::Open(cachePath.c_str(), "RECREATE"));
-    if (!cache || cache->IsZombie()) return;
-
-    TTree cacheTree("OscilloscopeData", "Decoded oscilloscope data");
-    ULong64_t eventID = 0;
-    Double_t triggerTime = 0.0, EventIDTime = 0.0, t0 = 0.0;
-    Int_t file = 0, segment = 0;
-    cacheTree.Branch("eventID", &eventID);
-    cacheTree.Branch("triggerTime", &triggerTime);
-    cacheTree.Branch("EventIDTime", &EventIDTime);
-    cacheTree.Branch("truthT0", &t0);
-    cacheTree.Branch("traceFileIndex", &file);
-    cacheTree.Branch("segmentIndex", &segment);
-    for (const OscilloscopeData& oscilloscopeData : decodedData) {
-        eventID = oscilloscopeData.decodedEventID;
-        triggerTime = oscilloscopeData.triggerTime;
-        EventIDTime = oscilloscopeData.EvnentIDtime;
-        t0 = oscilloscopeData.truthT0;
-        file = oscilloscopeData.fileIndex;
-        segment = oscilloscopeData.segmentIndex;
-        cacheTree.Fill();
-    }
-    cacheTree.Write();
-
-    cout << "[OscilloscopeData] wrote data cache=" << cachePath << " entries=" << decodedData.size() << '\n';
-}
-
-void OscilloscopeDataProcessor::LoadConfig(const json& config) {
-    m_csvDirectory = config.value("csvDirectory", m_csvDirectory);
-    m_outputDir = config.value("outputDir", m_outputDir);
-    m_dataCacheFile = config.value("dataCacheFile",
-                                   config.value("timingCacheFile", m_dataCacheFile));
-    m_waveformDiagnosticFile =
-        config.value("waveformDiagnosticFile", m_waveformDiagnosticFile);
-    m_rebuildTimingCache = config.value("rebuildTimingCache", m_rebuildTimingCache);
-    m_writeWaveformDiagnostics =
-        config.value("writeWaveformDiagnostics", m_writeWaveformDiagnostics);
-    m_triggerThreshold = config.value("triggerThreshold", m_triggerThreshold);
-    m_eventThreshold = config.value("eventThreshold", m_eventThreshold);
-    m_eventBits = config.value("eventBits", m_eventBits);
-    m_maxWaveformFiles = config.value("maxWaveformFiles", m_maxWaveformFiles);
-}
-
-void OscilloscopeDataProcessor::Print() const {
-    cout << "OscilloscopeDataProcessor: CSV=" << m_csvDirectory
-         << ", trigger threshold=" << m_triggerThreshold
-         << " V, event bits=" << m_eventBits
-         << ", event channel=" << m_eventCodeChannel
-         << ", trigger channel=" << m_triggerChannel
-         << ", rebuild cache=" << (m_rebuildTimingCache ? "yes" : "no") << '\n';
-    if (m_writeWaveformDiagnostics)
-        cout << "  waveform diagnostics=" << m_waveformDiagnosticFile << '\n';
-}
-
-bool OscilloscopeDataProcessor::Initialize() {
-    m_initialized = false;
-    m_dataByEventID.clear();
-    m_decodedEntries = 0;
-
-    const string cachePath = filesystem::path(m_dataCacheFile).is_absolute()
-                                 ? m_dataCacheFile
-                                 : m_outputDir + m_dataCacheFile;
-    const bool cacheLoaded = !m_rebuildTimingCache &&
-                             filesystem::exists(cachePath) &&
-                             LoadOscilloscopeDataCache(cachePath);
-
-    if (cacheLoaded) {
-        m_initialized = true;
-        return true;
-    }
-
-    if (m_csvDirectory.empty() || !filesystem::is_directory(m_csvDirectory)) {
-        cerr << "[TimeResolution] CSV directory does not exist: " << m_csvDirectory << endl;
-        return false;
-    }
-
-    map<int, map<int, filesystem::path>> traceFiles;
-    const regex filenamePattern(R"(^(C[0-9]+)Trace([0-9]+)\.csv$)");
-    for (const auto& item : filesystem::directory_iterator(m_csvDirectory)) {
-        smatch match;
-        const string name = item.path().filename().string();
-        if (item.is_regular_file() && regex_match(name, match, filenamePattern))
-            traceFiles[stoi(match[2].str())][stoi(match[1].str().substr(1))] = item.path();
-    }
-
-    vector<int> traceIndices;
-    traceIndices.reserve(traceFiles.size());
-    for (const auto& [traceIndex, channels] : traceFiles)
-        traceIndices.push_back(traceIndex);
-    if (m_maxWaveformFiles > 0 &&
-        traceIndices.size() > static_cast<size_t>(m_maxWaveformFiles))
-        traceIndices.resize(m_maxWaveformFiles);
-
-    if (traceIndices.empty()) {
-        cerr << "[OscilloscopeData] no C?Trace*.csv files found in " << m_csvDirectory << '\n';
-        return false;
-    }
-
-    unique_ptr<TFile> waveformDiagnostics;
-    if (m_writeWaveformDiagnostics) {
-        const string diagnosticPath = filesystem::path(m_waveformDiagnosticFile).is_absolute()
-                                          ? m_waveformDiagnosticFile
-                                          : m_outputDir + m_waveformDiagnosticFile;
-        waveformDiagnostics.reset(TFile::Open(diagnosticPath.c_str(), "RECREATE"));
-        if (!waveformDiagnostics || waveformDiagnostics->IsZombie()) {
-            cerr << "[OscilloscopeData] cannot create waveform diagnostic file " << diagnosticPath << '\n';
-            return false;
-        }
-        cout << "[OscilloscopeData] writing every oscilloscope segment to " << diagnosticPath << '\n';
-    }
-
-    vector<OscilloscopeData> decodedData;
-    size_t processedFiles = 0;
-    size_t failedFiles = 0;
-    size_t invalidSegments = 0;
-
-    for (int fileIndex : traceIndices) {
-        
-        const auto& channelFiles = traceFiles[fileIndex];
-
-        const auto eventFile = channelFiles.find(m_eventCodeChannel);
-        const auto triggerFile = channelFiles.find(m_triggerChannel);
-        if (eventFile == channelFiles.end() || triggerFile == channelFiles.end()) {
-            cerr << "[OscilloscopeData] missing C" << m_eventCodeChannel
-                 << " or C" << m_triggerChannel << " for Trace" << fileIndex << '\n';
-            ++failedFiles;
-            ++processedFiles;
-            continue;
-        }
-
-        StreamTraceReader eventReader;
-        StreamTraceReader triggerReader;
-        string error;
-        if (!eventReader.Open(eventFile->second, -20.0e-9, 550.0e-9, error) ||
-            !triggerReader.Open(triggerFile->second, -20.0e-9, 30.0e-9, error)) {
-            cerr << "[OscilloscopeData] " << error << '\n';
-            ++failedFiles;
-            ++processedFiles;
-            continue;
-        }
-
-        const int segments = min(eventReader.segmentCount, triggerReader.segmentCount);
-        TDirectory* traceDiagnosticDirectory = nullptr;
-        if (waveformDiagnostics) {
-            ostringstream traceName;
-            traceName << "Trace" << setw(5) << setfill('0') << fileIndex;
-            traceDiagnosticDirectory = waveformDiagnostics->mkdir(traceName.str().c_str());
-        }
-        WaveformSegment eventCode;
-        WaveformSegment trigger;
-        for (int segment = 0; segment < segments; ++segment) {
-            if (!eventReader.ReadSegment(segment, eventCode) ||
-                !triggerReader.ReadSegment(segment, trigger)) {
-                ++failedFiles;
-                break;
-            }
-
-            OscilloscopeData oscilloscopeData;
-            if (!DecodeOscilloscopeData(eventCode, trigger, oscilloscopeData)) {
-                if (traceDiagnosticDirectory)
-                    WriteWaveformDiagnostic(eventCode, trigger, nullptr, fileIndex, segment,
-                                            *traceDiagnosticDirectory);
-                ++invalidSegments;
-                continue;
-            }
-            if (traceDiagnosticDirectory)
-                WriteWaveformDiagnostic(eventCode, trigger, &oscilloscopeData, fileIndex, segment,
-                                        *traceDiagnosticDirectory);
-            oscilloscopeData.fileIndex = fileIndex;
-            oscilloscopeData.segmentIndex = segment;
-            decodedData.push_back(oscilloscopeData);
-            m_dataByEventID.emplace(oscilloscopeData.decodedEventID, oscilloscopeData);
-        }
-        ++processedFiles;
-        if (processedFiles % 25 == 0 || processedFiles == traceIndices.size())
-            cout << "\r[OscilloscopeData] waveform files " << processedFiles
-                 << '/' << traceIndices.size()
-                 << ", decoded IDs=" << m_dataByEventID.size() << flush;
-    }
-    if (!traceIndices.empty()) cout << '\n';
-    cout << "[OscilloscopeData] failed files=" << failedFiles
-         << ", invalid segments=" << invalidSegments
-         << endl;
-
-    if (waveformDiagnostics) waveformDiagnostics->Flush();
-
-    if (!cacheLoaded && failedFiles == 0)
-        WriteOscilloscopeDataCache(cachePath, decodedData);
-    m_decodedEntries = cacheLoaded ? m_dataByEventID.size() : decodedData.size();
-    m_initialized = true;
-    return true;
-}
-
-OscilloscopeDataResult OscilloscopeDataProcessor::LoadData(
-    const set<uint64_t>& wantedEventIDs) const {
-    OscilloscopeDataResult result;
-    if (!m_initialized) {
-        cerr << "[OscilloscopeData] LoadData called before Initialize; no data loaded\n";
-        return result;
-    }
-
-    for (uint64_t eventID : wantedEventIDs) {
-        auto found = m_dataByEventID.find(eventID);
-        if (found != m_dataByEventID.end())
-            result.dataByEventID.emplace(eventID, found->second);
-    }
-    if (result.dataByEventID.empty())
-        cerr << "[TimeResolution] no decoded C3 event ID matched rawEventID; "
-             << "external T0 outputs will be skipped\n";
-    result.decodedEntries = m_decodedEntries;
+    if (bits.front() != 1 || bits.back() != 0) return result;
+    uint64_t eventID = 0;
+    for (int bit = 1; bit <= kEventIDBits; ++bit)
+        eventID = (eventID << 1U) | static_cast<uint64_t>(bits[bit]);
+    result.eventID = eventID;
+    result.frameStartNs = frameStart * 1.0e9;
+    result.valid = true;
     return result;
 }
 
-REGISTER_ALGORITHM("OscilloscopeDataProcessor", OscilloscopeDataProcessor);
+TimingResult MeasureNegativePulse(
+    const Waveform& waveform, double eventIDFrameStartNs,
+    const OscilloscopeProcessingConfig& config) {
+    TimingResult result;
+    const size_t count =
+        min(waveform.time.size(), waveform.amplitude.size());
+    if (count < 10 || !isfinite(eventIDFrameStartNs)) return result;
+
+    const double windowBeginTime =
+        (eventIDFrameStartNs + config.signalTimeWindowNs[0]) * 1.0e-9;
+    const double windowEndTime =
+        (eventIDFrameStartNs + config.signalTimeWindowNs[1]) * 1.0e-9;
+    const auto windowBeginIterator =
+        lower_bound(waveform.time.begin(), waveform.time.begin() + count,
+                    windowBeginTime);
+    const auto windowEndIterator =
+        upper_bound(waveform.time.begin(), waveform.time.begin() + count,
+                    windowEndTime);
+    const size_t windowBegin = static_cast<size_t>(
+        windowBeginIterator - waveform.time.begin());
+    const size_t windowEnd = static_cast<size_t>(
+        windowEndIterator - waveform.time.begin());
+    if (windowBegin < 2 || windowEnd <= windowBegin + 1) return result;
+
+    vector<double> baselineValues(
+        waveform.amplitude.begin(), waveform.amplitude.begin() + windowBegin);
+    result.baseline = Quantile(baselineValues, 0.5);
+    if (!isfinite(result.baseline)) return result;
+
+    const auto minimum = min_element(
+        waveform.amplitude.begin() + windowBegin,
+        waveform.amplitude.begin() + windowEnd);
+    const size_t minimumSample = static_cast<size_t>(
+        minimum - waveform.amplitude.begin());
+    result.amplitude = result.baseline - *minimum;
+    if (!isfinite(result.amplitude) ||
+        result.amplitude < config.minPulseAmplitude) {
+        result.status = TimingStatus::BelowAmplitude;
+        return result;
+    }
+
+    result.threshold =
+        result.baseline - config.cfdFraction * result.amplitude;
+    size_t selectedSample = 0;
+    for (size_t sample = minimumSample; sample > windowBegin; --sample) {
+        if (waveform.amplitude[sample - 1] > result.threshold &&
+            waveform.amplitude[sample] <= result.threshold) {
+            selectedSample = sample;
+            break;
+        }
+    }
+    if (selectedSample == 0) {
+        result.status = TimingStatus::NoCrossing;
+        return result;
+    }
+
+    result.timeNs =
+        InterpolatedCrossing(waveform, selectedSample, result.threshold) *
+        1.0e9;
+    result.status =
+        isfinite(result.timeNs) ? TimingStatus::Valid
+                                : TimingStatus::NoCrossing;
+    return result;
+}
+
+map<int, map<int, filesystem::path>> FindTraceFiles(
+    const filesystem::path& directory) {
+    map<int, map<int, filesystem::path>> files;
+    const regex lecroyPattern(
+        R"(^C([0-9]+)--[^-]+--([0-9]+)\.csv$)");
+    const regex legacyPattern(R"(^C([0-9]+)Trace([0-9]+)\.csv$)");
+    for (const auto& item : filesystem::directory_iterator(directory)) {
+        if (!item.is_regular_file()) continue;
+        smatch match;
+        const string name = item.path().filename().string();
+        if (regex_match(name, match, lecroyPattern) ||
+            regex_match(name, match, legacyPattern)) {
+            const int channel = stoi(match[1].str());
+            const int traceIndex = stoi(match[2].str());
+            files[traceIndex][channel] = item.path();
+        }
+    }
+    return files;
+}
+
+void CountTimingResult(
+    TimingStatus status, OscilloscopeChannelStatistics& statistics) {
+    switch (status) {
+        case TimingStatus::Valid:
+            ++statistics.valid;
+            break;
+        case TimingStatus::BelowAmplitude:
+            ++statistics.belowAmplitude;
+            break;
+        case TimingStatus::NoCrossing:
+            ++statistics.noCrossing;
+            break;
+        case TimingStatus::NoWindow:
+            ++statistics.noWindow;
+            break;
+    }
+}
+
+}  // namespace
+
+OscilloscopeProcessingResult OscilloscopeDataProcessor::Process(
+    const filesystem::path& inputDirectory,
+    const OscilloscopeProcessingConfig& config,
+    const DiscoveryCallback& onDiscovery,
+    const ProgressCallback& onProgress) const {
+    OscilloscopeProcessingResult result;
+    if (!filesystem::is_directory(inputDirectory)) {
+        result.error =
+            "CSV directory does not exist: " + inputDirectory.string();
+        return result;
+    }
+
+    const auto traceFiles = FindTraceFiles(inputDirectory);
+    vector<int> traceIndices;
+    for (const auto& [index, channels] : traceFiles) {
+        bool complete = true;
+        for (int channel = 1; channel <= 4; ++channel)
+            complete = complete && channels.count(channel) > 0;
+        if (complete) traceIndices.push_back(index);
+    }
+    if (config.maxWaveformFiles > 0 &&
+        traceIndices.size() >
+            static_cast<size_t>(config.maxWaveformFiles))
+        traceIndices.resize(
+            static_cast<size_t>(config.maxWaveformFiles));
+    result.traceFiles = traceIndices.size();
+    if (onDiscovery) onDiscovery(result.traceFiles);
+    if (traceIndices.empty()) {
+        result.error =
+            "no complete C1-C4 trace sets in " + inputDirectory.string();
+        return result;
+    }
+
+    size_t processedFiles = 0;
+    for (int index : traceIndices) {
+        array<TraceReader, 4> readers;
+        string error;
+        for (size_t channel = 0; channel < readers.size(); ++channel) {
+            if (!readers[channel].Open(
+                    traceFiles.at(index).at(static_cast<int>(channel + 1)),
+                    error)) {
+                result.error = error;
+                return result;
+            }
+        }
+
+        int segments = readers.front().SegmentCount();
+        for (const TraceReader& reader : readers)
+            segments = min(segments, reader.SegmentCount());
+
+        array<Waveform, 4> waveforms;
+        for (int segment = 0; segment < segments; ++segment) {
+            ++result.processedSegments;
+            for (size_t channel = 0; channel < readers.size(); ++channel) {
+                if (!readers[channel].ReadSegment(waveforms[channel])) {
+                    result.error =
+                        "incomplete segment " + to_string(segment) +
+                        " in trace " + to_string(index);
+                    return result;
+                }
+            }
+
+            const EventIDResult decoded = DecodeEventID(waveforms[3], config);
+            if (decoded.valid) {
+                ++result.decodedEventIDs;
+                result.uniqueEventIDs.insert(decoded.eventID);
+            } else {
+                ++result.invalidEventIDs;
+            }
+
+            array<TimingResult, kChannelCount> timing;
+            for (size_t channel = 0; channel < timing.size(); ++channel) {
+                timing[channel] = MeasureNegativePulse(
+                    waveforms[channel], decoded.frameStartNs, config);
+                CountTimingResult(
+                    timing[channel].status,
+                    result.channelStatistics[channel]);
+            }
+
+            const bool complete =
+                decoded.valid &&
+                all_of(timing.begin(), timing.end(),
+                       [](const TimingResult& value) {
+                           return value.status == TimingStatus::Valid;
+                       });
+            if (!complete) continue;
+
+            OscilloscopeEvent event;
+            event.eventID = decoded.eventID;
+            event.eventIDTime = decoded.frameStartNs;
+            for (size_t channel = 0; channel < timing.size(); ++channel) {
+                event.time[channel] =
+                    timing[channel].timeNs - decoded.frameStartNs;
+                event.amplitude[channel] = timing[channel].amplitude;
+            }
+            result.pairDifferences[0].push_back(
+                event.time[0] - event.time[1]);
+            result.pairDifferences[1].push_back(
+                event.time[0] - event.time[2]);
+            result.pairDifferences[2].push_back(
+                event.time[1] - event.time[2]);
+            result.events.push_back(event);
+        }
+
+        ++processedFiles;
+        if (onProgress) onProgress(processedFiles, traceIndices.size());
+    }
+
+    result.success = true;
+    return result;
+}
