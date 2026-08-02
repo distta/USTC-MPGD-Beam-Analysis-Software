@@ -211,7 +211,7 @@ bool ClusterBuilder::processCluster(
         return false;
     }
 
-    // 计算总电荷和最大幅度
+    // Cluster charge is defined as the sum of per-hit ADC amplitudes.
     cluster.charge = 0.0;
     cluster.maxAmp = 0.0;
     cluster.time = std::numeric_limits<double>::max();
@@ -221,7 +221,7 @@ bool ClusterBuilder::processCluster(
     for (int idx : cluster.channelHitIndices) {
         const auto& strip = channelHits[idx];
 
-        cluster.charge += strip.charge;
+        cluster.charge += strip.amp;
         sumCharge += strip.charge;
         sumPos += strip.id0 * strip.charge;  // strip 电荷加权位置
 

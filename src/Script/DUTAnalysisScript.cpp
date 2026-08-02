@@ -28,16 +28,36 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <map>
+#include <memory>
 #include <numeric>
 #include <unordered_map>
 #include <unordered_set>
 
 using namespace std;
 
-void RunDUTAlign(const std::vector<Event>& events, std::shared_ptr<Detector> detector, int detID);
-LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<Cluster>& clusters, const TVector3& predL, double& residualX, double& residualY);
-double DUTChi2Objective(const double* par, const std::vector<Event>& events, std::shared_ptr<Detector> detector, int detID);
+struct DUTAlignmentRegion {
+   double xMin;
+   double xMax;
+   double yMin;
+   double yMax;
+};
+
+void RunDUTAlign(const std::vector<Event>& events,
+                 std::shared_ptr<Detector> detector, int detID,
+                 const DUTAlignmentRegion& region);
+LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector,
+                          const std::vector<Cluster>& clusters,
+                          const TVector3& predL, double& residualX,
+                          double& residualY, bool useCentroid = false);
+double DUTChi2Objective(const double* par, const std::vector<Event>& events,
+                        std::shared_ptr<Detector> detector, int detID,
+                        const DUTAlignmentRegion& region,
+                        double matchingSigma, double minMatchDominance);
+double DUTCCResidualSlopeY(const double* par,
+                           const std::vector<Event>& events,
+                           std::shared_ptr<Detector> detector, int detID,
+                           const DUTAlignmentRegion& region,
+                           double matchingSigma);
 
 std::pair<int, int> PlanarAxisTypes(const planarConfig& config) {
    int typeX = -1;
@@ -59,6 +79,71 @@ std::pair<int, int> PlanarAxisTypes(const planarConfig& config) {
       }
    }
    return {typeX, typeY};
+}
+
+struct DUTAlignmentMatch {
+   double residualX = DUTAnalysisConfig::kInvalidValue;
+   double residualY = DUTAnalysisConfig::kInvalidValue;
+   double dominanceX = 0.0;
+   double dominanceY = 0.0;
+};
+
+// Smooth nearest-cluster association used only by DUT alignment.  All
+// candidates are reconsidered at every geometry evaluation, so the fit never
+// freezes a possibly wrong cluster set selected from the initial geometry.
+DUTAlignmentMatch CalcuDutAlignmentMatch(
+    std::shared_ptr<Detector> detector,
+    const std::vector<Cluster>& clusters, const TVector3& predL,
+    double matchingSigma) {
+   DUTAlignmentMatch match;
+   const auto* config = detector->GetPlanarConfig();
+   if (!config || !(matchingSigma > 0.0) || !std::isfinite(matchingSigma))
+      return match;
+
+   const auto [typeX, typeY] = PlanarAxisTypes(*config);
+   const auto axisResidual = [&](int type, double prediction,
+                                 double& dominance) {
+      const auto pitchEntry = config->readoutPlanePitch.find(type);
+      if (pitchEntry == config->readoutPlanePitch.end())
+         return DUTAnalysisConfig::kInvalidValue;
+
+      std::vector<double> residuals;
+      residuals.reserve(clusters.size());
+      double bestResidual2 = std::numeric_limits<double>::infinity();
+      for (const auto& cluster : clusters) {
+         if (cluster.type != type || !std::isfinite(cluster.centroid))
+            continue;
+         const double residual =
+             cluster.centroid * pitchEntry->second - prediction;
+         if (!std::isfinite(residual)) continue;
+         residuals.push_back(residual);
+         bestResidual2 = std::min(bestResidual2, residual * residual);
+      }
+      if (residuals.empty()) return DUTAnalysisConfig::kInvalidValue;
+
+      const double inverseTwoSigma2 =
+          0.5 / (matchingSigma * matchingSigma);
+      double sumWeight = 0.0;
+      double weightedResidual = 0.0;
+      double bestWeight = 0.0;
+      for (double residual : residuals) {
+         // Subtracting the best exponent keeps the calculation stable even
+         // when the configured geometry is still far from the final one.
+         const double weight = std::exp(
+             -(residual * residual - bestResidual2) * inverseTwoSigma2);
+         sumWeight += weight;
+         weightedResidual += weight * residual;
+         bestWeight = std::max(bestWeight, weight);
+      }
+      if (!(sumWeight > 0.0) || !std::isfinite(sumWeight))
+         return DUTAnalysisConfig::kInvalidValue;
+      dominance = bestWeight / sumWeight;
+      return weightedResidual / sumWeight;
+   };
+
+   match.residualX = axisResidual(typeX, predL.X(), match.dominanceX);
+   match.residualY = axisResidual(typeY, predL.Y(), match.dominanceY);
+   return match;
 }
 struct ResidualAnalysisResult {
    double sigma68 = 0;
@@ -83,170 +168,161 @@ struct DUTAlignmentQAPoint {
    bool validY = false;
 };
 
-struct DUTTimingResolutionResult {
-   long long entries = 0;
-   double mean = std::numeric_limits<double>::quiet_NaN();
-   double sigma = std::numeric_limits<double>::quiet_NaN();
-   double sigmaError = std::numeric_limits<double>::quiet_NaN();
-   double sigma68 = std::numeric_limits<double>::quiet_NaN();
-};
-
 ResidualAnalysisResult AnalyzeResidualSequence(const std::vector<double>& residuals, TFile* outputFile, const std::string& histName);
 void WriteDUTAlignmentQA(TFile* outputFile, int detID,
                          const std::vector<DUTAlignmentQAPoint>& points,
                          double predXMin, double predXMax,
                          double predYMin, double predYMax);
-DUTTimingResolutionResult WriteDUTXYMeanTimeResolution(
-    TFile* outputFile, int detID, std::vector<double> times);
 
-double CombinedXYMeanTime(const std::vector<ChannelHit>& channelHitsX,
-                          const std::vector<ChannelHit>& channelHitsY) {
-   double sum = 0.0;
-   size_t count = 0;
-   bool hasX = false;
-   bool hasY = false;
-   for (const auto& hit : channelHitsX) {
-      if (!hit.isValid || !std::isfinite(hit.time)) continue;
-      sum += hit.time;
-      ++count;
-      hasX = true;
-   }
-   for (const auto& hit : channelHitsY) {
-      if (!hit.isValid || !std::isfinite(hit.time)) continue;
-      sum += hit.time;
-      ++count;
-      hasY = true;
-   }
-   return hasX && hasY && count > 0
-              ? sum / static_cast<double>(count)
-              : std::numeric_limits<double>::quiet_NaN();
+std::pair<double, double> DUTDistributionRange(
+    std::vector<double> values) {
+   values.erase(
+       std::remove_if(
+           values.begin(), values.end(),
+           [](double value) { return !std::isfinite(value); }),
+       values.end());
+   if (values.empty()) return {0.0, 1.0};
+   std::sort(values.begin(), values.end());
+   const size_t lowIndex = static_cast<size_t>(
+       0.005 * static_cast<double>(values.size() - 1));
+   const size_t highIndex = static_cast<size_t>(
+       0.995 * static_cast<double>(values.size() - 1));
+   double minimum = values[lowIndex];
+   double maximum = values[highIndex];
+
+   double low = std::min(0.0, minimum);
+   double high = std::max(0.0, maximum);
+   if (!(high > low)) return {low - 0.5, high + 0.5};
+   const double padding = 0.05 * (high - low);
+   if (low < 0.0) low -= padding;
+   high += padding;
+   return {low, high};
 }
 
-DUTTimingResolutionResult WriteDUTXYMeanTimeResolution(
-    TFile* outputFile, int detID, std::vector<double> times) {
-   DUTTimingResolutionResult result;
-   times.erase(
-       std::remove_if(times.begin(), times.end(),
-                      [](double value) { return !std::isfinite(value); }),
-       times.end());
-   result.entries = static_cast<long long>(times.size());
-   if (!outputFile || times.size() < 20) return result;
-
-   std::sort(times.begin(), times.end());
-   const auto quantile = [&](double fraction) {
-      const double position = fraction * (times.size() - 1);
-      const size_t lower = static_cast<size_t>(std::floor(position));
-      const size_t upper = static_cast<size_t>(std::ceil(position));
-      const double weight = position - lower;
-      return times[lower] * (1.0 - weight) + times[upper] * weight;
-   };
-   const double median = quantile(0.50);
-   result.sigma68 = 0.5 * (quantile(0.84) - quantile(0.16));
-
-   double rawMean =
-       std::accumulate(times.begin(), times.end(), 0.0) / times.size();
-   double rawVariance = 0.0;
-   for (double value : times)
-      rawVariance += (value - rawMean) * (value - rawMean);
-   const double rawSigma =
-       std::sqrt(rawVariance / static_cast<double>(times.size() - 1));
-   double initialSigma =
-       result.sigma68 > 0.0 ? result.sigma68 : rawSigma;
-   if (!std::isfinite(initialSigma) || initialSigma <= 0.0) return result;
-
-   double plotLow = quantile(0.005);
-   double plotHigh = quantile(0.995);
-   const double padding = std::max(
-       1.0, 0.08 * std::max(1.0, plotHigh - plotLow));
-   plotLow -= padding;
-   plotHigh += padding;
-   if (!(plotHigh > plotLow)) {
-      plotLow = median - 5.0 * initialSigma;
-      plotHigh = median + 5.0 * initialSigma;
-   }
-
-   auto* dutDirectory =
-       outputFile->GetDirectory(("DUT_" + std::to_string(detID)).c_str());
-   if (!dutDirectory)
-      dutDirectory =
-          outputFile->mkdir(("DUT_" + std::to_string(detID)).c_str());
-   auto* timingDirectory = dutDirectory->GetDirectory("TimeResolution");
-   if (!timingDirectory)
-      timingDirectory = dutDirectory->mkdir("TimeResolution");
-   TDirectory::TContext context(timingDirectory);
-
-   TH1D histogram(
-       "hXYMeanTime",
-       Form("DUT %d XYMean time relative to trigger;"
-            "XYMean time - trigger [ns];Events",
-            detID),
-       200, plotLow, plotHigh);
-   for (double value : times) histogram.Fill(value);
-
-   const double fitLow =
-       std::max(plotLow, median - 2.5 * initialSigma);
-   const double fitHigh =
-       std::min(plotHigh, median + 2.5 * initialSigma);
-   TF1 gaussian(
-       Form("fXYMeanTimeGaussian_DUT%d", detID), "gaus",
-       fitLow, fitHigh);
-   gaussian.SetParameters(histogram.GetMaximum(), median, initialSigma);
-   gaussian.SetLineColor(kRed + 1);
-   gaussian.SetLineWidth(2);
-   const int fitStatus = histogram.Fit(&gaussian, "QRS0");
-   if (fitStatus == 0 &&
-       std::isfinite(gaussian.GetParameter(1)) &&
-       std::isfinite(gaussian.GetParameter(2))) {
-      result.mean = gaussian.GetParameter(1);
-      result.sigma = std::abs(gaussian.GetParameter(2));
-      result.sigmaError = gaussian.GetParError(2);
-   } else {
-      result.mean = rawMean;
-      result.sigma = rawSigma;
-   }
-
-   TCanvas canvas(
-       "cXYMeanTimeResolution",
-       Form("DUT %d XYMean time resolution", detID), 900, 700);
+void StyleDUTDistribution(TH1D& histogram, Color_t color) {
+   histogram.SetDirectory(nullptr);
    histogram.SetStats(false);
-   histogram.Draw("E");
-   gaussian.Draw("SAME");
-   TLegend legend(0.57, 0.67, 0.88, 0.88);
-   legend.SetBorderSize(1);
-   legend.SetFillColor(kWhite);
-   legend.AddEntry(&gaussian, "Single Gaussian fit", "l");
-   legend.AddEntry(
-       static_cast<TObject*>(nullptr),
-       Form("Entries = %lld", result.entries), "");
-   legend.AddEntry(
-       static_cast<TObject*>(nullptr),
-       Form("#mu = %.3f ns", result.mean), "");
-   legend.AddEntry(
-       static_cast<TObject*>(nullptr),
-       Form("#sigma = %.3f #pm %.3f ns",
-            result.sigma, result.sigmaError), "");
-   legend.AddEntry(
-       static_cast<TObject*>(nullptr),
-       Form("#sigma_{68} = %.3f ns", result.sigma68), "");
-   legend.Draw();
+   histogram.SetLineColor(color);
+   histogram.SetLineWidth(2);
+}
 
-   histogram.Write();
-   canvas.Write();
+void WritePlanarDUTHitProperties(
+    TDirectory* detectorDirectory, int dutID,
+    const std::vector<double>& clusterChargesX,
+    const std::vector<double>& clusterChargesY,
+    const std::vector<int>& clusterSizesX,
+    const std::vector<int>& clusterSizesY,
+    const std::vector<double>& hitADCsX,
+    const std::vector<double>& hitADCsY) {
+   if (!detectorDirectory) return;
+   auto* hitProperties = detectorDirectory->GetDirectory("HitProperties");
+   if (!hitProperties)
+      hitProperties = detectorDirectory->mkdir("HitProperties");
+   if (!hitProperties) return;
+   TDirectory::TContext context(hitProperties);
 
-   Long64_t entries = result.entries;
-   Double_t mean = result.mean;
-   Double_t sigma = result.sigma;
-   Double_t sigmaError = result.sigmaError;
-   Double_t sigma68 = result.sigma68;
-   TTree summary("TimingSummary", "DUT XYMean timing resolution");
-   summary.Branch("entries", &entries);
-   summary.Branch("mean_ns", &mean);
-   summary.Branch("sigma_ns", &sigma);
-   summary.Branch("sigma_error_ns", &sigmaError);
-   summary.Branch("sigma68_ns", &sigma68);
-   summary.Fill();
-   summary.Write();
-   return result;
+   std::vector<double> combinedCharges = clusterChargesX;
+   combinedCharges.insert(
+       combinedCharges.end(), clusterChargesY.begin(),
+       clusterChargesY.end());
+   const auto chargeRange = DUTDistributionRange(combinedCharges);
+   TH1D chargeX(
+       "hClusterChargeX",
+       ("DUT " + std::to_string(dutID) +
+        " track-matched cluster ADC sum;"
+        "Cluster charge = #Sigma strip ADC [ADC];Entries")
+           .c_str(),
+       200, chargeRange.first, chargeRange.second);
+   TH1D chargeY(
+       "hClusterChargeY", "", 200,
+       chargeRange.first, chargeRange.second);
+   StyleDUTDistribution(chargeX, kBlue + 1);
+   StyleDUTDistribution(chargeY, kRed + 1);
+   for (double value : clusterChargesX) chargeX.Fill(value);
+   for (double value : clusterChargesY) chargeY.Fill(value);
+   chargeX.SetMaximum(
+       1.15 * std::max(chargeX.GetMaximum(), chargeY.GetMaximum()));
+   TCanvas chargeCanvas(
+       "cClusterCharge",
+       "Track-matched DUT cluster ADC sum", 900, 700);
+   chargeX.Draw("HIST");
+   chargeY.Draw("HIST SAME");
+   TLegend chargeLegend(0.68, 0.75, 0.88, 0.88);
+   chargeLegend.SetBorderSize(0);
+   chargeLegend.AddEntry(&chargeX, "X strips", "l");
+   chargeLegend.AddEntry(&chargeY, "Y strips", "l");
+   chargeLegend.Draw();
+   chargeCanvas.Write();
+
+   std::vector<int> combinedClusterSizes = clusterSizesX;
+   combinedClusterSizes.insert(
+       combinedClusterSizes.end(), clusterSizesY.begin(),
+       clusterSizesY.end());
+   std::sort(combinedClusterSizes.begin(), combinedClusterSizes.end());
+   int maximumClusterSize = 1;
+   if (!combinedClusterSizes.empty()) {
+      const size_t highIndex = static_cast<size_t>(
+          0.995 *
+          static_cast<double>(combinedClusterSizes.size() - 1));
+      maximumClusterSize =
+          std::max(1, combinedClusterSizes[highIndex]);
+   }
+   TH1D sizeX(
+       "hClusterSizeX",
+       ("DUT " + std::to_string(dutID) +
+        " track-matched cluster size;Cluster size [strips];Entries")
+           .c_str(),
+       maximumClusterSize, 0.5, maximumClusterSize + 0.5);
+   TH1D sizeY(
+       "hClusterSizeY", "", maximumClusterSize,
+       0.5, maximumClusterSize + 0.5);
+   StyleDUTDistribution(sizeX, kBlue + 1);
+   StyleDUTDistribution(sizeY, kRed + 1);
+   for (int value : clusterSizesX) sizeX.Fill(value);
+   for (int value : clusterSizesY) sizeY.Fill(value);
+   sizeX.SetMaximum(
+       1.15 * std::max(sizeX.GetMaximum(), sizeY.GetMaximum()));
+   TCanvas sizeCanvas(
+       "cClusterSize",
+       "Track-matched DUT cluster size", 900, 700);
+   sizeX.Draw("HIST");
+   sizeY.Draw("HIST SAME");
+   TLegend sizeLegend(0.68, 0.75, 0.88, 0.88);
+   sizeLegend.SetBorderSize(0);
+   sizeLegend.AddEntry(&sizeX, "X strips", "l");
+   sizeLegend.AddEntry(&sizeY, "Y strips", "l");
+   sizeLegend.Draw();
+   sizeCanvas.Write();
+
+   std::vector<double> combinedADCs = hitADCsX;
+   combinedADCs.insert(
+       combinedADCs.end(), hitADCsY.begin(), hitADCsY.end());
+   const auto adcRange = DUTDistributionRange(combinedADCs);
+   TH1D adcX(
+       "hHitADCX",
+       ("DUT " + std::to_string(dutID) +
+        " track-matched hit amplitude;Hit amplitude [ADC];Entries")
+           .c_str(),
+       200, adcRange.first, adcRange.second);
+   TH1D adcY(
+       "hHitADCY", "", 200, adcRange.first, adcRange.second);
+   StyleDUTDistribution(adcX, kBlue + 1);
+   StyleDUTDistribution(adcY, kRed + 1);
+   for (double value : hitADCsX) adcX.Fill(value);
+   for (double value : hitADCsY) adcY.Fill(value);
+   adcX.SetMaximum(
+       1.15 * std::max(adcX.GetMaximum(), adcY.GetMaximum()));
+   TCanvas adcCanvas(
+       "cHitADC",
+       "Track-matched DUT hit amplitude", 900, 700);
+   adcX.Draw("HIST");
+   adcY.Draw("HIST SAME");
+   TLegend adcLegend(0.68, 0.75, 0.88, 0.88);
+   adcLegend.SetBorderSize(0);
+   adcLegend.AddEntry(&adcX, "X strips", "l");
+   adcLegend.AddEntry(&adcY, "Y strips", "l");
+   adcLegend.Draw();
+   adcCanvas.Write();
 }
 
 void WriteDUTAlignmentQA(TFile* outputFile, int detID,
@@ -361,6 +437,17 @@ void DUTAnalysisScript::LoadConfig(const json& config) {
    m_progressInterval = config.value("progressInterval", 1000);
    m_maxEvents = config.value("maxEvents", -1);
 
+   const json alignmentCfg =
+       config.value("alignmentRegion", json::object());
+   m_alignmentXMin = alignmentCfg.value("xMin", m_alignmentXMin);
+   m_alignmentXMax = alignmentCfg.value("xMax", m_alignmentXMax);
+   m_alignmentYMin = alignmentCfg.value("yMin", m_alignmentYMin);
+   m_alignmentYMax = alignmentCfg.value("yMax", m_alignmentYMax);
+   if (m_alignmentXMax < m_alignmentXMin)
+      std::swap(m_alignmentXMax, m_alignmentXMin);
+   if (m_alignmentYMax < m_alignmentYMin)
+      std::swap(m_alignmentYMax, m_alignmentYMin);
+
    const json effCfg = config.value("efficiencyMap", json::object());
    m_effXMin = effCfg.value("xMin", m_effXMin);
    m_effXMax = effCfg.value("xMax", m_effXMax);
@@ -454,7 +541,8 @@ bool DUTAnalysisScript::Execute() {
 
    Int_t eventID;
    Track* track = nullptr;
-   double sigTime = 0.0;
+   double sigTime = numeric_limits<double>::quiet_NaN();
+   Bool_t hasTrackTime = false;
 
    // Tracks contains one row per reconstructed track.  Count event IDs using
    // only the lightweight scalar branch first, then analyze exactly-one-track
@@ -478,7 +566,11 @@ bool DUTAnalysisScript::Execute() {
 
    trackTree->SetBranchStatus("*", true);
    trackTree->SetBranchAddress("track", &track);
-   if (trackTree->GetBranch("t0")) trackTree->SetBranchAddress("t0", &sigTime);
+   const bool hasT0Branch = trackTree->GetBranch("t0") != nullptr;
+   const bool hasT0FlagBranch = trackTree->GetBranch("hasT0") != nullptr;
+   if (hasT0Branch) trackTree->SetBranchAddress("t0", &sigTime);
+   if (hasT0FlagBranch)
+      trackTree->SetBranchAddress("hasT0", &hasTrackTime);
 
    std::vector<Event> events;  // Script本地数据
 
@@ -516,6 +608,9 @@ bool DUTAnalysisScript::Execute() {
         i < totalTrackEntries && processed < processingTarget; ++i) {
       trackTree->GetEntry(i);
 
+      if (!hasT0FlagBranch)
+         hasTrackTime = hasT0Branch && isfinite(sigTime);
+
       const auto multiplicity = tracksPerEvent.find(eventID);
       if (multiplicity == tracksPerEvent.end() || multiplicity->second != 1) continue;
 
@@ -543,7 +638,10 @@ bool DUTAnalysisScript::Execute() {
          const int id = det->GetID();
          auto detEvt = make_shared<DetectorFrame>(*det);
          detEvt->SetRawData(rawHits[det->GetID()]);
-         detEvt->Process(evt.t0);
+         if (hasTrackTime)
+            detEvt->Process(evt.t0);
+         else
+            detEvt->Process();
          evt.detectorFramesMap[id] = std::move(detEvt);
       }
 
@@ -561,7 +659,9 @@ bool DUTAnalysisScript::Execute() {
    // 运行DUT对齐
    if (m_runAlignment) {
       for (auto& det : duts) {
-         RunDUTAlign(events, det, det->GetID());
+         RunDUTAlign(events, det, det->GetID(),
+                     {m_alignmentXMin, m_alignmentXMax,
+                      m_alignmentYMin, m_alignmentYMax});
       }
    }
 
@@ -576,7 +676,6 @@ bool DUTAnalysisScript::Execute() {
    Int_t hitFlag;
    Cluster clusterX, clusterY;
    vector<ChannelHit> channelHitsX, channelHitsY;
-   std::map<int, std::vector<double>> xyMeanTimesByDUT;
 
    tDut->Branch("eventID", &eventID);
    tDut->Branch("dutID", &dutID);
@@ -603,6 +702,49 @@ bool DUTAnalysisScript::Execute() {
                  : std::pair<int, int>{
                        DUTAnalysisConfig::kTypeX,
                        DUTAnalysisConfig::kTypeY};
+      int hitMapXBins = m_effXBins;
+      int hitMapYBins = m_effYBins;
+      double hitMapXMin = m_effXMin;
+      double hitMapXMax = m_effXMax;
+      double hitMapYMin = m_effYMin;
+      double hitMapYMax = m_effYMax;
+      if (planar) {
+         const auto setReadoutBinning =
+             [&](int type, int& bins, double& minimum, double& maximum) {
+                const auto pitch = planar->readoutPlanePitch.find(type);
+                const auto strips =
+                    planar->readoutPlaneStripNumber.find(type);
+                if (pitch == planar->readoutPlanePitch.end() ||
+                    strips == planar->readoutPlaneStripNumber.end() ||
+                    !(pitch->second > 0.0) || strips->second <= 0) {
+                   return;
+                }
+                bins = strips->second;
+                minimum = 0.0;
+                maximum = pitch->second * strips->second;
+             };
+         setReadoutBinning(
+             typeX, hitMapXBins, hitMapXMin, hitMapXMax);
+         setReadoutBinning(
+             typeY, hitMapYBins, hitMapYMin, hitMapYMax);
+      }
+      TH2D reconstructedHitMap(
+          "hReconstructedHitMap",
+          "All reconstructed DUT hits;Reconstructed X [mm];"
+          "Reconstructed Y [mm]",
+          hitMapXBins, hitMapXMin, hitMapXMax,
+          hitMapYBins, hitMapYMin, hitMapYMax);
+      TH2D matchedHitMap(
+          "hMatchedHitMap",
+          "Track-selected reconstructed DUT hits;Reconstructed X [mm];"
+          "Reconstructed Y [mm]",
+          hitMapXBins, hitMapXMin, hitMapXMax,
+          hitMapYBins, hitMapYMin, hitMapYMax);
+      for (TH2D* histogram : {&reconstructedHitMap, &matchedHitMap}) {
+         histogram->SetDirectory(nullptr);
+         histogram->SetStats(false);
+         histogram->SetOption("COLZ");
+      }
       for (auto& evt : events) {
          eventID = evt.eventID;
          dutID = id;
@@ -624,13 +766,22 @@ bool DUTAnalysisScript::Execute() {
          predX = predL.X();
          predY = predL.Y();
 
+         auto frameIt = evt.detectorFramesMap.find(id);
+         if (frameIt != evt.detectorFramesMap.end()) {
+            for (const auto& localHit : frameIt->second->LocalHits()) {
+               const double localX = localHit.localPos.X();
+               const double localY = localHit.localPos.Y();
+               if (std::isfinite(localX) && std::isfinite(localY))
+                  reconstructedHitMap.Fill(localX, localY);
+            }
+         }
+
          if (predY < m_effYMin || predY > m_effYMax) continue;
          // if (predY < 60 || predY > 66) continue;
          // if (predX > 70 || predX < 55) continue;
          // if (predY < 0 || predY > 20) continue;
          if (predX > m_effXMax || predX < m_effXMin) continue;
 
-         auto frameIt = evt.detectorFramesMap.find(id);
          if (frameIt != evt.detectorFramesMap.end()) {
             const auto& detFrame = frameIt->second;
 
@@ -676,10 +827,10 @@ bool DUTAnalysisScript::Execute() {
                   hitFlag = 0;
 
                clusterIndices = clusterIdx;
-               const double xyMeanTime =
-                   CombinedXYMeanTime(channelHitsX, channelHitsY);
-               if (std::isfinite(xyMeanTime))
-                  xyMeanTimesByDUT[id].push_back(xyMeanTime);
+               if (hasX && hasY && std::isfinite(hitX) &&
+                   std::isfinite(hitY)) {
+                  matchedHitMap.Fill(hitX, hitY);
+               }
 
             } else {
                clusterX = CreateInvalidCluster(typeX);
@@ -694,6 +845,85 @@ bool DUTAnalysisScript::Execute() {
          }
 
          tDut->Fill();
+      }
+
+      auto* detectorDirectory =
+          fDut->GetDirectory(("DUT_" + std::to_string(id)).c_str());
+      if (!detectorDirectory)
+         detectorDirectory =
+             fDut->mkdir(("DUT_" + std::to_string(id)).c_str());
+      auto* hitMapDirectory = detectorDirectory->GetDirectory("HitMaps");
+      if (!hitMapDirectory)
+         hitMapDirectory = detectorDirectory->mkdir("HitMaps");
+      if (hitMapDirectory) {
+         TDirectory::TContext context(hitMapDirectory);
+         reconstructedHitMap.Write();
+         matchedHitMap.Write();
+
+         std::unique_ptr<TH1D> reconstructedProfileX(
+             reconstructedHitMap.ProjectionX(
+                 "hReconstructedHitProfileX"));
+         std::unique_ptr<TH1D> reconstructedProfileY(
+             reconstructedHitMap.ProjectionY(
+                 "hReconstructedHitProfileY"));
+         std::unique_ptr<TH1D> matchedProfileX(
+             matchedHitMap.ProjectionX("hMatchedHitProfileX"));
+         std::unique_ptr<TH1D> matchedProfileY(
+             matchedHitMap.ProjectionY("hMatchedHitProfileY"));
+
+         reconstructedProfileX->SetTitle(
+             "DUT hit profile X;Reconstructed X [mm];Entries");
+         reconstructedProfileY->SetTitle(
+             "DUT hit profile Y;Reconstructed Y [mm];Entries");
+         for (TH1D* profile :
+              {reconstructedProfileX.get(), reconstructedProfileY.get()}) {
+            profile->SetDirectory(nullptr);
+            profile->SetStats(false);
+            profile->SetLineColor(kBlue + 1);
+            profile->SetLineWidth(2);
+            profile->Write();
+         }
+         for (TH1D* profile :
+              {matchedProfileX.get(), matchedProfileY.get()}) {
+            profile->SetDirectory(nullptr);
+            profile->SetStats(false);
+            profile->SetLineColor(kRed + 1);
+            profile->SetLineWidth(2);
+            profile->Fit("gaus", "Q");
+            profile->Write();
+         }
+
+         TCanvas profileCanvas(
+             "cHitProfiles", "DUT hit profiles", 1400, 650);
+         profileCanvas.Divide(2, 1);
+         profileCanvas.cd(1);
+         reconstructedProfileX->SetMaximum(
+             1.15 * std::max(reconstructedProfileX->GetMaximum(),
+                             matchedProfileX->GetMaximum()));
+         reconstructedProfileX->Draw("HIST");
+         matchedProfileX->Draw("HIST SAME");
+         TLegend legendX(0.62, 0.76, 0.88, 0.88);
+         legendX.SetBorderSize(0);
+         legendX.AddEntry(
+             reconstructedProfileX.get(), "All reconstructed", "l");
+         legendX.AddEntry(
+             matchedProfileX.get(), "Track selected", "l");
+         legendX.Draw();
+
+         profileCanvas.cd(2);
+         reconstructedProfileY->SetMaximum(
+             1.15 * std::max(reconstructedProfileY->GetMaximum(),
+                             matchedProfileY->GetMaximum()));
+         reconstructedProfileY->Draw("HIST");
+         matchedProfileY->Draw("HIST SAME");
+         TLegend legendY(0.62, 0.76, 0.88, 0.88);
+         legendY.SetBorderSize(0);
+         legendY.AddEntry(
+             reconstructedProfileY.get(), "All reconstructed", "l");
+         legendY.AddEntry(
+             matchedProfileY.get(), "Track selected", "l");
+         legendY.Draw();
+         profileCanvas.Write();
       }
    }
 
@@ -711,6 +941,7 @@ bool DUTAnalysisScript::Execute() {
       const int id = det->GetID();
       vector<double> residualsX, residualsY;
       vector<DUTAlignmentQAPoint> alignmentPoints;
+      vector<double> selectedClusterChargesX, selectedClusterChargesY;
       vector<int> selectedClusterSizesX, selectedClusterSizesY;
       vector<double> selectedHitADCsX, selectedHitADCsY;
       for (Long64_t entry = 0; entry < tDut->GetEntries(); ++entry) {
@@ -725,12 +956,16 @@ bool DUTAnalysisScript::Execute() {
          residualsX.push_back(resX);
          residualsY.push_back(resY);
          if (clusterX.size > 0) {
+            if (std::isfinite(clusterX.charge))
+               selectedClusterChargesX.push_back(clusterX.charge);
             selectedClusterSizesX.push_back(clusterX.size);
             for (const auto& hit : channelHitsX)
                if (hit.isValid && std::isfinite(hit.amp))
                   selectedHitADCsX.push_back(hit.amp);
          }
          if (clusterY.size > 0) {
+            if (std::isfinite(clusterY.charge))
+               selectedClusterChargesY.push_back(clusterY.charge);
             selectedClusterSizesY.push_back(clusterY.size);
             for (const auto& hit : channelHitsY)
                if (hit.isValid && std::isfinite(hit.amp))
@@ -742,6 +977,16 @@ bool DUTAnalysisScript::Execute() {
          }
       }
 
+      auto* detectorDirectory =
+          fDut->GetDirectory(("DUT_" + std::to_string(id)).c_str());
+      if (!detectorDirectory)
+         detectorDirectory =
+             fDut->mkdir(("DUT_" + std::to_string(id)).c_str());
+      WritePlanarDUTHitProperties(
+          detectorDirectory, id,
+          selectedClusterChargesX, selectedClusterChargesY,
+          selectedClusterSizesX, selectedClusterSizesY,
+          selectedHitADCsX, selectedHitADCsY);
       WriteDUTAlignmentQA(fDut, id, alignmentPoints,
                           m_effXMin, m_effXMax, m_effYMin, m_effYMax);
       const auto resolutionX = AnalyzeResidualSequence(
@@ -751,10 +996,6 @@ bool DUTAnalysisScript::Execute() {
       const auto efficiency = DUTEfficiency::Analyze(
           events, strictSingleHitTrackerEvents, det,
           m_efficiencyConfig, fDut);
-      const auto timing = WriteDUTXYMeanTimeResolution(
-          fDut, id, xyMeanTimesByDUT[id]);
-
-      (void)timing;
 
       const auto mean = [](const auto& values) {
          if (values.empty()) return 0.0;
@@ -879,7 +1120,9 @@ bool DUTAnalysisScript::Execute() {
    return true;
 }
 
-void RunDUTAlign(const std::vector<Event>& events, std::shared_ptr<Detector> detector, int detID) {
+void RunDUTAlign(const std::vector<Event>& events,
+                 std::shared_ptr<Detector> detector, int detID,
+                 const DUTAlignmentRegion& region) {
 
    if (events.empty()) {
       std::cerr << "[DUT Alignment] No events to analyze for DUT " << detID << "!" << std::endl;
@@ -887,34 +1130,104 @@ void RunDUTAlign(const std::vector<Event>& events, std::shared_ptr<Detector> det
    }
 
    std::cout << "[DUT " << detID << "] Aligning (6-parameter)..." << std::endl;
-   auto minimizer = ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
-   minimizer->SetTolerance(0.005);
-   minimizer->SetPrintLevel(0);
-
    UInt_t nPar = 6;
 
-   // 使用lambda捕获this和参数
-   auto chi2Func = [&events, &detector, detID](const double* par) -> double {
-      return DUTChi2Objective(par, events, detector, detID);
-   };
+   // The broad CC residual distribution can hide a coherent Y scale trend
+   // from a generic chi2 minimizer.  Use the zero of the observable
+   // CC-residual-vs-predY slope as the rotX seed; rotX remains free in the
+   // subsequent staged fit.
+   double prefittedRotX = 0.0;
+   double bestAbsSlope = std::numeric_limits<double>::infinity();
+   double previousRotX = -0.05;
+   double previousSlope = std::numeric_limits<double>::quiet_NaN();
+   double scanParameters[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+   for (int step = 0; step <= 100; ++step) {
+      const double candidateRotX = -0.05 + 0.001 * step;
+      scanParameters[3] = candidateRotX;
+      const double slope = DUTCCResidualSlopeY(
+          scanParameters, events, detector, detID, region, 2.0);
+      if (!std::isfinite(slope)) continue;
+      if (std::abs(slope) < bestAbsSlope) {
+         bestAbsSlope = std::abs(slope);
+         prefittedRotX = candidateRotX;
+      }
+      if (std::isfinite(previousSlope) && slope * previousSlope < 0.0) {
+         const double denominator = slope - previousSlope;
+         if (std::abs(denominator) > 1e-12) {
+            const double root = previousRotX -
+                previousSlope * (candidateRotX - previousRotX) /
+                    denominator;
+            if (std::abs(root) <= 0.05) prefittedRotX = root;
+         }
+         break;
+      }
+      previousRotX = candidateRotX;
+      previousSlope = slope;
+   }
+   detector->SetAlignment(0, 0, 0, 0, 0, 0);
 
-   ROOT::Math::Functor f(chi2Func, nPar);
-   minimizer->SetFunction(f);
+   // Deterministic annealing: start with broad, continuously varying
+   // associations and tighten them only after the geometry has moved.  In the
+   // final stage, reject events for which no cluster clearly dominates.
+   const double matchingSigmas[] = {2.0, 1.0, 0.5};
+   const double minMatchDominances[] = {0.0, 0.55, 0.75};
+   double fitResult[6] = {0.0, 0.0, 0.0, prefittedRotX, 0.0, 0.0};
+   double finalMinimum = std::numeric_limits<double>::quiet_NaN();
+   for (size_t stage = 0; stage < 3; ++stage) {
+      auto minimizer =
+          ROOT::Math::Factory::CreateMinimizer("Minuit2", "Migrad");
+      minimizer->SetTolerance(1e-6);
+      minimizer->SetPrecision(1e-10);
+      minimizer->SetStrategy(2);
+      minimizer->SetMaxFunctionCalls(10000);
+      minimizer->SetMaxIterations(2000);
+      minimizer->SetPrintLevel(0);
 
-   for (UInt_t i = 0; i < nPar; ++i) {
-      minimizer->SetVariable(i, Form("p%d", i), 0.0, 0.001);
+      auto chi2Func = [&events, &detector, detID, &region,
+                       stage, &matchingSigmas,
+                       &minMatchDominances](const double* par) {
+         return DUTChi2Objective(par, events, detector, detID, region,
+                                 matchingSigmas[stage],
+                                 minMatchDominances[stage]);
+      };
+      ROOT::Math::Functor f(chi2Func, nPar);
+      minimizer->SetFunction(f);
+      minimizer->SetLimitedVariable(0, "dx", fitResult[0], 0.01, -5.0, 5.0);
+      minimizer->SetLimitedVariable(1, "dy", fitResult[1], 0.01, -5.0, 5.0);
+      // This beam has too little angular spread to determine z independently
+      // from transverse translations.
+      minimizer->SetFixedVariable(2, "dz", 0.0);
+      minimizer->SetLimitedVariable(3, "rotX", fitResult[3], 1e-4,
+                                    -0.05, 0.05);
+      minimizer->SetLimitedVariable(4, "rotY", fitResult[4], 1e-3,
+                                    -0.05, 0.05);
+      minimizer->SetLimitedVariable(5, "rotZ", fitResult[5], 1e-3,
+                                    -0.05, 0.05);
+
+      minimizer->Minimize();
+      const double* stageResult = minimizer->X();
+      bool finiteResult = std::isfinite(minimizer->MinValue());
+      for (UInt_t i = 0; i < nPar; ++i)
+         finiteResult = finiteResult && std::isfinite(stageResult[i]);
+      if (!finiteResult) {
+         detector->SetAlignment(0, 0, 0, 0, 0, 0);
+         std::cerr << "[DUT Alignment] Fit failed for DUT " << detID
+                   << "; keeping configured geometry\n";
+         delete minimizer;
+         return;
+      }
+      std::copy(stageResult, stageResult + nPar, fitResult);
+      finalMinimum = minimizer->MinValue();
+      delete minimizer;
    }
 
-   minimizer->Minimize();
-
    // 应用结果
-   const double* result = minimizer->X();
-   double dx = result[0];
-   double dy = result[1];
-   double dz = result[2];
-   double rotX = result[3];
-   double rotY = result[4];
-   double rotZ = result[5];
+   double dx = fitResult[0];
+   double dy = fitResult[1];
+   double dz = fitResult[2];
+   double rotX = fitResult[3];
+   double rotY = fitResult[4];
+   double rotZ = fitResult[5];
 
    detector->SetAlignment(dx, dy, dz, rotX, rotY, rotZ);
 
@@ -931,14 +1244,15 @@ void RunDUTAlign(const std::vector<Event>& events, std::shared_ptr<Detector> det
              << "rotX=" << rotX << ", rotY=" << rotY << ", rotZ=" << rotZ
              << std::endl;
 
-   std::cout << "[DUT " << detID << "] Final chi2: " << minimizer->MinValue() << std::endl;
-
-   delete minimizer;
+   std::cout << "[DUT " << detID << "] Final chi2: " << finalMinimum << std::endl;
 }
 
 // ========== DUT对齐私有方法 ==========
 
-LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<Cluster>& clusters, const TVector3& predL, double& residualX, double& residualY) {
+LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector,
+                          const std::vector<Cluster>& clusters,
+                          const TVector3& predL, double& residualX,
+                          double& residualY, bool useCentroid) {
 
    double predX = predL.X();
    double predY = predL.Y();
@@ -995,7 +1309,8 @@ LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<
    // 构建LocalHit
    if (bestClusterXIndex != -1) {
       double pitchX = config->readoutPlanePitch.at(typeX);
-      bestPosX = clusters[bestClusterXIndex].pos * pitchX;
+      const auto& cluster = clusters[bestClusterXIndex];
+      bestPosX = (useCentroid ? cluster.centroid : cluster.pos) * pitchX;
       residualX = bestPosX - predX;
    } else {
       bestPosX = DUTAnalysisConfig::kInvalidValue;
@@ -1004,7 +1319,8 @@ LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<
 
    if (bestClusterYIndex != -1) {
       double pitchY = config->readoutPlanePitch.at(typeY);
-      bestPosY = clusters[bestClusterYIndex].pos * pitchY;
+      const auto& cluster = clusters[bestClusterYIndex];
+      bestPosY = (useCentroid ? cluster.centroid : cluster.pos) * pitchY;
       residualY = bestPosY - predY;
    } else {
       bestPosY = DUTAnalysisConfig::kInvalidValue;
@@ -1017,7 +1333,64 @@ LocalHit CalcuDutResidual(std::shared_ptr<Detector> detector, const std::vector<
    return localHit;
 }
 
-double DUTChi2Objective(const double* par, const std::vector<Event>& events, std::shared_ptr<Detector> detector, int detID) {
+double DUTCCResidualSlopeY(const double* par,
+                           const std::vector<Event>& events,
+                           std::shared_ptr<Detector> detector, int detID,
+                           const DUTAlignmentRegion& region,
+                           double matchingSigma) {
+   detector->SetAlignment(par[0], par[1], par[2], par[3], par[4], par[5]);
+
+   double sumPredY = 0.0;
+   double sumResidualY = 0.0;
+   double sumPredY2 = 0.0;
+   double sumPredYResidualY = 0.0;
+   size_t count = 0;
+   for (const auto& event : events) {
+      const auto frame = event.detectorFramesMap.find(detID);
+      if (frame == event.detectorFramesMap.end() ||
+          frame->second->Clusters().empty())
+         continue;
+      const TVector3 predictedGlobal = detector->CalcHitFromTrack(event.track);
+      const TVector3 predictedLocal = detector->GlobalToLocal(predictedGlobal);
+      const double predX = predictedLocal.X();
+      const double predY = predictedLocal.Y();
+      if (!std::isfinite(predX) || !std::isfinite(predY) ||
+          predX < region.xMin || predX > region.xMax ||
+          predY < region.yMin || predY > region.yMax)
+         continue;
+
+      const DUTAlignmentMatch match = CalcuDutAlignmentMatch(
+          detector, frame->second->Clusters(), predictedLocal,
+          matchingSigma);
+      const double residualX = match.residualX;
+      const double residualY = match.residualY;
+      if (!std::isfinite(residualX) || !std::isfinite(residualY) ||
+          residualX == DUTAnalysisConfig::kInvalidValue ||
+          residualY == DUTAnalysisConfig::kInvalidValue ||
+          std::abs(residualX) > 1.0 || std::abs(residualY) > 3.0)
+         continue;
+
+      sumPredY += predY;
+      sumResidualY += residualY;
+      sumPredY2 += predY * predY;
+      sumPredYResidualY += predY * residualY;
+      ++count;
+   }
+
+   if (count < 100) return std::numeric_limits<double>::quiet_NaN();
+   const double denominator =
+       count * sumPredY2 - sumPredY * sumPredY;
+   if (!(denominator > 1e-12) || !std::isfinite(denominator))
+      return std::numeric_limits<double>::quiet_NaN();
+   return (count * sumPredYResidualY - sumPredY * sumResidualY) /
+          denominator;
+}
+
+double DUTChi2Objective(const double* par, const std::vector<Event>& events,
+                        std::shared_ptr<Detector> detector, int detID,
+                        const DUTAlignmentRegion& region,
+                        double matchingSigma,
+                        double minMatchDominance) {
 
    const double dx = par[0];
    const double dy = par[1];
@@ -1031,6 +1404,10 @@ double DUTChi2Objective(const double* par, const std::vector<Event>& events, std
    // 对所有事件求平均 χ²
    double chi2 = 0.0;
    int nEvents = 0;
+   double sumPredY = 0.0;
+   double sumResidualY = 0.0;
+   double sumPredY2 = 0.0;
+   double sumPredYResidualY = 0.0;
 
    for (const auto& evt : events) {
       double residualX = 0.0;
@@ -1049,20 +1426,55 @@ double DUTChi2Objective(const double* par, const std::vector<Event>& events, std
       double predX = predL.X();
       double predY = predL.Y();
 
-      // if (predY < 10 || predY > 50) continue;
-      // if (predX < 60 & predX > 40) continue;
-      // if (predX > 90) continue;
-      // 调用新的CalcuDutResidual方法
-      LocalHit localHit = CalcuDutResidual(detector, clusters, predL, residualX, residualY);
+      if (!std::isfinite(predX) || !std::isfinite(predY)) continue;
+      if (predX < region.xMin || predX > region.xMax ||
+          predY < region.yMin || predY > region.yMax)
+         continue;
+      // Geometry alignment must not absorb uTPC timing distortions.  Match
+      // against the charge centroid and reconsider all candidates whenever
+      // the trial geometry changes.
+      const DUTAlignmentMatch match = CalcuDutAlignmentMatch(
+          detector, clusters, predL, matchingSigma);
+      residualX = match.residualX;
+      residualY = match.residualY;
+
+      if (!std::isfinite(residualX) || !std::isfinite(residualY) ||
+          residualX == DUTAnalysisConfig::kInvalidValue ||
+          residualY == DUTAnalysisConfig::kInvalidValue ||
+          match.dominanceX < minMatchDominance ||
+          match.dominanceY < minMatchDominance)
+         continue;
 
       double res = residualX * residualX + residualY * residualY;
-      if (res > 3) continue;
+      if (!std::isfinite(res) || std::abs(residualX) > 1.0 ||
+          std::abs(residualY) > 3.0)
+         continue;
       chi2 += res;
+      sumPredY += predY;
+      sumResidualY += residualY;
+      sumPredY2 += predY * predY;
+      sumPredYResidualY += predY * residualY;
       nEvents++;
    }
 
-   // 返回平均 χ²
-   return (nEvents > 0) ? chi2 / nEvents : 1e9;
+   if (nEvents < 100) return 1e9;
+   const double slopeDenominator =
+       nEvents * sumPredY2 - sumPredY * sumPredY;
+   if (!(slopeDenominator > 1e-12) ||
+       !std::isfinite(slopeDenominator))
+      return 1e9;
+   const double residualSlopeY =
+       (nEvents * sumPredYResidualY - sumPredY * sumResidualY) /
+       slopeDenominator;
+   const double meanResidualY = sumResidualY / nEvents;
+
+   // Keep the broad-residual chi2 for translations and cluster matching,
+   // while preventing it from pulling rotX away from the slope-zero seed.
+   constexpr double kResidualSlopePenalty = 1e4;
+   constexpr double kResidualMeanPenalty = 100.0;
+   return chi2 / nEvents +
+          kResidualSlopePenalty * residualSlopeY * residualSlopeY +
+          kResidualMeanPenalty * meanResidualY * meanResidualY;
 }
 
 Cluster DUTAnalysisScript::CreateInvalidCluster(int type) {

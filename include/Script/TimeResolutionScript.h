@@ -18,7 +18,7 @@ class TimeResolutionScript : public IScript {
 
    private:
     std::string m_trackFile;
-    std::string m_dutFile = "PadDUTInfo.root";
+    std::string m_dutFile = "DUTInfo.root";
     std::string m_oscilloscopeFile = "OscilloscopeAnalysis.root";
     std::string m_outputFile = "TimeResolution.root";
     int m_histogramBins = 160;
@@ -26,5 +26,8 @@ class TimeResolutionScript : public IScript {
     bool m_analyzeDUTTiming = false;
     double m_timingEfficiencyWindowNs = 25.0;
     double m_timingEfficiencyStepNs = 0.5;
+    std::string m_timeMethod = "XYMean";
+    double m_amplitudeWeightPower = 1.0;
+    double m_maximumStripAmplitude = -1.0;
     json m_timingWaveformConfig = json{{"mode", "Fit"}};
 };

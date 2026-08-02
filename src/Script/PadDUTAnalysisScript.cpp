@@ -1336,7 +1336,8 @@ bool PadDUTAnalysisScript::Execute() {
 
     Int_t eventID = 0;
     Track* track = nullptr;
-    double eventTime = 0.0;
+    double eventTime = std::numeric_limits<double>::quiet_NaN();
+    Bool_t hasTrackTime = false;
     trackTree->SetBranchStatus("*", false);
     trackTree->SetBranchStatus("eventID", true);
     trackTree->SetBranchAddress("eventID", &eventID);
@@ -1347,8 +1348,13 @@ bool PadDUTAnalysisScript::Execute() {
     }
     trackTree->SetBranchStatus("*", true);
     trackTree->SetBranchAddress("track", &track);
-    if (trackTree->GetBranch("t0")) {
+    const bool hasT0Branch = trackTree->GetBranch("t0") != nullptr;
+    const bool hasT0FlagBranch = trackTree->GetBranch("hasT0") != nullptr;
+    if (hasT0Branch) {
         trackTree->SetBranchAddress("t0", &eventTime);
+    }
+    if (hasT0FlagBranch) {
+        trackTree->SetBranchAddress("hasT0", &hasTrackTime);
     }
 
     const auto& trackers = factory.GetDetectorsByRole(Detector::Role::Tracker);
@@ -1362,6 +1368,8 @@ bool PadDUTAnalysisScript::Execute() {
          entry < trackTree->GetEntries() && processed < maximumEvents;
          ++entry) {
         trackTree->GetEntry(entry);
+        if (!hasT0FlagBranch)
+            hasTrackTime = hasT0Branch && std::isfinite(eventTime);
         if (!track || trackMultiplicity[eventID] != 1) continue;
         auto rawByDetector = parser->LoadEvent(eventID);
         if (rawByDetector.empty()) continue;
@@ -1386,7 +1394,10 @@ bool PadDUTAnalysisScript::Execute() {
             auto frame = std::make_shared<DetectorFrame>(*detector);
             const auto raw = rawByDetector.find(detector->GetID());
             if (raw != rawByDetector.end()) frame->SetRawData(raw->second);
-            frame->Process(eventTime);
+            if (hasTrackTime)
+                frame->Process(eventTime);
+            else
+                frame->Process();
             event.detectorFramesMap[detector->GetID()] = std::move(frame);
         }
         events.push_back(std::move(event));

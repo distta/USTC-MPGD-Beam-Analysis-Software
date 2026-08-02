@@ -109,6 +109,49 @@ AxisTrackSamples* AxisSamplesForType(DetectorTrackSamples& samples, int type) {
     return nullptr;
 }
 
+double CalculateTrackTime(const Event& event,
+                          const Tracking::Result& result) {
+    double detectorTimeSum = 0.0;
+    size_t detectorTimeCount = 0;
+    for (const auto& [detectorID, hitIndex] : result.hitIndices) {
+        const auto frameEntry = event.detectorFramesMap.find(detectorID);
+        if (frameEntry == event.detectorFramesMap.end()) continue;
+        const auto& frame = *frameEntry->second;
+        if (hitIndex < 0 ||
+            hitIndex >= static_cast<int>(frame.LocalHits().size()))
+            continue;
+        const auto& localHit = frame.LocalHits()[hitIndex];
+        const auto& clusters = frame.Clusters();
+        const auto& channelHits = frame.ChannelHits();
+        double weightedTime = 0.0;
+        double weightSum = 0.0;
+        for (int clusterIndex : localHit.clusterIndices) {
+            if (clusterIndex < 0 ||
+                clusterIndex >= static_cast<int>(clusters.size()))
+                continue;
+            for (int channelIndex :
+                 clusters[clusterIndex].channelHitIndices) {
+                if (channelIndex < 0 ||
+                    channelIndex >= static_cast<int>(channelHits.size()))
+                    continue;
+                const auto& channel = channelHits[channelIndex];
+                if (!channel.isValid || !isfinite(channel.time) ||
+                    !isfinite(channel.amp) || channel.amp <= 0.0)
+                    continue;
+                const double weight = channel.amp * channel.amp;
+                weightedTime += weight * channel.time;
+                weightSum += weight;
+            }
+        }
+        if (weightSum <= 0.0) continue;
+        detectorTimeSum += weightedTime / weightSum;
+        ++detectorTimeCount;
+    }
+    return detectorTimeCount > 0
+               ? detectorTimeSum / detectorTimeCount
+               : numeric_limits<double>::quiet_NaN();
+}
+
 pair<double, double> CommonRange(const vector<double>& x,
                                  const vector<double>& y) {
     double minimum = numeric_limits<double>::infinity();
@@ -261,7 +304,7 @@ void TrackAnalysisScript::LoadConfig(const json& config) {
     m_tracking.resolutionX = config.value("resolutionX", 0.12);
     m_tracking.resolutionY = config.value("resolutionY", 0.12);
     m_tracking.gateSigma = config.value("gateSigma", 3.0);
-    m_tracking.maxChi2Ndf = config.value("maxChi2Ndf", 25.0);
+    m_tracking.maxChi2Ndf = config.value("maxChi2Ndf", 10);
     m_tracking.maxBranchesPerLayer = config.value("maxBranchesPerLayer", 3);
     m_tracking.maxCandidates = config.value("maxCandidates", 4000);
     m_tracking.maxTracks = config.value("maxTracksPerEvent", 32);
@@ -363,10 +406,14 @@ bool TrackAnalysisScript::Execute() {
     ULong64_t rawEventID = 0;
     Int_t trackIndex = 0;
     Track track{};
+    Double_t t0 = numeric_limits<double>::quiet_NaN();
+    Bool_t hasT0 = false;
     tracksTree.Branch("eventID", &eventID);
     tracksTree.Branch("rawEventID", &rawEventID);
     tracksTree.Branch("trackIndex", &trackIndex);
     tracksTree.Branch("track", &track);
+    tracksTree.Branch("t0", &t0);
+    tracksTree.Branch("hasT0", &hasT0);
 
     unique_ptr<TTree> validation;
     Int_t detID = 0;
@@ -476,6 +523,8 @@ bool TrackAnalysisScript::Execute() {
             rawEventID = currentRawEventID;
             trackIndex = static_cast<Int_t>(resultIndex);
             track = result.track;
+            t0 = CalculateTrackTime(event, result);
+            hasT0 = isfinite(t0);
             tracksTree.Fill();
             ++savedTracks;
             if (performance && m_performanceHistograms)

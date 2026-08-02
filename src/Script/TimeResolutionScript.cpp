@@ -11,23 +11,20 @@
 #include <TCanvas.h>
 #include <TDirectory.h>
 #include <TF1.h>
-#include <TGraph.h>
 #include <TH1D.h>
 #include <TH2D.h>
 #include <TLatex.h>
 #include <TLine.h>
-#include <TMarker.h>
 #include <TProfile.h>
+#include <TStyle.h>
 #include <TTree.h>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <filesystem>
-#include <future>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -38,6 +35,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -45,16 +43,105 @@ using namespace std;
 
 namespace {
 
-constexpr size_t kEstimatorCount = 6;
-constexpr size_t kTrackerTimingEstimator = 4;
-const array<string, kEstimatorCount> kEstimatorNames = {
-    "XMean", "XMin", "YMean", "YMin", "XYMean", "XYMin"};
+const array<string, 7> kTimeMethods = {
+    "XMean", "XMin", "YMean", "YMin", "XYMean", "XYMin",
+    "XYWeighted"};
 
-using TrackKey = pair<uint64_t, int>;
+string CanonicalTimeMethod(string method) {
+    transform(method.begin(), method.end(), method.begin(),
+              [](unsigned char value) {
+                  return static_cast<char>(tolower(value));
+              });
+    for (const string& candidate : kTimeMethods) {
+        string lowered = candidate;
+        transform(lowered.begin(), lowered.end(), lowered.begin(),
+                  [](unsigned char value) {
+                      return static_cast<char>(tolower(value));
+                  });
+        if (method == lowered) return candidate;
+    }
+    return {};
+}
+
+double CalculateConfiguredTime(
+    const vector<double>& times,
+    const vector<double>& errors,
+    const vector<double>& amplitudes,
+    const vector<int>& planes,
+    const string& method,
+    double amplitudeWeightPower) {
+    const bool useX = method == "XMean" || method == "XMin" ||
+                      method == "XYMean" || method == "XYMin" ||
+                      method == "XYWeighted";
+    const bool useY = method == "YMean" || method == "YMin" ||
+                      method == "XYMean" || method == "XYMin" ||
+                      method == "XYWeighted";
+    const bool useMinimum = method == "XMin" || method == "YMin" ||
+                            method == "XYMin";
+    const bool useAmplitudeWeight = method == "XYWeighted";
+    const size_t entries = min(times.size(), planes.size());
+    double minimumTime = numeric_limits<double>::infinity();
+    double timeSum = 0.0;
+    size_t validTimes = 0;
+    double weightedTime = 0.0;
+    double weightSum = 0.0;
+    for (size_t index = 0; index < entries; ++index) {
+        const bool selected =
+            (planes[index] == 0 && useX) ||
+            (planes[index] == 1 && useY);
+        if (!selected || !isfinite(times[index])) continue;
+        minimumTime = min(minimumTime, times[index]);
+        timeSum += times[index];
+        ++validTimes;
+        if (useAmplitudeWeight) continue;
+        if (index >= errors.size() || !isfinite(errors[index]) ||
+            errors[index] <= 0.0)
+            continue;
+        const double weight = 1.0 / (errors[index] * errors[index]);
+        if (!isfinite(weight)) continue;
+        weightedTime += weight * times[index];
+        weightSum += weight;
+    }
+    if (validTimes == 0)
+        return numeric_limits<double>::quiet_NaN();
+    if (useMinimum) return minimumTime;
+    if (useAmplitudeWeight) {
+        weightedTime = 0.0;
+        weightSum = 0.0;
+        for (size_t index = 0; index < entries; ++index) {
+            const bool selected =
+                (planes[index] == 0 && useX) ||
+                (planes[index] == 1 && useY);
+            if (!selected || !isfinite(times[index]) ||
+                index >= amplitudes.size() ||
+                !isfinite(amplitudes[index]) || amplitudes[index] <= 0.0)
+                continue;
+            const double weight = pow(amplitudes[index],
+                                      amplitudeWeightPower);
+            if (!isfinite(weight)) continue;
+            weightedTime += weight * times[index];
+            weightSum += weight;
+        }
+        if (weightSum > 0.0) return weightedTime / weightSum;
+    }
+    if (weightSum > 0.0) return weightedTime / weightSum;
+    return timeSum / static_cast<double>(validTimes);
+}
+
+// Reconstruction event IDs are unique within the analysis input, while raw
+// event IDs can wrap or repeat.  Keep the latter only as external-T0 lookup
+// metadata so equal raw IDs never merge two reconstructed tracks.
+using TrackKey = pair<int, int>;
 
 struct DetectorTimes {
-    array<double, kEstimatorCount> value{};
-    DetectorTimes() { value.fill(numeric_limits<double>::quiet_NaN()); }
+    double clusterTime = numeric_limits<double>::quiet_NaN();
+    vector<double> stripTimes;
+    vector<double> stripTimeErrors;
+    vector<double> stripAmplitudes;
+    vector<double> stripRiseTimes;
+    vector<double> stripWidths;
+    vector<int> stripIDs;
+    vector<int> stripPlanes;
 };
 
 struct FitResult {
@@ -66,10 +153,9 @@ struct FitResult {
 
 struct ReconstructionTimingResult {
     map<TrackKey, map<int, DetectorTimes>> trackTimes;
-    map<TrackKey, int> eventIDs;
+    map<TrackKey, uint64_t> rawEventIDs;
     set<uint64_t> wantedEventIDs;
-    size_t missingRawDetectors = 0;
-    size_t emptyTimingDetectors = 0;
+    set<uint64_t> ambiguousRawEventIDs;
 };
 
 struct TrackTimeReference {
@@ -83,28 +169,27 @@ struct DUTTimingSample {
     uint64_t rawEventID = 0;
     int trackIndex = -1;
     int detectorID = -1;
-    double amplitude = numeric_limits<double>::quiet_NaN();
     double dutTime = numeric_limits<double>::quiet_NaN();
-    double trackTime = numeric_limits<double>::quiet_NaN();
     double residual = numeric_limits<double>::quiet_NaN();
-    double meanAmplitude = numeric_limits<double>::quiet_NaN();
-    double clusterCharge = numeric_limits<double>::quiet_NaN();
-    double clusterMaxAmplitude = numeric_limits<double>::quiet_NaN();
-    double clusterSize = numeric_limits<double>::quiet_NaN();
-    double clusterCentroid = numeric_limits<double>::quiet_NaN();
-    double clusterLocalX = numeric_limits<double>::quiet_NaN();
-    double clusterLocalY = numeric_limits<double>::quiet_NaN();
-    double predictedX = numeric_limits<double>::quiet_NaN();
-    double predictedY = numeric_limits<double>::quiet_NaN();
     bool insideActiveArea = false;
+    vector<double> stripTimes;
+    vector<double> stripTimeErrors;
+    vector<double> stripAmplitudes;
+    vector<double> stripRiseTimes;
+    vector<double> stripWidths;
+    vector<int> stripIDs;
+    vector<int> stripPlanes;
 };
 
 struct DUTTimingResult {
     map<int, vector<DUTTimingSample>> samplesByDetector;
     map<int, set<TrackKey>> activeAreaTrackCases;
     map<int, set<TrackKey>> activeAreaMatchedHitCases;
-    size_t unmatchedTrackTimes = 0;
-    size_t invalidDUTTimes = 0;
+};
+
+enum class DUTTreeSchema {
+    Planar,
+    Pad
 };
 
 struct TrackTimeWeights {
@@ -167,9 +252,33 @@ struct T0ResidualSamples {
     }
 };
 
-struct TimeMeasurement {
-    double time = numeric_limits<double>::quiet_NaN();
-    double error = numeric_limits<double>::quiet_NaN();
+double SubtractReferenceResolution(
+    const FitResult& fit, const T0ResidualSamples& samples) {
+    const double referenceVariance = samples.MeanReferenceVariance();
+    if (!isfinite(fit.sigma) || !isfinite(referenceVariance))
+        return numeric_limits<double>::quiet_NaN();
+    const double intrinsicVariance =
+        fit.sigma * fit.sigma - referenceVariance;
+    return intrinsicVariance >= 0.0
+               ? sqrt(intrinsicVariance)
+               : numeric_limits<double>::quiet_NaN();
+}
+
+struct TimeWalkCorrection {
+    bool valid = false;
+    size_t entries = 0;
+    double amplitudeLow = numeric_limits<double>::quiet_NaN();
+    double amplitudeHigh = numeric_limits<double>::quiet_NaN();
+    array<double, 4> parameter{};
+
+    double Evaluate(double amplitude) const {
+        if (!valid || !isfinite(amplitude))
+            return numeric_limits<double>::quiet_NaN();
+        const double x = clamp(amplitude, amplitudeLow, amplitudeHigh);
+        return parameter[0] +
+               x * (parameter[1] +
+                    x * (parameter[2] + x * parameter[3]));
+    }
 };
 
 class TimingProgress {
@@ -207,111 +316,69 @@ class TimingProgress {
     int m_lastPercent = -1;
 };
 
-double ErrorWeightedMean(const vector<TimeMeasurement>& measurements) {
-    double weightedTime = 0.0;
-    double weightSum = 0.0;
-    for (const TimeMeasurement& measurement : measurements) {
-        if (!isfinite(measurement.time) || !isfinite(measurement.error) ||
-            measurement.error <= 0.0)
-            continue;
-        const double weight =
-            1.0 / (measurement.error * measurement.error);
-        if (!isfinite(weight)) continue;
-        weightedTime += weight * measurement.time;
-        weightSum += weight;
-    }
-    if (weightSum > 0.0) return weightedTime / weightSum;
-
-    double timeSum = 0.0;
-    size_t validTimes = 0;
-    for (const TimeMeasurement& measurement : measurements) {
-        if (!isfinite(measurement.time)) continue;
-        timeSum += measurement.time;
-        ++validTimes;
-    }
-    return validTimes > 0
-               ? timeSum / static_cast<double>(validTimes)
-               : numeric_limits<double>::quiet_NaN();
-}
-
 // ==========================
 // Reconstruction-based timing
 // ==========================
 
-array<double, kEstimatorCount> ExtractTimes(const vector<int>& clusterIndices,
-                                            const vector<Cluster>& clusters,
-                                            const vector<ChannelHit>& channelHits,
-                                            const vector<RawData>& detectorRawData,
-                                            HitProcessor& timingFitter,
-                                            size_t& fitCount) {
-    array<double, kEstimatorCount> result;
-    result.fill(numeric_limits<double>::quiet_NaN());
-    array<vector<TimeMeasurement>, 2> planeStripTimes;
-    map<int, TimeMeasurement> fittedStripTimes;
+DetectorTimes ExtractTimes(const vector<int>& clusterIndices,
+                           const vector<Cluster>& clusters,
+                           const vector<ChannelHit>& channelHits,
+                           const vector<RawData>& detectorRawData,
+                           HitProcessor& timingFitter,
+                           const string& timeMethod,
+                           double amplitudeWeightPower,
+                           size_t& fitCount) {
+    DetectorTimes result;
+    map<int, ChannelHit> fittedStripHits;
 
     for (int clusterIndex : clusterIndices) {
         if (clusterIndex < 0 || clusterIndex >= static_cast<int>(clusters.size())) continue;
         const Cluster& cluster = clusters[clusterIndex];
-        if (cluster.type < 0 || cluster.type > 1) continue;
 
-        vector<TimeMeasurement> stripTimes;
         for (int stripIndex : cluster.channelHitIndices) {
             if (stripIndex < 0 || stripIndex >= static_cast<int>(channelHits.size())) continue;
             const int rawIndex = channelHits[stripIndex].rawIndices;
             if (rawIndex < 0 || rawIndex >= static_cast<int>(detectorRawData.size())) continue;
 
-            auto cached = fittedStripTimes.find(rawIndex);
-            if (cached == fittedStripTimes.end()) {
-                const ChannelHit fitted =
-                    timingFitter.ProcessHit(detectorRawData[rawIndex]);
+            auto cached = fittedStripHits.find(rawIndex);
+            if (cached == fittedStripHits.end()) {
+                ChannelHit fitted = timingFitter.ProcessHit(
+                    detectorRawData[rawIndex]);
                 ++fitCount;
-                TimeMeasurement measurement;
-                if (fitted.isValid && isfinite(fitted.time)) {
-                    measurement.time = fitted.time;
-                    measurement.error = fitted.timeError;
-                }
-                cached =
-                    fittedStripTimes.emplace(rawIndex, measurement).first;
+                cached = fittedStripHits.emplace(rawIndex, fitted).first;
             }
-            if (isfinite(cached->second.time))
-                stripTimes.push_back(cached->second);
         }
-        if (stripTimes.empty()) continue;
-        planeStripTimes[cluster.type].insert(
-            planeStripTimes[cluster.type].end(), stripTimes.begin(), stripTimes.end());
     }
 
-    vector<TimeMeasurement> combined;
-    for (size_t plane = 0; plane < 2; ++plane) {
-        const auto& times = planeStripTimes[plane];
-        if (times.empty()) continue;
-        result[plane * 2] = ErrorWeightedMean(times);
-        result[plane * 2 + 1] =
-            min_element(
-                times.begin(), times.end(),
-                [](const TimeMeasurement& first,
-                   const TimeMeasurement& second) {
-                    return first.time < second.time;
-                })
-                ->time;
-        combined.insert(combined.end(), times.begin(), times.end());
+    result.stripTimes.reserve(fittedStripHits.size());
+    result.stripTimeErrors.reserve(fittedStripHits.size());
+    result.stripAmplitudes.reserve(fittedStripHits.size());
+    result.stripRiseTimes.reserve(fittedStripHits.size());
+    result.stripWidths.reserve(fittedStripHits.size());
+    result.stripIDs.reserve(fittedStripHits.size());
+    result.stripPlanes.reserve(fittedStripHits.size());
+    for (const auto& [rawIndex, hit] : fittedStripHits) {
+        (void)rawIndex;
+        if (!hit.isValid || !isfinite(hit.time)) continue;
+        result.stripTimes.push_back(hit.time);
+        result.stripTimeErrors.push_back(hit.timeError);
+        result.stripAmplitudes.push_back(hit.amp);
+        result.stripRiseTimes.push_back(hit.riseTime);
+        result.stripWidths.push_back(hit.width);
+        result.stripIDs.push_back(hit.id0);
+        result.stripPlanes.push_back(hit.type);
     }
-    if (!combined.empty()) {
-        result[4] = ErrorWeightedMean(combined);
-        result[5] =
-            min_element(
-                combined.begin(), combined.end(),
-                [](const TimeMeasurement& first,
-                   const TimeMeasurement& second) {
-                    return first.time < second.time;
-                })
-                ->time;
-    }
+    result.clusterTime = CalculateConfiguredTime(
+        result.stripTimes, result.stripTimeErrors,
+        result.stripAmplitudes, result.stripPlanes, timeMethod,
+        amplitudeWeightPower);
     return result;
 }
 
 bool LoadReconstructionTimes(TTree& validation, RawDataParser& parser,
                              const json& timingWaveformConfig,
+                             const string& timeMethod,
+                             double amplitudeWeightPower,
                              size_t& fitCount,
                              ReconstructionTimingResult& result) {
     for (const char* branch : {"eventID", "rawEventID", "trackIndex", "detID",
@@ -341,44 +408,47 @@ bool LoadReconstructionTimes(TTree& validation, RawDataParser& parser,
     timingFitter.LoadConfig(timingWaveformConfig);
     int loadedEventID = numeric_limits<int>::min();
     unordered_map<int, vector<RawData>> rawHits;
+    map<uint64_t, int> rawToEventID;
     const Long64_t entries = validation.GetEntries();
     TimingProgress progress("Tracker timing", entries, fitCount);
     for (Long64_t entry = 0; entry < entries; ++entry) {
         progress.Update(entry);
         validation.GetEntry(entry);
+        const TrackKey key{eventID, trackIndex};
+        const auto [rawEntry, inserted] =
+            result.rawEventIDs.emplace(key, rawEventID);
+        if (!inserted && rawEntry->second != rawEventID) {
+            cerr << "[TimeResolution] inconsistent rawEventID for event "
+                 << eventID << ", track " << trackIndex << '\n';
+            return false;
+        }
+        result.wantedEventIDs.insert(rawEventID);
+        const auto [eventEntry, newRawID] =
+            rawToEventID.emplace(rawEventID, eventID);
+        if (!newRawID && eventEntry->second != eventID)
+            result.ambiguousRawEventIDs.insert(rawEventID);
         if (!clusterIndices || !channelHits || !clusters) continue;
         if (eventID != loadedEventID) {
             rawHits = parser.LoadEvent(eventID);
             loadedEventID = eventID;
         }
         const auto rawDetector = rawHits.find(detID);
-        if (rawDetector == rawHits.end()) {
-            ++result.missingRawDetectors;
-            continue;
-        }
-        DetectorTimes times;
-        times.value = ExtractTimes(*clusterIndices, *clusters, *channelHits,
-                                   rawDetector->second, timingFitter,
-                                   fitCount);
-        bool hasAnyTime = false;
-        for (double value : times.value) {
-            if (isfinite(value)) {
-                hasAnyTime = true;
-                break;
-            }
-        }
-        if (!hasAnyTime) ++result.emptyTimingDetectors;
-        result.trackTimes[{rawEventID, trackIndex}][detID] = times;
-        result.eventIDs[{rawEventID, trackIndex}] = eventID;
-        result.wantedEventIDs.insert(rawEventID);
+        if (rawDetector == rawHits.end()) continue;
+        DetectorTimes times =
+            ExtractTimes(*clusterIndices, *clusters, *channelHits,
+                         rawDetector->second, timingFitter,
+                         timeMethod, amplitudeWeightPower, fitCount);
+        result.trackTimes[key][detID] = times;
     }
+    for (uint64_t rawEventID : result.ambiguousRawEventIDs)
+        result.wantedEventIDs.erase(rawEventID);
     progress.Update(entries);
     return true;
 }
 
 map<int, TrackTimeReference> BuildTrackTimeReferences(
     const map<TrackKey, map<int, DetectorTimes>>& trackTimes,
-    const map<TrackKey, int>& eventIDs,
+    const map<TrackKey, uint64_t>& rawEventIDs,
     const array<int, 3>& trackerIDs,
     const TrackTimeWeights& weights) {
     map<int, TrackTimeReference> references;
@@ -389,95 +459,180 @@ map<int, TrackTimeReference> BuildTrackTimeReferences(
         for (size_t i = 0; i < trackerIDs.size(); ++i) {
             const auto detector = detectors.find(trackerIDs[i]);
             if (detector == detectors.end() ||
-                !isfinite(detector->second.value[kTrackerTimingEstimator])) {
+                !isfinite(detector->second.clusterTime)) {
                 valid = false;
                 break;
             }
-            times[i] =
-                detector->second.value[kTrackerTimingEstimator];
+            times[i] = detector->second.clusterTime;
         }
-        const auto event = eventIDs.find(key);
-        if (!valid || event == eventIDs.end()) continue;
-        if (references.count(event->second)) {
-            ambiguousEventIDs.insert(event->second);
+        const auto rawEvent = rawEventIDs.find(key);
+        if (!valid || rawEvent == rawEventIDs.end()) continue;
+        if (references.count(key.first)) {
+            ambiguousEventIDs.insert(key.first);
             continue;
         }
         double trackTime = 0.0;
         for (size_t i = 0; i < trackerIDs.size(); ++i) {
             trackTime += weights.value[i] * times[i];
         }
-        references[event->second] = {key.first, key.second, trackTime};
+        references[key.first] = {
+            rawEvent->second, key.second, trackTime};
     }
     for (int eventID : ambiguousEventIDs) references.erase(eventID);
     return references;
+}
+
+bool IsInsideDUTActiveArea(
+    const shared_ptr<Detector>& detector,
+    double predictedX, double predictedY) {
+    if (!detector || !isfinite(predictedX) || !isfinite(predictedY))
+        return false;
+
+    if (const auto* pad = detector->GetPlanarPadConfig()) {
+        const double xMinimum = -0.5 * pad->pitchX;
+        const double xMaximum =
+            (pad->columns - 0.5) * pad->pitchX;
+        const double yMinimum = -0.5 * pad->pitchY;
+        const double yMaximum =
+            (pad->rows - 0.5) * pad->pitchY;
+        return predictedX >= xMinimum && predictedX < xMaximum &&
+               predictedY >= yMinimum && predictedY < yMaximum;
+    }
+
+    const auto* planar = detector->GetPlanarConfig();
+    if (!planar || planar->readoutPlaneType.empty()) return false;
+    constexpr double degreesToRadians =
+        3.14159265358979323846 / 180.0;
+    for (int type : planar->readoutPlaneType) {
+        const auto angle = planar->readoutPlaneAngle.find(type);
+        const auto pitch = planar->readoutPlanePitch.find(type);
+        const auto strips = planar->readoutPlaneStripNumber.find(type);
+        if (angle == planar->readoutPlaneAngle.end() ||
+            pitch == planar->readoutPlanePitch.end() ||
+            strips == planar->readoutPlaneStripNumber.end() ||
+            !isfinite(pitch->second) || pitch->second <= 0.0 ||
+            strips->second <= 0) {
+            return false;
+        }
+        const double radians = angle->second * degreesToRadians;
+        const double coordinate =
+            predictedX * cos(radians) + predictedY * sin(radians);
+        const double minimum = -0.5 * pitch->second;
+        const double maximum =
+            (strips->second - 0.5) * pitch->second;
+        if (coordinate < minimum || coordinate >= maximum) return false;
+    }
+    return true;
 }
 
 DUTTimingResult LoadDUTTiming(
     TTree& dutTree, RawDataParser& parser,
     const map<int, TrackTimeReference>& trackReferences,
     const json& timingWaveformConfig,
+    const string& timeMethod,
+    double amplitudeWeightPower,
     size_t& fitCount) {
     DUTTimingResult result;
     for (const char* branch :
-         {"eventID", "dutID", "hitFlag", "predX", "predY",
-          "selectedCluster", "selectedChannelHits"}) {
+         {"eventID", "dutID", "hitFlag", "predX", "predY"}) {
         if (!dutTree.GetBranch(branch)) {
-            cerr << "[TimeResolution] PadDUTTree branch " << branch
+            cerr << "[TimeResolution] DUT tree branch " << branch
                  << " is missing\n";
             return result;
         }
     }
+
+    const auto hasBranches = [&](initializer_list<const char*> names) {
+        return all_of(
+            names.begin(), names.end(),
+            [&](const char* name) { return dutTree.GetBranch(name); });
+    };
+    const bool hasPlanarSchema = hasBranches(
+        {"clusterX", "clusterY", "channelHitsX", "channelHitsY"});
+    const bool hasPadSchema =
+        hasBranches({"selectedCluster", "selectedChannelHits"});
+    if (!hasPlanarSchema && !hasPadSchema) {
+        cerr << "[TimeResolution] DUT tree has neither the planar nor the "
+                "planar_pad timing branches\n";
+        return result;
+    }
+    const DUTTreeSchema schema =
+        hasPlanarSchema ? DUTTreeSchema::Planar : DUTTreeSchema::Pad;
 
     Int_t eventID = 0, dutID = 0, hitFlag = 0;
     Double_t predictedX = numeric_limits<double>::quiet_NaN();
     Double_t predictedY = numeric_limits<double>::quiet_NaN();
     Cluster* selectedCluster = nullptr;
     vector<ChannelHit>* selectedChannelHits = nullptr;
+    Cluster* clusterX = nullptr;
+    Cluster* clusterY = nullptr;
+    vector<ChannelHit>* channelHitsX = nullptr;
+    vector<ChannelHit>* channelHitsY = nullptr;
     dutTree.SetBranchAddress("eventID", &eventID);
     dutTree.SetBranchAddress("dutID", &dutID);
     dutTree.SetBranchAddress("hitFlag", &hitFlag);
     dutTree.SetBranchAddress("predX", &predictedX);
     dutTree.SetBranchAddress("predY", &predictedY);
-    dutTree.SetBranchAddress("selectedCluster", &selectedCluster);
-    dutTree.SetBranchAddress("selectedChannelHits", &selectedChannelHits);
+    if (schema == DUTTreeSchema::Planar) {
+        dutTree.SetBranchAddress("clusterX", &clusterX);
+        dutTree.SetBranchAddress("clusterY", &clusterY);
+        dutTree.SetBranchAddress("channelHitsX", &channelHitsX);
+        dutTree.SetBranchAddress("channelHitsY", &channelHitsY);
+    } else {
+        dutTree.SetBranchAddress("selectedCluster", &selectedCluster);
+        dutTree.SetBranchAddress(
+            "selectedChannelHits", &selectedChannelHits);
+    }
 
     HitProcessor timingFitter;
     timingFitter.LoadConfig(timingWaveformConfig);
     int loadedEventID = numeric_limits<int>::min();
     unordered_map<int, vector<RawData>> rawHits;
+    unordered_set<int> warnedDetectorIDs;
     const Long64_t entries = dutTree.GetEntries();
     TimingProgress progress("DUT timing", entries, fitCount);
     for (Long64_t entry = 0; entry < entries; ++entry) {
         progress.Update(entry);
         dutTree.GetEntry(entry);
-        const bool hasMatchedHit =
-            hitFlag != 0 && selectedCluster && selectedChannelHits &&
-            !selectedChannelHits->empty();
-        const auto reference = trackReferences.find(eventID);
-        if (reference == trackReferences.end()) {
-            if (hasMatchedHit) ++result.unmatchedTrackTimes;
-            continue;
+
+        vector<const ChannelHit*> matchedHits;
+        bool hasMatchedCluster = false;
+        const auto appendMatch =
+            [&](const Cluster* cluster,
+                const vector<ChannelHit>* hits) {
+                if (!cluster || !hits || hits->empty()) return;
+                hasMatchedCluster = true;
+                for (const auto& hit : *hits)
+                    matchedHits.push_back(&hit);
+            };
+        if (schema == DUTTreeSchema::Planar) {
+            if (hitFlag & 1) appendMatch(clusterX, channelHitsX);
+            if (hitFlag & 2) appendMatch(clusterY, channelHitsY);
+        } else if (hitFlag != 0) {
+            appendMatch(selectedCluster, selectedChannelHits);
         }
-        bool insideActiveArea = false;
+        const bool hasMatchedHit =
+            hasMatchedCluster && !matchedHits.empty();
+
         const auto detector =
             DetectorFactory::GetInstance().GetDetector(dutID);
-        const auto* pad = detector
-                              ? detector->GetPlanarPadConfig()
-                              : nullptr;
-        if (pad && isfinite(predictedX) && isfinite(predictedY)) {
-            const double xMinimum = -0.5 * pad->pitchX;
-            const double xMaximum =
-                (pad->columns - 0.5) * pad->pitchX;
-            const double yMinimum = -0.5 * pad->pitchY;
-            const double yMaximum =
-                (pad->rows - 0.5) * pad->pitchY;
-            insideActiveArea =
-                predictedX >= xMinimum && predictedX < xMaximum &&
-                predictedY >= yMinimum && predictedY < yMaximum;
+        if (!detector || !detector->isDUT() ||
+            (!detector->GetPlanarConfig() &&
+             !detector->GetPlanarPadConfig())) {
+            if (warnedDetectorIDs.insert(dutID).second) {
+                cerr << "[TimeResolution] skipping DUT tree entries for "
+                     << dutID
+                     << ": detector is missing, not a DUT, or unsupported\n";
+            }
+            continue;
         }
+
+        const auto reference = trackReferences.find(eventID);
+        if (reference == trackReferences.end()) continue;
+        const bool insideActiveArea = IsInsideDUTActiveArea(
+            detector, predictedX, predictedY);
         const TrackKey trackCase{
-            reference->second.rawEventID,
-            reference->second.trackIndex};
+            eventID, reference->second.trackIndex};
         if (insideActiveArea) {
             result.activeAreaTrackCases[dutID].insert(trackCase);
             if (hasMatchedHit)
@@ -490,61 +645,58 @@ DUTTimingResult LoadDUTTiming(
             loadedEventID = eventID;
         }
         const auto rawDetector = rawHits.find(dutID);
-        if (rawDetector == rawHits.end()) {
-            ++result.invalidDUTTimes;
-            continue;
-        }
-
-        vector<TimeMeasurement> dutMeasurements;
-        double amplitudeSum = 0.0;
-        double maximumAmplitude = -numeric_limits<double>::infinity();
+        if (rawDetector == rawHits.end()) continue;
+        vector<double> stripTimes;
+        vector<double> stripTimeErrors;
+        vector<double> stripAmplitudes;
+        vector<double> stripRiseTimes;
+        vector<double> stripWidths;
+        vector<int> stripIDs;
+        vector<int> stripPlanes;
         size_t validDUTChannels = 0;
-        for (const ChannelHit& selectedHit : *selectedChannelHits) {
-            const int rawIndex = selectedHit.rawIndices;
+        unordered_set<int> fittedRawIndices;
+        for (const ChannelHit* selectedHit : matchedHits) {
+            if (!selectedHit) continue;
+            const int rawIndex = selectedHit->rawIndices;
             if (rawIndex < 0 ||
-                rawIndex >= static_cast<int>(rawDetector->second.size())) {
+                rawIndex >= static_cast<int>(rawDetector->second.size()) ||
+                !fittedRawIndices.insert(rawIndex).second) {
                 continue;
             }
             const ChannelHit fitted =
                 timingFitter.ProcessHit(rawDetector->second[rawIndex]);
             ++fitCount;
             if (fitted.isValid && isfinite(fitted.time)) {
-                dutMeasurements.push_back(
-                    {fitted.time, fitted.timeError});
-                amplitudeSum += fitted.amp;
-                maximumAmplitude = max(maximumAmplitude, fitted.amp);
+                stripTimes.push_back(fitted.time);
+                stripTimeErrors.push_back(fitted.timeError);
+                stripAmplitudes.push_back(fitted.amp);
+                stripRiseTimes.push_back(fitted.riseTime);
+                stripWidths.push_back(fitted.width);
+                stripIDs.push_back(fitted.id0);
+                stripPlanes.push_back(fitted.type);
                 ++validDUTChannels;
             }
         }
-        if (validDUTChannels == 0) {
-            ++result.invalidDUTTimes;
-            continue;
-        }
-        const double dutTime = ErrorWeightedMean(dutMeasurements);
+        if (validDUTChannels == 0) continue;
+        const double dutTime = CalculateConfiguredTime(
+            stripTimes, stripTimeErrors, stripAmplitudes,
+            stripPlanes, timeMethod, amplitudeWeightPower);
+        if (!isfinite(dutTime)) continue;
         DUTTimingSample sample;
         sample.eventID = eventID;
         sample.rawEventID = reference->second.rawEventID;
         sample.trackIndex = reference->second.trackIndex;
         sample.detectorID = dutID;
-        sample.amplitude = maximumAmplitude;
         sample.dutTime = dutTime;
-        sample.trackTime = reference->second.time;
         sample.residual = dutTime - reference->second.time;
-        sample.meanAmplitude =
-            amplitudeSum / static_cast<double>(validDUTChannels);
-        sample.clusterCharge = selectedCluster->charge;
-        sample.clusterMaxAmplitude = maximumAmplitude;
-        sample.clusterSize = selectedCluster->size;
-        sample.clusterCentroid = selectedCluster->centroid;
-        sample.clusterLocalX = selectedCluster->hasLocalPosition
-                                   ? selectedCluster->localPosition.X()
-                                   : selectedCluster->pos;
-        sample.clusterLocalY = selectedCluster->hasLocalPosition
-                                   ? selectedCluster->localPosition.Y()
-                                   : numeric_limits<double>::quiet_NaN();
-        sample.predictedX = predictedX;
-        sample.predictedY = predictedY;
         sample.insideActiveArea = insideActiveArea;
+        sample.stripTimes = move(stripTimes);
+        sample.stripTimeErrors = move(stripTimeErrors);
+        sample.stripAmplitudes = move(stripAmplitudes);
+        sample.stripRiseTimes = move(stripRiseTimes);
+        sample.stripWidths = move(stripWidths);
+        sample.stripIDs = move(stripIDs);
+        sample.stripPlanes = move(stripPlanes);
         result.samplesByDetector[dutID].push_back(move(sample));
     }
     progress.Update(entries);
@@ -577,7 +729,10 @@ FitResult WriteAndFit(const vector<double>& values, TDirectory& directory, const
     double high = rawMean + 6.0 * rawSigma;
     if (low == high) high = low + 1.0;
     directory.cd();
+    gStyle->SetOptStat(1);
+    gStyle->SetOptFit(1);
     TH1D histogram(name.c_str(), title.c_str(), bins, low, high);
+    histogram.SetStats(true);
     for (double value : values) histogram.Fill(value);
 
     TF1 gaussian((name + "_gaus").c_str(), "gaus", rawMean - 2.0 * rawSigma, rawMean + 2.0 * rawSigma);
@@ -952,8 +1107,7 @@ TrackTimeWeights CalculateTrackTimeWeights(
                 complete = false;
                 break;
             }
-            times[i] =
-                detector->second.value[kTrackerTimingEstimator];
+            times[i] = detector->second.clusterTime;
             if (!isfinite(times[i])) {
                 complete = false;
                 break;
@@ -1029,1231 +1183,6 @@ struct TimingEfficiencyResult {
     double bestEfficiency = numeric_limits<double>::quiet_NaN();
 };
 
-TimingEfficiencyResult WriteTimingEfficiencyCurve(
-    const vector<double>& residuals, size_t denominator,
-    double windowWidthNs,
-    double stepNs, int histogramBins, TDirectory& directory,
-    const string& name, const string& title,
-    bool compactPlot = false) {
-    TimingEfficiencyResult result;
-    vector<double> sorted = residuals;
-    sorted.erase(
-        remove_if(sorted.begin(), sorted.end(),
-                  [](double value) { return !isfinite(value); }),
-        sorted.end());
-    sort(sorted.begin(), sorted.end());
-    result.denominator = denominator;
-    result.validTimes = sorted.size();
-    if (sorted.empty() || result.denominator == 0 ||
-        sorted.size() > result.denominator ||
-        !isfinite(windowWidthNs) || windowWidthNs <= 0.0 ||
-        !isfinite(stepNs) || stepNs <= 0.0)
-        return result;
-
-    size_t right = 0;
-    size_t bestLeft = 0;
-    size_t bestRight = 0;
-    for (size_t left = 0; left < sorted.size(); ++left) {
-        if (right < left) right = left;
-        while (right < sorted.size() &&
-               sorted[right] - sorted[left] <= windowWidthNs)
-            ++right;
-        const size_t count = right - left;
-        if (count > result.bestCount) {
-            result.bestCount = count;
-            bestLeft = left;
-            bestRight = right;
-        }
-    }
-    const double earliestStart =
-        sorted[bestRight - 1] - windowWidthNs;
-    const double latestStart = sorted[bestLeft];
-    result.bestWindowStart =
-        0.5 * (earliestStart + latestStart);
-    result.bestWindowEnd =
-        result.bestWindowStart + windowWidthNs;
-    result.bestWindowCenter =
-        result.bestWindowStart + 0.5 * windowWidthNs;
-    result.bestEfficiency =
-        static_cast<double>(result.bestCount) /
-        static_cast<double>(result.denominator);
-    result.valid = true;
-
-    const auto [robustLow, robustHigh] = RobustRange(sorted);
-    double scanLow = robustLow - windowWidthNs;
-    double scanHigh = robustHigh;
-    const double span = max(stepNs, scanHigh - scanLow);
-    const double effectiveStep =
-        max(stepNs, span / 20000.0);
-    vector<double> windowStarts;
-    for (double start = scanLow; start <= scanHigh;
-         start += effectiveStep)
-        windowStarts.push_back(start);
-    windowStarts.push_back(result.bestWindowStart);
-    sort(windowStarts.begin(), windowStarts.end());
-    windowStarts.erase(
-        unique(windowStarts.begin(), windowStarts.end(),
-               [](double first, double second) {
-                   return abs(first - second) < 1.0e-9;
-               }),
-        windowStarts.end());
-
-    TDirectory::TContext context(&directory);
-    TGraph curve(static_cast<int>(windowStarts.size()));
-    curve.SetName(("g_" + name).c_str());
-    ostringstream graphTitle;
-    graphTitle << ";Window start t_{start} [ns];Efficiency";
-    curve.SetTitle(graphTitle.str().c_str());
-    for (size_t point = 0; point < windowStarts.size(); ++point) {
-        const double start = windowStarts[point];
-        const auto first =
-            lower_bound(sorted.begin(), sorted.end(), start);
-        const auto last =
-            upper_bound(sorted.begin(), sorted.end(),
-                        start + windowWidthNs);
-        const double efficiency =
-            static_cast<double>(last - first) /
-            static_cast<double>(result.denominator);
-        curve.SetPoint(
-            static_cast<int>(point), start, efficiency);
-    }
-    curve.SetLineColor(kBlue + 1);
-    curve.SetLineWidth(2);
-    curve.SetMinimum(0.0);
-    curve.SetMaximum(min(1.05, max(0.05, 1.08 * result.bestEfficiency)));
-
-    TCanvas canvas(
-        ("c_" + name).c_str(), title.c_str(), 1000, 700);
-    canvas.SetTopMargin(0.20);
-    curve.Draw("AL");
-    TLatex heading;
-    heading.SetNDC();
-    heading.SetTextAlign(22);
-    heading.SetTextSize(0.040);
-    heading.DrawLatex(0.5, 0.96, title.c_str());
-    TLine bestLine(
-        result.bestWindowStart, 0.0,
-        result.bestWindowStart, result.bestEfficiency);
-    bestLine.SetLineColor(kRed + 1);
-    bestLine.SetLineStyle(2);
-    bestLine.SetLineWidth(2);
-    bestLine.Draw("SAME");
-    TMarker bestMarker(
-        result.bestWindowStart, result.bestEfficiency, 29);
-    bestMarker.SetMarkerColor(kRed + 1);
-    bestMarker.SetMarkerSize(2.0);
-    bestMarker.Draw("SAME");
-    ostringstream maximumAnnotation;
-    maximumAnnotation << fixed << setprecision(3)
-                      << "max = "
-                      << 100.0 * result.bestEfficiency
-                      << "% (" << result.bestCount << '/'
-                      << result.denominator << ')';
-    ostringstream windowAnnotation;
-    windowAnnotation << fixed << setprecision(3)
-                     << "best " << windowWidthNs
-                     << " ns window = ["
-                     << result.bestWindowStart << ", "
-                     << result.bestWindowEnd << "] ns";
-    TLatex label;
-    label.SetNDC();
-    label.SetTextSize(0.030);
-    label.SetTextColor(kRed + 1);
-    label.DrawLatex(
-        0.14, 0.90, maximumAnnotation.str().c_str());
-    label.DrawLatex(
-        0.14, 0.85, windowAnnotation.str().c_str());
-    canvas.Modified();
-    canvas.Update();
-    canvas.Write();
-
-    const auto [residualLow, residualHigh] = RobustRange(sorted);
-    const double plotLow = compactPlot
-                               ? min(residualLow,
-                                     result.bestWindowStart)
-                               : min(residualLow,
-                                     result.bestWindowStart) -
-                                     0.05 * windowWidthNs;
-    const double plotHigh = compactPlot
-                                ? max(residualHigh,
-                                      result.bestWindowEnd)
-                                : max(residualHigh,
-                                      result.bestWindowEnd) +
-                                      0.05 * windowWidthNs;
-    TH1D residualHistogram(
-        ("h_residual_" + name).c_str(),
-        ";#Deltat=t-T0_{scope} [ns];Events",
-        histogramBins, plotLow, plotHigh);
-    residualHistogram.SetDirectory(nullptr);
-    for (double value : sorted) residualHistogram.Fill(value);
-    residualHistogram.SetLineColor(kBlue + 1);
-    residualHistogram.SetLineWidth(2);
-    residualHistogram.SetStats(false);
-
-    vector<double> fitValues;
-    fitValues.reserve(result.bestCount);
-    copy_if(
-        sorted.begin(), sorted.end(), back_inserter(fitValues),
-        [&](double value) {
-            return value >= result.bestWindowStart &&
-                   value <= result.bestWindowEnd;
-        });
-    const FitResult fit = FitGaussianWithoutWriting(fitValues);
-    unique_ptr<TF1> gaussian;
-    if (isfinite(fit.mean) && isfinite(fit.sigma) &&
-        fit.sigma > 0.0) {
-        const double fitLow =
-            max(plotLow, fit.mean - 2.5 * fit.sigma);
-        const double fitHigh =
-            min(plotHigh, fit.mean + 2.5 * fit.sigma);
-        gaussian = make_unique<TF1>(
-            ("fit_residual_" + name).c_str(), "gaus",
-            fitLow, fitHigh);
-        gaussian->SetParameters(
-            residualHistogram.GetMaximum(), fit.mean, fit.sigma);
-        residualHistogram.Fit(
-            gaussian.get(), "RQ0N", "", fitLow, fitHigh);
-        gaussian->SetLineColor(kGreen + 2);
-        gaussian->SetLineWidth(3);
-    }
-
-    TCanvas residualCanvas(
-        ("c_residual_" + name).c_str(),
-        (title + " residual and best window").c_str(), 1000, 700);
-    residualCanvas.SetTopMargin(0.24);
-    const double yMaximum = 1.08 * residualHistogram.GetMaximum();
-    residualHistogram.SetMaximum(yMaximum);
-    residualHistogram.Draw("HIST");
-    heading.DrawLatex(0.5, 0.96, title.c_str());
-    TLine windowStart(
-        result.bestWindowStart, 0.0,
-        result.bestWindowStart, yMaximum);
-    TLine windowEnd(
-        result.bestWindowEnd, 0.0,
-        result.bestWindowEnd, yMaximum);
-    windowStart.SetLineColor(kRed + 1);
-    windowEnd.SetLineColor(kRed + 1);
-    windowStart.SetLineStyle(2);
-    windowEnd.SetLineStyle(2);
-    windowStart.SetLineWidth(2);
-    windowEnd.SetLineWidth(2);
-    windowStart.Draw("SAME");
-    windowEnd.Draw("SAME");
-    if (gaussian) gaussian->Draw("SAME");
-    label.SetTextColor(kRed + 1);
-    label.DrawLatex(
-        0.14, 0.90, maximumAnnotation.str().c_str());
-    label.DrawLatex(
-        0.14, 0.85, windowAnnotation.str().c_str());
-    if (gaussian) {
-        ostringstream fitAnnotation;
-        fitAnnotation << fixed << setprecision(3)
-                      << "Gaussian: #mu = "
-                      << gaussian->GetParameter(1)
-                      << " ns, #sigma = "
-                      << abs(gaussian->GetParameter(2))
-                      << " ns";
-        label.SetTextColor(kGreen + 2);
-        label.DrawLatex(
-            0.14, 0.80, fitAnnotation.str().c_str());
-    }
-    residualCanvas.Modified();
-    residualCanvas.Update();
-    residualCanvas.Write();
-    return result;
-}
-
-double PearsonCorrelation(const vector<double>& x, const vector<double>& y) {
-    double sumX = 0.0, sumY = 0.0;
-    size_t entries = 0;
-    for (size_t i = 0; i < min(x.size(), y.size()); ++i) {
-        if (!isfinite(x[i]) || !isfinite(y[i])) continue;
-        sumX += x[i];
-        sumY += y[i];
-        ++entries;
-    }
-    if (entries < 2) return numeric_limits<double>::quiet_NaN();
-    const double meanX = sumX / entries;
-    const double meanY = sumY / entries;
-    double covariance = 0.0, varianceX = 0.0, varianceY = 0.0;
-    for (size_t i = 0; i < min(x.size(), y.size()); ++i) {
-        if (!isfinite(x[i]) || !isfinite(y[i])) continue;
-        const double dx = x[i] - meanX;
-        const double dy = y[i] - meanY;
-        covariance += dx * dy;
-        varianceX += dx * dx;
-        varianceY += dy * dy;
-    }
-    if (varianceX <= 0.0 || varianceY <= 0.0)
-        return numeric_limits<double>::quiet_NaN();
-    return covariance / sqrt(varianceX * varianceY);
-}
-
-double WriteDUTCorrelation(
-    const vector<double>& factor, const vector<double>& residual,
-    TDirectory& directory,
-    const string& name, const string& axisTitle, int bins) {
-    const auto [xLow, xHigh] = RobustRange(factor);
-    const auto [yLow, yHigh] = RobustRange(residual);
-    TDirectory::TContext context(&directory);
-    TH2D histogram(
-        ("residual_vs_" + name).c_str(),
-        ("DUT-track residual vs " + axisTitle + ";" + axisTitle +
-         ";t_{DUT}-t_{track} [ns]")
-            .c_str(),
-        bins, xLow, xHigh, bins, yLow, yHigh);
-    TProfile profile(
-        ("profile_vs_" + name).c_str(),
-        ("Residual profile vs " + axisTitle + ";" + axisTitle +
-         ";<#Deltat> [ns]")
-            .c_str(),
-        bins, xLow, xHigh);
-    for (size_t i = 0; i < factor.size(); ++i) {
-        if (i < residual.size() && isfinite(factor[i]) &&
-            isfinite(residual[i])) {
-            histogram.Fill(factor[i], residual[i]);
-            profile.Fill(factor[i], residual[i]);
-        }
-    }
-    histogram.Write();
-    profile.Write();
-    return PearsonCorrelation(factor, residual);
-}
-
-bool WriteTimingOutput(const string& outputPath,
-                       const map<TrackKey, map<int, DetectorTimes>>& trackTimes,
-                       const map<TrackKey, int>& eventIDs,
-                       const OscilloscopeT0Result& oscilloscopeT0,
-                       const array<int, 3>& trackerIDs,
-                       const DUTTimingResult& dutTiming,
-                       const TrackTimeWeights& trackWeights,
-                       double timingEfficiencyWindowNs,
-                       double timingEfficiencyStepNs,
-                       int histogramBins) {
-    unique_ptr<TFile> output(TFile::Open(outputPath.c_str(), "RECREATE"));
-    if (!output || output->IsZombie()) {
-        cerr << "[TimeResolution] cannot create " << outputPath << '\n';
-        return false;
-    }
-    TTree eventTree(
-        "EventTimes", "Tracker detector and matched oscilloscope T0 times");
-    ULong64_t outRawEventID = 0;
-    Int_t outTrackIndex = 0, outDetID = 0;
-    Bool_t outHasOscilloscopeT0 = false;
-    Double_t outOscilloscopeT0 =
-        numeric_limits<double>::quiet_NaN();
-    Double_t outOscilloscopeT0Resolution =
-        numeric_limits<double>::quiet_NaN();
-    Int_t outOscilloscopeValidChannels = 0;
-    Int_t outOscilloscopeTraceFileIndex = -1;
-    Int_t outOscilloscopeSegmentIndex = -1;
-    array<Double_t, kEstimatorCount> estimatorValues{};
-    eventTree.Branch("rawEventID", &outRawEventID);
-    eventTree.Branch("trackIndex", &outTrackIndex);
-    eventTree.Branch("detectorID", &outDetID);
-    eventTree.Branch("hasOscilloscopeT0", &outHasOscilloscopeT0);
-    eventTree.Branch("oscilloscopeT0", &outOscilloscopeT0);
-    eventTree.Branch(
-        "oscilloscopeT0Resolution", &outOscilloscopeT0Resolution);
-    eventTree.Branch(
-        "oscilloscopeT0ValidChannels", &outOscilloscopeValidChannels);
-    eventTree.Branch(
-        "oscilloscopeTraceFileIndex", &outOscilloscopeTraceFileIndex);
-    eventTree.Branch(
-        "oscilloscopeSegmentIndex", &outOscilloscopeSegmentIndex);
-    for (size_t estimator = 0; estimator < kEstimatorCount; ++estimator)
-        eventTree.Branch(kEstimatorNames[estimator].c_str(), &estimatorValues[estimator]);
-
-    TTree trackTimeTree("TrackTimes", "Inverse-variance weighted tracker time");
-    Int_t trackEventID = 0;
-    ULong64_t trackRawEventID = 0;
-    Int_t trackIndex = 0;
-    Int_t tracker1ID = trackerIDs[0], tracker2ID = trackerIDs[1],
-          tracker3ID = trackerIDs[2];
-    Double_t tracker1Time = numeric_limits<double>::quiet_NaN();
-    Double_t tracker2Time = numeric_limits<double>::quiet_NaN();
-    Double_t tracker3Time = numeric_limits<double>::quiet_NaN();
-    Double_t trackTime = numeric_limits<double>::quiet_NaN();
-    Bool_t trackHasOscilloscopeT0 = false;
-    Double_t trackOscilloscopeT0 =
-        numeric_limits<double>::quiet_NaN();
-    Double_t trackOscilloscopeT0Resolution =
-        numeric_limits<double>::quiet_NaN();
-    Double_t trackMinusOscilloscopeT0 =
-        numeric_limits<double>::quiet_NaN();
-    Double_t tracker1Weight = trackWeights.value[0];
-    Double_t tracker2Weight = trackWeights.value[1];
-    Double_t tracker3Weight = trackWeights.value[2];
-    trackTimeTree.Branch("eventID", &trackEventID);
-    trackTimeTree.Branch("rawEventID", &trackRawEventID);
-    trackTimeTree.Branch("trackIndex", &trackIndex);
-    trackTimeTree.Branch("tracker1ID", &tracker1ID);
-    trackTimeTree.Branch("tracker2ID", &tracker2ID);
-    trackTimeTree.Branch("tracker3ID", &tracker3ID);
-    trackTimeTree.Branch("tracker1Time", &tracker1Time);
-    trackTimeTree.Branch("tracker2Time", &tracker2Time);
-    trackTimeTree.Branch("tracker3Time", &tracker3Time);
-    trackTimeTree.Branch("trackTime", &trackTime);
-    trackTimeTree.Branch(
-        "hasOscilloscopeT0", &trackHasOscilloscopeT0);
-    trackTimeTree.Branch("oscilloscopeT0", &trackOscilloscopeT0);
-    trackTimeTree.Branch(
-        "oscilloscopeT0Resolution", &trackOscilloscopeT0Resolution);
-    trackTimeTree.Branch(
-        "trackMinusOscilloscopeT0", &trackMinusOscilloscopeT0);
-    trackTimeTree.Branch("tracker1Weight", &tracker1Weight);
-    trackTimeTree.Branch("tracker2Weight", &tracker2Weight);
-    trackTimeTree.Branch("tracker3Weight", &tracker3Weight);
-
-    map<pair<int, size_t>, vector<double>> detectorTimeSamples;
-    map<tuple<int, int, size_t>, vector<double>> pairResiduals;
-    map<pair<int, size_t>, T0ResidualSamples> detectorT0Residuals;
-    vector<double> trackTimeSamples;
-    T0ResidualSamples trackT0Residuals;
-    array<vector<double>, 3> threeTrackerPairResiduals;
-    size_t tracksWithOscilloscopeT0 = 0;
-    size_t completeThreeTrackerTimes = 0;
-    for (const auto& [key, detectors] : trackTimes) {
-        const auto scopeReference =
-            oscilloscopeT0.references.find(key.first);
-        const bool hasOscilloscopeT0 =
-            scopeReference != oscilloscopeT0.references.end();
-        if (hasOscilloscopeT0) ++tracksWithOscilloscopeT0;
-        const OscilloscopeT0Reference* t0 =
-            hasOscilloscopeT0 ? &scopeReference->second : nullptr;
-        for (const auto& [detectorID, times] : detectors) {
-            outRawEventID = key.first;
-            outTrackIndex = key.second;
-            outDetID = detectorID;
-            outHasOscilloscopeT0 = hasOscilloscopeT0;
-            outOscilloscopeT0 =
-                t0 ? t0->time : numeric_limits<double>::quiet_NaN();
-            outOscilloscopeT0Resolution =
-                t0 ? t0->resolution
-                   : numeric_limits<double>::quiet_NaN();
-            outOscilloscopeValidChannels =
-                t0 ? t0->validChannels : 0;
-            outOscilloscopeTraceFileIndex =
-                t0 ? t0->traceFileIndex : -1;
-            outOscilloscopeSegmentIndex =
-                t0 ? t0->segmentIndex : -1;
-            estimatorValues = times.value;
-            eventTree.Fill();
-            for (size_t estimator = 0; estimator < kEstimatorCount; ++estimator) {
-                if (!isfinite(times.value[estimator])) continue;
-                detectorTimeSamples[{detectorID, estimator}].push_back(times.value[estimator]);
-                if (t0)
-                    detectorT0Residuals[{detectorID, estimator}].Add(
-                        times.value[estimator] - t0->time,
-                        t0->resolution);
-            }
-        }
-
-        for (auto first = detectors.begin(); first != detectors.end(); ++first) {
-            for (auto second = next(first); second != detectors.end(); ++second) {
-                for (size_t estimator = 0; estimator < kEstimatorCount; ++estimator) {
-                    const double a = first->second.value[estimator];
-                    const double b = second->second.value[estimator];
-                    if (isfinite(a) && isfinite(b))
-                        pairResiduals[{first->first, second->first, estimator}].push_back(
-                            a - b);
-                }
-            }
-        }
-
-        array<double, 3> selectedTimes{};
-        bool hasAllTrackerTimes = true;
-        for (size_t i = 0; i < trackerIDs.size(); ++i) {
-            const auto detector = detectors.find(trackerIDs[i]);
-            if (detector == detectors.end() ||
-                !isfinite(detector->second.value[kTrackerTimingEstimator])) {
-                hasAllTrackerTimes = false;
-                break;
-            }
-            selectedTimes[i] =
-                detector->second.value[kTrackerTimingEstimator];
-        }
-        if (hasAllTrackerTimes) {
-            const auto event = eventIDs.find(key);
-            trackEventID = event == eventIDs.end() ? -1 : event->second;
-            trackRawEventID = key.first;
-            trackIndex = key.second;
-            tracker1Time = selectedTimes[0];
-            tracker2Time = selectedTimes[1];
-            tracker3Time = selectedTimes[2];
-            trackTime =
-                tracker1Weight * tracker1Time +
-                tracker2Weight * tracker2Time +
-                tracker3Weight * tracker3Time;
-            trackHasOscilloscopeT0 = hasOscilloscopeT0;
-            trackOscilloscopeT0 =
-                t0 ? t0->time : numeric_limits<double>::quiet_NaN();
-            trackOscilloscopeT0Resolution =
-                t0 ? t0->resolution
-                   : numeric_limits<double>::quiet_NaN();
-            trackMinusOscilloscopeT0 =
-                t0 ? trackTime - t0->time
-                   : numeric_limits<double>::quiet_NaN();
-            trackTimeTree.Fill();
-            trackTimeSamples.push_back(trackTime);
-            if (t0)
-                trackT0Residuals.Add(
-                    trackMinusOscilloscopeT0, t0->resolution);
-            threeTrackerPairResiduals[0].push_back(tracker1Time - tracker2Time);
-            threeTrackerPairResiduals[1].push_back(tracker1Time - tracker3Time);
-            threeTrackerPairResiduals[2].push_back(tracker2Time - tracker3Time);
-            ++completeThreeTrackerTimes;
-        }
-    }
-    eventTree.Write();
-    trackTimeTree.Write();
-
-    TTree dutTimeTree("DUTTimes", "DUT time relative to weighted tracker time");
-    Int_t dutEventID = 0, dutTrackIndex = -1, dutDetectorID = -1;
-    ULong64_t dutRawEventID = 0;
-    Double_t dutTime = numeric_limits<double>::quiet_NaN();
-    Double_t dutTrackTime = numeric_limits<double>::quiet_NaN();
-    Double_t dutMinusTrackTime = numeric_limits<double>::quiet_NaN();
-    Bool_t dutHasOscilloscopeT0 = false;
-    Double_t dutOscilloscopeT0 =
-        numeric_limits<double>::quiet_NaN();
-    Double_t dutOscilloscopeT0Resolution =
-        numeric_limits<double>::quiet_NaN();
-    Double_t dutMinusOscilloscopeT0 =
-        numeric_limits<double>::quiet_NaN();
-    Double_t dutAmplitude = numeric_limits<double>::quiet_NaN();
-    Double_t dutMeanAmplitude = numeric_limits<double>::quiet_NaN();
-    Double_t dutClusterCharge = numeric_limits<double>::quiet_NaN();
-    Double_t dutClusterMaxAmplitude = numeric_limits<double>::quiet_NaN();
-    Double_t dutClusterSize = numeric_limits<double>::quiet_NaN();
-    Double_t dutClusterCentroid = numeric_limits<double>::quiet_NaN();
-    Double_t dutClusterLocalX = numeric_limits<double>::quiet_NaN();
-    Double_t dutClusterLocalY = numeric_limits<double>::quiet_NaN();
-    Double_t dutPredictedX = numeric_limits<double>::quiet_NaN();
-    Double_t dutPredictedY = numeric_limits<double>::quiet_NaN();
-    dutTimeTree.Branch("eventID", &dutEventID);
-    dutTimeTree.Branch("rawEventID", &dutRawEventID);
-    dutTimeTree.Branch("trackIndex", &dutTrackIndex);
-    dutTimeTree.Branch("dutID", &dutDetectorID);
-    dutTimeTree.Branch("dutTime", &dutTime);
-    dutTimeTree.Branch("trackTime", &dutTrackTime);
-    dutTimeTree.Branch("dutMinusTrackTime", &dutMinusTrackTime);
-    dutTimeTree.Branch(
-        "hasOscilloscopeT0", &dutHasOscilloscopeT0);
-    dutTimeTree.Branch("oscilloscopeT0", &dutOscilloscopeT0);
-    dutTimeTree.Branch(
-        "oscilloscopeT0Resolution", &dutOscilloscopeT0Resolution);
-    dutTimeTree.Branch(
-        "dutMinusOscilloscopeT0", &dutMinusOscilloscopeT0);
-    dutTimeTree.Branch("amplitude", &dutAmplitude);
-    dutTimeTree.Branch("meanAmplitude", &dutMeanAmplitude);
-    dutTimeTree.Branch("clusterCharge", &dutClusterCharge);
-    dutTimeTree.Branch("clusterMaxAmplitude", &dutClusterMaxAmplitude);
-    dutTimeTree.Branch("clusterSize", &dutClusterSize);
-    dutTimeTree.Branch("clusterCentroid", &dutClusterCentroid);
-    dutTimeTree.Branch("clusterLocalX", &dutClusterLocalX);
-    dutTimeTree.Branch("clusterLocalY", &dutClusterLocalY);
-    dutTimeTree.Branch("predictedX", &dutPredictedX);
-    dutTimeTree.Branch("predictedY", &dutPredictedY);
-    map<int, T0ResidualSamples> dutT0Residuals;
-    map<int, T0ResidualSamples> dutEfficiencyT0Residuals;
-    for (const auto& [detectorID, samples] : dutTiming.samplesByDetector) {
-        for (const DUTTimingSample& sample : samples) {
-            dutEventID = sample.eventID;
-            dutRawEventID = sample.rawEventID;
-            dutTrackIndex = sample.trackIndex;
-            dutDetectorID = detectorID;
-            dutTime = sample.dutTime;
-            dutTrackTime = sample.trackTime;
-            dutMinusTrackTime = sample.residual;
-            const auto scopeReference =
-                oscilloscopeT0.references.find(sample.rawEventID);
-            dutHasOscilloscopeT0 =
-                scopeReference != oscilloscopeT0.references.end();
-            if (dutHasOscilloscopeT0) {
-                dutOscilloscopeT0 = scopeReference->second.time;
-                dutOscilloscopeT0Resolution =
-                    scopeReference->second.resolution;
-                dutMinusOscilloscopeT0 =
-                    sample.dutTime - dutOscilloscopeT0;
-                dutT0Residuals[detectorID].Add(
-                    dutMinusOscilloscopeT0,
-                    dutOscilloscopeT0Resolution);
-                if (sample.insideActiveArea)
-                    dutEfficiencyT0Residuals[detectorID].Add(
-                        dutMinusOscilloscopeT0,
-                        dutOscilloscopeT0Resolution);
-            } else {
-                dutOscilloscopeT0 =
-                    numeric_limits<double>::quiet_NaN();
-                dutOscilloscopeT0Resolution =
-                    numeric_limits<double>::quiet_NaN();
-                dutMinusOscilloscopeT0 =
-                    numeric_limits<double>::quiet_NaN();
-            }
-            dutAmplitude = sample.amplitude;
-            dutMeanAmplitude = sample.meanAmplitude;
-            dutClusterCharge = sample.clusterCharge;
-            dutClusterMaxAmplitude = sample.clusterMaxAmplitude;
-            dutClusterSize = sample.clusterSize;
-            dutClusterCentroid = sample.clusterCentroid;
-            dutClusterLocalX = sample.clusterLocalX;
-            dutClusterLocalY = sample.clusterLocalY;
-            dutPredictedX = sample.predictedX;
-            dutPredictedY = sample.predictedY;
-            dutTimeTree.Fill();
-        }
-    }
-    dutTimeTree.Write();
-
-    TTree summary("ResolutionSummary", "Gaussian timing-resolution fits");
-    string analysis, estimatorName;
-    Int_t detectorA = 0, detectorB = -1;
-    Long64_t entries = 0;
-    Double_t meanNs = 0.0, sigmaNs = 0.0, sigmaErrorNs = 0.0, resolutionNs = 0.0;
-    summary.Branch("analysis", &analysis);
-    summary.Branch("estimator", &estimatorName);
-    summary.Branch("detectorA", &detectorA);
-    summary.Branch("detectorB", &detectorB);
-    summary.Branch("entries", &entries);
-    summary.Branch("meanNs", &meanNs);
-    summary.Branch("sigmaNs", &sigmaNs);
-    summary.Branch("sigmaErrorNs", &sigmaErrorNs);
-    summary.Branch("resolutionNs", &resolutionNs);
-
-    auto fillSummary = [&](const string& analysisName, const string& estimator,
-                           int detA, int detB, const FitResult& fit,
-                           double resolution) {
-        analysis = analysisName;
-        estimatorName = estimator;
-        detectorA = detA;
-        detectorB = detB;
-        entries = fit.entries;
-        meanNs = fit.mean;
-        sigmaNs = fit.sigma;
-        sigmaErrorNs = fit.sigmaError;
-        resolutionNs = resolution;
-        summary.Fill();
-    };
-
-    TDirectory* timeDirectory = output->mkdir("TimeDistributions");
-    TDirectory* rawTimeDirectory = timeDirectory->mkdir("RawDetectorTime");
-    for (const auto& [key, samples] : detectorTimeSamples) {
-        const int detectorID = key.first;
-        const size_t estimator = key.second;
-        const string estimatorLabel = kEstimatorNames[estimator];
-        const string name = SafeName("time_d" + to_string(detectorID) + "_" + estimatorLabel);
-        const FitResult fit = WriteAndFit(
-            samples, *rawTimeDirectory, name, "Detector time; t_{detector} [ns];Entries",
-            histogramBins);
-        fillSummary("detector_time", estimatorLabel, detectorID, -1, fit, fit.sigma);
-    }
-
-    TDirectory* pairDirectory = output->mkdir("PairResiduals");
-    TDirectory* pairRawDirectory = pairDirectory->mkdir("Raw");
-    for (const auto& [key, samples] : pairResiduals) {
-        size_t estimator = 0;
-        tie(detectorA, detectorB, estimator) = key;
-        const string estimatorLabel = kEstimatorNames[estimator];
-        const string name = SafeName("pair_d" + to_string(detectorA) + "_d" +
-                                     to_string(detectorB) + "_" + estimatorLabel);
-        const string title = "Tracker pair residual; t_{" + to_string(detectorA) +
-                             "} - t_{" + to_string(detectorB) + "} [ns];Entries";
-        const FitResult fit = WriteAndFit(samples, *pairRawDirectory, name, title,
-                                          histogramBins);
-        fillSummary("tracker_pair", estimatorLabel, detectorA, detectorB, fit,
-                    fit.sigma / sqrt(2.0));
-    }
-
-    TDirectory* threeTrackerDirectory = output->mkdir("ThreeTracker");
-    WriteAndFit(
-        trackTimeSamples, *threeTrackerDirectory, "track_time_weighted",
-        "Inverse-variance weighted tracker time;t_{track} [ns];Tracks",
-        histogramBins);
-    const array<pair<size_t, size_t>, 3> pairIndices = {
-        pair<size_t, size_t>{0, 1}, {0, 2}, {1, 2}};
-    array<FitResult, 3> threeTrackerPairFits;
-    for (size_t pairIndex = 0; pairIndex < pairIndices.size(); ++pairIndex) {
-        const auto [first, second] = pairIndices[pairIndex];
-        const string pairLabel =
-            "d" + to_string(trackerIDs[first]) + "_d" + to_string(trackerIDs[second]);
-        threeTrackerPairFits[pairIndex] = WriteAndFit(
-            threeTrackerPairResiduals[pairIndex], *threeTrackerDirectory,
-            "three_tracker_pair_" + pairLabel,
-            "Three-tracker common-sample residual; t_{" +
-                to_string(trackerIDs[first]) + "} - t_{" +
-                to_string(trackerIDs[second]) + "} [ns];Tracks",
-            histogramBins);
-    }
-    const FitResult* fit12 = &threeTrackerPairFits[0];
-    const FitResult* fit13 = &threeTrackerPairFits[1];
-    const FitResult* fit23 = &threeTrackerPairFits[2];
-
-    TTree threeTrackerSummary(
-        "ThreeTrackerResolution",
-        "Individual tracker resolutions and inverse-variance weighted track-time resolution");
-    Int_t resolutionValid = 0;
-    Double_t sigma12Ns = numeric_limits<double>::quiet_NaN();
-    Double_t sigma13Ns = numeric_limits<double>::quiet_NaN();
-    Double_t sigma23Ns = numeric_limits<double>::quiet_NaN();
-    Double_t tracker1VarianceNs2 = numeric_limits<double>::quiet_NaN();
-    Double_t tracker2VarianceNs2 = numeric_limits<double>::quiet_NaN();
-    Double_t tracker3VarianceNs2 = numeric_limits<double>::quiet_NaN();
-    Double_t tracker1ResolutionNs = numeric_limits<double>::quiet_NaN();
-    Double_t tracker2ResolutionNs = numeric_limits<double>::quiet_NaN();
-    Double_t tracker3ResolutionNs = numeric_limits<double>::quiet_NaN();
-    Double_t tracker1ResolutionErrorNs = numeric_limits<double>::quiet_NaN();
-    Double_t tracker2ResolutionErrorNs = numeric_limits<double>::quiet_NaN();
-    Double_t tracker3ResolutionErrorNs = numeric_limits<double>::quiet_NaN();
-    Double_t trackResolutionNs = numeric_limits<double>::quiet_NaN();
-    Double_t trackResolutionErrorNs = numeric_limits<double>::quiet_NaN();
-    ULong64_t completeTracks = static_cast<ULong64_t>(completeThreeTrackerTimes);
-    threeTrackerSummary.Branch("valid", &resolutionValid);
-    threeTrackerSummary.Branch("tracker1ID", &tracker1ID);
-    threeTrackerSummary.Branch("tracker2ID", &tracker2ID);
-    threeTrackerSummary.Branch("tracker3ID", &tracker3ID);
-    threeTrackerSummary.Branch("completeTracks", &completeTracks);
-    threeTrackerSummary.Branch("sigma12Ns", &sigma12Ns);
-    threeTrackerSummary.Branch("sigma13Ns", &sigma13Ns);
-    threeTrackerSummary.Branch("sigma23Ns", &sigma23Ns);
-    threeTrackerSummary.Branch("tracker1VarianceNs2", &tracker1VarianceNs2);
-    threeTrackerSummary.Branch("tracker2VarianceNs2", &tracker2VarianceNs2);
-    threeTrackerSummary.Branch("tracker3VarianceNs2", &tracker3VarianceNs2);
-    threeTrackerSummary.Branch("tracker1ResolutionNs", &tracker1ResolutionNs);
-    threeTrackerSummary.Branch("tracker2ResolutionNs", &tracker2ResolutionNs);
-    threeTrackerSummary.Branch("tracker3ResolutionNs", &tracker3ResolutionNs);
-    threeTrackerSummary.Branch("tracker1ResolutionErrorNs", &tracker1ResolutionErrorNs);
-    threeTrackerSummary.Branch("tracker2ResolutionErrorNs", &tracker2ResolutionErrorNs);
-    threeTrackerSummary.Branch("tracker3ResolutionErrorNs", &tracker3ResolutionErrorNs);
-    threeTrackerSummary.Branch("tracker1Weight", &tracker1Weight);
-    threeTrackerSummary.Branch("tracker2Weight", &tracker2Weight);
-    threeTrackerSummary.Branch("tracker3Weight", &tracker3Weight);
-    threeTrackerSummary.Branch("trackResolutionNs", &trackResolutionNs);
-    threeTrackerSummary.Branch("trackResolutionErrorNs", &trackResolutionErrorNs);
-
-    const bool hasPairFits =
-        fit12 && fit13 && fit23 && isfinite(fit12->sigma) &&
-        isfinite(fit13->sigma) && isfinite(fit23->sigma);
-    if (hasPairFits) {
-        sigma12Ns = fit12->sigma;
-        sigma13Ns = fit13->sigma;
-        sigma23Ns = fit23->sigma;
-        tracker1VarianceNs2 =
-            0.5 * (sigma12Ns * sigma12Ns + sigma13Ns * sigma13Ns -
-                   sigma23Ns * sigma23Ns);
-        tracker2VarianceNs2 =
-            0.5 * (sigma12Ns * sigma12Ns + sigma23Ns * sigma23Ns -
-                   sigma13Ns * sigma13Ns);
-        tracker3VarianceNs2 =
-            0.5 * (sigma13Ns * sigma13Ns + sigma23Ns * sigma23Ns -
-                   sigma12Ns * sigma12Ns);
-        resolutionValid = trackWeights.valid &&
-                          tracker1VarianceNs2 > 0.0 &&
-                          tracker2VarianceNs2 > 0.0 &&
-                          tracker3VarianceNs2 > 0.0;
-        if (resolutionValid) {
-            tracker1ResolutionNs = sqrt(tracker1VarianceNs2);
-            tracker2ResolutionNs = sqrt(tracker2VarianceNs2);
-            tracker3ResolutionNs = sqrt(tracker3VarianceNs2);
-            trackResolutionNs = trackWeights.resolution;
-
-            auto resolutionError = [](double resolution,
-                                      const FitResult& first,
-                                      const FitResult& second,
-                                      const FitResult& third) {
-                if (resolution <= 0.0 || !isfinite(first.sigmaError) ||
-                    !isfinite(second.sigmaError) || !isfinite(third.sigmaError))
-                    return numeric_limits<double>::quiet_NaN();
-                const double varianceError = sqrt(
-                    pow(first.sigma * first.sigmaError, 2) +
-                    pow(second.sigma * second.sigmaError, 2) +
-                    pow(third.sigma * third.sigmaError, 2));
-                return varianceError / (2.0 * resolution);
-            };
-            tracker1ResolutionErrorNs =
-                resolutionError(tracker1ResolutionNs, *fit12, *fit13, *fit23);
-            tracker2ResolutionErrorNs =
-                resolutionError(tracker2ResolutionNs, *fit12, *fit23, *fit13);
-            tracker3ResolutionErrorNs =
-                resolutionError(tracker3ResolutionNs, *fit13, *fit23, *fit12);
-            if (trackResolutionNs > 0.0 &&
-                isfinite(tracker1ResolutionErrorNs) &&
-                isfinite(tracker2ResolutionErrorNs) &&
-                isfinite(tracker3ResolutionErrorNs)) {
-                trackResolutionErrorNs =
-                    sqrt(pow(tracker1Weight * tracker1Weight *
-                                 tracker1ResolutionNs *
-                                 tracker1ResolutionErrorNs,
-                             2) +
-                         pow(tracker2Weight * tracker2Weight *
-                                 tracker2ResolutionNs *
-                                 tracker2ResolutionErrorNs,
-                             2) +
-                         pow(tracker3Weight * tracker3Weight *
-                                 tracker3ResolutionNs *
-                                 tracker3ResolutionErrorNs,
-                             2)) /
-                    trackResolutionNs;
-            }
-
-            const array<double, 3> resolutions = {
-                tracker1ResolutionNs, tracker2ResolutionNs, tracker3ResolutionNs};
-            const array<double, 3> errors = {
-                tracker1ResolutionErrorNs, tracker2ResolutionErrorNs,
-                tracker3ResolutionErrorNs};
-            for (size_t i = 0; i < trackerIDs.size(); ++i) {
-                FitResult derived;
-                derived.entries = min({fit12->entries, fit13->entries, fit23->entries});
-                derived.sigma = resolutions[i];
-                derived.sigmaError = errors[i];
-                fillSummary("three_tracker_detector", kEstimatorNames[kTrackerTimingEstimator],
-                            trackerIDs[i], -1, derived, resolutions[i]);
-            }
-            FitResult trackDerived;
-            trackDerived.entries = static_cast<long long>(completeThreeTrackerTimes);
-            trackDerived.sigma = trackResolutionNs;
-            trackDerived.sigmaError = trackResolutionErrorNs;
-            fillSummary("track_time_weighted", kEstimatorNames[kTrackerTimingEstimator],
-                        -1, -1, trackDerived, trackResolutionNs);
-        }
-    }
-    threeTrackerDirectory->cd();
-    threeTrackerSummary.Fill();
-    threeTrackerSummary.Write();
-
-    ostringstream trackerSummary;
-    trackerSummary << fixed << setprecision(1)
-                   << "track reference ";
-    if (resolutionValid) {
-        trackerSummary << trackResolutionNs << " ns · trackers "
-                       << tracker1ResolutionNs << '/'
-                       << tracker2ResolutionNs << '/'
-                       << tracker3ResolutionNs << " ns · "
-                       << Terminal::Count(completeThreeTrackerTimes)
-                       << " tracks";
-    } else {
-        trackerSummary << "invalid";
-    }
-    Terminal::Detail(trackerSummary.str());
-    if (Terminal::Verbose() && resolutionValid) {
-        ostringstream weights;
-        weights << fixed << setprecision(2)
-                << "tracker IDs " << trackerIDs[0] << '/'
-                << trackerIDs[1] << '/' << trackerIDs[2]
-                << " · weights " << tracker1Weight << '/'
-                << tracker2Weight << '/' << tracker3Weight;
-        Terminal::Detail(Terminal::Muted(weights.str()));
-    }
-
-    if (!oscilloscopeT0.references.empty()) {
-        TDirectory* t0Directory = output->mkdir("OscilloscopeT0");
-        TDirectory* detectorDirectory =
-            t0Directory->mkdir("DetectorResiduals");
-        auto subtractT0Resolution =
-            [](const FitResult& fit,
-               const T0ResidualSamples& samples) {
-                const double referenceVariance =
-                    samples.MeanReferenceVariance();
-                if (!isfinite(fit.sigma) ||
-                    !isfinite(referenceVariance))
-                    return numeric_limits<double>::quiet_NaN();
-                const double intrinsicVariance =
-                    fit.sigma * fit.sigma - referenceVariance;
-                return intrinsicVariance >= 0.0
-                           ? sqrt(intrinsicVariance)
-                           : numeric_limits<double>::quiet_NaN();
-            };
-
-        for (const auto& [key, samples] : detectorT0Residuals) {
-            const int detectorID = key.first;
-            const size_t estimator = key.second;
-            const string estimatorLabel = kEstimatorNames[estimator];
-            const string name =
-                SafeName("detector_minus_t0_d" +
-                         to_string(detectorID) + "_" + estimatorLabel);
-            const FitResult fit = WriteAndFit(
-                samples.residual, *detectorDirectory, name,
-                "Detector time relative to oscilloscope T0;"
-                "t_{detector}-T0_{scope} [ns];Entries",
-                histogramBins);
-            fillSummary(
-                "oscilloscope_t0_detector", estimatorLabel,
-                detectorID, -1, fit,
-                subtractT0Resolution(fit, samples));
-        }
-
-        const FitResult trackT0Fit = WriteAndFit(
-            trackT0Residuals.residual, *t0Directory,
-            "track_minus_oscilloscope_t0",
-            "Weighted track time relative to oscilloscope T0;"
-            "t_{track}-T0_{scope} [ns];Tracks",
-            histogramBins);
-        const double trackT0Resolution =
-            subtractT0Resolution(trackT0Fit, trackT0Residuals);
-        fillSummary(
-            "oscilloscope_t0_track",
-            kEstimatorNames[kTrackerTimingEstimator],
-            -1, -1, trackT0Fit, trackT0Resolution);
-
-        TTree t0Summary(
-            "OscilloscopeT0Summary",
-            "Oscilloscope channel alignment, weighting and matched T0 summary");
-        Double_t channelResolution[3] = {
-            oscilloscopeT0.channelResolution[0],
-            oscilloscopeT0.channelResolution[1],
-            oscilloscopeT0.channelResolution[2]};
-        Double_t channelResolutionError[3] = {
-            oscilloscopeT0.channelResolutionError[0],
-            oscilloscopeT0.channelResolutionError[1],
-            oscilloscopeT0.channelResolutionError[2]};
-        Double_t channelOffset[3] = {
-            oscilloscopeT0.channelOffset[0],
-            oscilloscopeT0.channelOffset[1],
-            oscilloscopeT0.channelOffset[2]};
-        Double_t channelWeight[3] = {
-            oscilloscopeT0.channelWeight[0],
-            oscilloscopeT0.channelWeight[1],
-            oscilloscopeT0.channelWeight[2]};
-        Double_t combinedResolutionNs = oscilloscopeT0.resolution;
-        Double_t measuredTrackMinusT0SigmaNs = trackT0Fit.sigma;
-        Double_t intrinsicTrackResolutionNs = trackT0Resolution;
-        ULong64_t inputEntries = oscilloscopeT0.inputEntries;
-        ULong64_t matchedRawEventIDs =
-            oscilloscopeT0.references.size();
-        ULong64_t matchedTracks = tracksWithOscilloscopeT0;
-        ULong64_t invalidEventIDs =
-            oscilloscopeT0.invalidEventIDs;
-        ULong64_t duplicateEventIDs =
-            oscilloscopeT0.duplicateEventIDs;
-        t0Summary.Branch(
-            "channelResolutionNs", channelResolution,
-            "channelResolutionNs[3]/D");
-        t0Summary.Branch(
-            "channelResolutionErrorNs", channelResolutionError,
-            "channelResolutionErrorNs[3]/D");
-        t0Summary.Branch(
-            "channelOffsetNs", channelOffset,
-            "channelOffsetNs[3]/D");
-        t0Summary.Branch(
-            "channelWeight", channelWeight, "channelWeight[3]/D");
-        t0Summary.Branch(
-            "combinedResolutionNs", &combinedResolutionNs);
-        t0Summary.Branch(
-            "measuredTrackMinusT0SigmaNs",
-            &measuredTrackMinusT0SigmaNs);
-        t0Summary.Branch(
-            "intrinsicTrackResolutionNs",
-            &intrinsicTrackResolutionNs);
-        t0Summary.Branch("inputEntries", &inputEntries);
-        t0Summary.Branch("matchedRawEventIDs", &matchedRawEventIDs);
-        t0Summary.Branch("matchedTracks", &matchedTracks);
-        t0Summary.Branch("invalidEventIDs", &invalidEventIDs);
-        t0Summary.Branch("duplicateEventIDs", &duplicateEventIDs);
-        t0Directory->cd();
-        t0Summary.Fill();
-        t0Summary.Write();
-
-        struct EfficiencyRow {
-            string source;
-            TimingEfficiencyResult result;
-        };
-        vector<EfficiencyRow> efficiencyRows;
-        TDirectory* efficiencyDirectory =
-            t0Directory->mkdir("TimingEfficiency");
-        map<int, size_t> dutEfficiencyDenominators;
-        map<int, size_t> dutMatchedHitCounts;
-        map<int, TimingEfficiencyResult> dutEfficiencyResults;
-        auto countCasesWithT0 =
-            [&](const set<TrackKey>& cases) {
-                return static_cast<size_t>(count_if(
-                    cases.begin(), cases.end(),
-                    [&](const TrackKey& key) {
-                        return oscilloscopeT0.references.count(
-                                   key.first) != 0;
-                    }));
-            };
-        for (const auto& [dutID, cases] :
-             dutTiming.activeAreaTrackCases) {
-            dutEfficiencyDenominators[dutID] =
-                countCasesWithT0(cases);
-        }
-        for (const auto& [dutID, cases] :
-             dutTiming.activeAreaMatchedHitCases) {
-            dutMatchedHitCounts[dutID] =
-                countCasesWithT0(cases);
-        }
-
-        for (const auto& [dutID, samples] :
-             dutEfficiencyT0Residuals) {
-            const string source = "DUT " + to_string(dutID);
-            const size_t denominator =
-                dutEfficiencyDenominators[dutID];
-            const TimingEfficiencyResult efficiency =
-                WriteTimingEfficiencyCurve(
-                    samples.residual, denominator,
-                    timingEfficiencyWindowNs, timingEfficiencyStepNs,
-                    histogramBins,
-                    *efficiencyDirectory,
-                    SafeName("dut_d" + to_string(dutID)),
-                    source + " timing-window efficiency", true);
-            if (efficiency.valid)
-                efficiencyRows.push_back({source, efficiency});
-            if (efficiency.valid)
-                dutEfficiencyResults[dutID] = efficiency;
-        }
-
-        if (!efficiencyRows.empty()) {
-            cout << "\n[TimeResolution] " << timingEfficiencyWindowNs
-                 << " ns timing-window efficiency relative to "
-                    "oscilloscope T0 (DUT only)\n"
-                 << "  " << left << setw(20) << "Source"
-                 << right << setw(12) << "Best/All"
-                 << setw(14) << "Maximum"
-                 << setw(27) << "Best window [ns]" << '\n';
-            for (const EfficiencyRow& row : efficiencyRows) {
-                ostringstream counts;
-                counts << row.result.bestCount << '/'
-                       << row.result.denominator;
-                ostringstream maximum;
-                maximum << fixed << setprecision(3)
-                        << 100.0 * row.result.bestEfficiency << '%';
-                ostringstream window;
-                window << fixed << setprecision(6) << '['
-                       << row.result.bestWindowStart << ", "
-                       << row.result.bestWindowEnd << ']';
-                cout << "  " << left << setw(20) << row.source
-                     << right << setw(12) << counts.str()
-                     << setw(14) << maximum.str()
-                     << setw(27) << window.str() << '\n';
-            }
-            for (const auto& [dutID, denominator] :
-                 dutEfficiencyDenominators) {
-                const size_t matchedHits =
-                    dutMatchedHitCounts[dutID];
-                const auto residuals =
-                    dutEfficiencyT0Residuals.find(dutID);
-                const size_t validTimes =
-                    residuals ==
-                            dutEfficiencyT0Residuals.end()
-                        ? 0
-                        : residuals->second.residual.size();
-                const auto efficiency =
-                    dutEfficiencyResults.find(dutID);
-                const size_t bestCount =
-                    efficiency == dutEfficiencyResults.end()
-                        ? 0
-                        : efficiency->second.bestCount;
-                const size_t spatialMisses =
-                    denominator > matchedHits
-                        ? denominator - matchedHits
-                        : 0;
-                const size_t invalidTimes =
-                    matchedHits > validTimes
-                        ? matchedHits - validTimes
-                        : 0;
-                const size_t outsideWindow =
-                    validTimes > bestCount
-                        ? validTimes - bestCount
-                        : 0;
-                cout << "  DUT " << dutID
-                     << " DUTEfficiency selection: "
-                     << denominator
-                     << " active-area track+T0; losses = "
-                     << spatialMisses << " no spatial match + "
-                     << invalidTimes << " invalid time + "
-                     << outsideWindow
-                     << " outside best window\n";
-            }
-        }
-
-        cout << "[TimeResolution] oscilloscope T0 matched tracks="
-             << tracksWithOscilloscopeT0
-             << ", measured track-T0 sigma=" << trackT0Fit.sigma
-             << " ns, T0-subtracted track resolution="
-             << trackT0Resolution << " ns\n";
-    }
-
-    if (!dutTiming.samplesByDetector.empty()) {
-        TDirectory* dutDirectory = output->mkdir("DUTTimeResolution");
-        for (const auto& [dutID, samples] : dutTiming.samplesByDetector) {
-            vector<double> dutTimes;
-            vector<double> referenceTimes;
-            vector<double> residuals;
-            const array<string, 9> factorNames = {
-                "max_amplitude", "mean_amplitude", "cluster_charge",
-                "cluster_size", "cluster_centroid", "cluster_local_x",
-                "cluster_local_y", "predicted_x", "predicted_y"};
-            const array<string, 9> factorTitles = {
-                "Maximum fitted channel amplitude [ADC]",
-                "Mean fitted channel amplitude [ADC]",
-                "Cluster charge", "Cluster size", "Cluster centroid",
-                "Cluster local X", "Cluster local Y",
-                "Track predicted X", "Track predicted Y"};
-            array<vector<double>, 9> factors;
-            dutTimes.reserve(samples.size());
-            referenceTimes.reserve(samples.size());
-            residuals.reserve(samples.size());
-            for (const DUTTimingSample& sample : samples) {
-                dutTimes.push_back(sample.dutTime);
-                referenceTimes.push_back(sample.trackTime);
-                residuals.push_back(sample.residual);
-                factors[0].push_back(sample.amplitude);
-                factors[1].push_back(sample.meanAmplitude);
-                factors[2].push_back(sample.clusterCharge);
-                factors[3].push_back(sample.clusterSize);
-                factors[4].push_back(sample.clusterCentroid);
-                factors[5].push_back(sample.clusterLocalX);
-                factors[6].push_back(sample.clusterLocalY);
-                factors[7].push_back(sample.predictedX);
-                factors[8].push_back(sample.predictedY);
-            }
-            TDirectory* detectorDirectory =
-                dutDirectory->mkdir(("DUT_" + to_string(dutID)).c_str());
-            WriteAndFit(
-                dutTimes, *detectorDirectory, "dut_time",
-                "DUT matched-cluster mean fitted time;t_{DUT} [ns];Events",
-                histogramBins);
-            WriteAndFit(
-                referenceTimes, *detectorDirectory, "track_time",
-                "Weighted tracker reference time;t_{track} [ns];Events",
-                histogramBins);
-            const FitResult measured = WriteAndFit(
-                residuals, *detectorDirectory, "dut_minus_track_time",
-                "DUT time residual;t_{DUT}-t_{track} [ns];Events",
-                histogramBins);
-            FitResult dutT0Fit;
-            double dutT0Resolution =
-                numeric_limits<double>::quiet_NaN();
-            const auto dutT0Samples = dutT0Residuals.find(dutID);
-            if (dutT0Samples != dutT0Residuals.end()) {
-                dutT0Fit = WriteAndFit(
-                    dutT0Samples->second.residual,
-                    *detectorDirectory,
-                    "dut_minus_oscilloscope_t0",
-                    "DUT time relative to oscilloscope T0;"
-                    "t_{DUT}-T0_{scope} [ns];Events",
-                    histogramBins);
-                const double referenceVariance =
-                    dutT0Samples->second.MeanReferenceVariance();
-                const double dutVariance =
-                    dutT0Fit.sigma * dutT0Fit.sigma -
-                    referenceVariance;
-                if (isfinite(dutT0Fit.sigma) &&
-                    isfinite(referenceVariance) &&
-                    dutVariance >= 0.0)
-                    dutT0Resolution = sqrt(dutVariance);
-                fillSummary(
-                    "oscilloscope_t0_dut", "XYMean",
-                    dutID, -1, dutT0Fit, dutT0Resolution);
-            }
-
-            TDirectory* correlationDirectory =
-                detectorDirectory->mkdir("Correlations");
-            TTree correlationSummary(
-                "DUTCorrelationSummary",
-                "DUT-track residual correlations with cluster factors");
-            string factorName;
-            Long64_t correlationEntries =
-                static_cast<Long64_t>(samples.size());
-            Double_t pearson =
-                numeric_limits<double>::quiet_NaN();
-            correlationSummary.Branch("factor", &factorName);
-            correlationSummary.Branch("entries", &correlationEntries);
-            correlationSummary.Branch("pearson", &pearson);
-            for (size_t factor = 0; factor < factors.size(); ++factor) {
-                pearson = WriteDUTCorrelation(
-                    factors[factor], residuals,
-                    *correlationDirectory, factorNames[factor],
-                    factorTitles[factor], min(histogramBins, 80));
-                factorName = factorNames[factor];
-                correlationSummary.Fill();
-            }
-            correlationDirectory->cd();
-            correlationSummary.Write();
-
-            TTree dutSummary(
-                "DUTResolution",
-                "DUT resolution after subtracting tracker reference in quadrature");
-            Int_t valid = 0;
-            Int_t summaryDUTID = dutID;
-            Long64_t matchedEntries = measured.entries;
-            Double_t residualMeanNs = measured.mean;
-            Double_t measuredSigmaNs = measured.sigma;
-            Double_t measuredSigmaErrorNs = measured.sigmaError;
-            Double_t referenceResolutionNs = trackResolutionNs;
-            Double_t referenceResolutionErrorNs = trackResolutionErrorNs;
-            Double_t dutVarianceNs2 = numeric_limits<double>::quiet_NaN();
-            Double_t dutResolutionNs = numeric_limits<double>::quiet_NaN();
-            Double_t dutResolutionErrorNs = numeric_limits<double>::quiet_NaN();
-            if (resolutionValid && isfinite(measuredSigmaNs)) {
-                dutVarianceNs2 =
-                    measuredSigmaNs * measuredSigmaNs -
-                    referenceResolutionNs * referenceResolutionNs;
-                valid = dutVarianceNs2 >= 0.0;
-                if (valid) {
-                    dutResolutionNs = sqrt(dutVarianceNs2);
-                    if (dutResolutionNs > 0.0 &&
-                        isfinite(measuredSigmaErrorNs) &&
-                        isfinite(referenceResolutionErrorNs)) {
-                        dutResolutionErrorNs =
-                            sqrt(pow(measuredSigmaNs * measuredSigmaErrorNs, 2) +
-                                 pow(referenceResolutionNs *
-                                         referenceResolutionErrorNs,
-                                     2)) /
-                            dutResolutionNs;
-                    }
-                }
-            }
-            dutSummary.Branch("valid", &valid);
-            dutSummary.Branch("dutID", &summaryDUTID);
-            dutSummary.Branch("entries", &matchedEntries);
-            dutSummary.Branch("residualMeanNs", &residualMeanNs);
-            dutSummary.Branch("measuredSigmaNs", &measuredSigmaNs);
-            dutSummary.Branch("measuredSigmaErrorNs", &measuredSigmaErrorNs);
-            dutSummary.Branch("trackResolutionNs", &referenceResolutionNs);
-            dutSummary.Branch("trackResolutionErrorNs",
-                              &referenceResolutionErrorNs);
-            dutSummary.Branch("dutVarianceNs2", &dutVarianceNs2);
-            dutSummary.Branch("dutResolutionNs", &dutResolutionNs);
-            dutSummary.Branch("dutResolutionErrorNs", &dutResolutionErrorNs);
-            detectorDirectory->cd();
-            dutSummary.Fill();
-            dutSummary.Write();
-
-            ostringstream dutSummaryLine;
-            dutSummaryLine << fixed << setprecision(1)
-                           << "DUT" << dutID << ' ';
-            if (valid) {
-                dutSummaryLine << dutResolutionNs << " ns · measured "
-                               << measuredSigmaNs << " ns · "
-                               << Terminal::Count(samples.size())
-                               << " matches";
-            } else {
-                dutSummaryLine << "resolution invalid · "
-                               << Terminal::Count(samples.size())
-                               << " matches";
-            }
-            Terminal::Detail(dutSummaryLine.str());
-            if (dutT0Samples != dutT0Residuals.end())
-                cout << "[TimeResolution] DUT " << dutID
-                     << " vs oscilloscope T0: matched="
-                     << dutT0Samples->second.residual.size()
-                     << ", measured sigma=" << dutT0Fit.sigma
-                     << " ns, T0-subtracted resolution="
-                     << dutT0Resolution << " ns\n";
-        }
-    }
-
-    output->cd();
-    summary.Write();
-    if (Terminal::Verbose()) {
-        Terminal::Detail(Terminal::Muted(
-            Terminal::Count(trackTimes.size()) + " tracks · output " +
-            outputPath));
-    }
-    return !trackTimes.empty();
-}
-
 void WriteRawTimeHistogram(const vector<double>& values, TDirectory& directory,
                            const string& name, const string& title, int bins) {
     vector<double> finiteValues;
@@ -2270,6 +1199,170 @@ void WriteRawTimeHistogram(const vector<double>& values, TDirectory& directory,
     TH1D histogram(name.c_str(), title.c_str(), bins, low, high);
     for (double value : finiteValues) histogram.Fill(value);
     histogram.Write();
+}
+
+void WriteTimeAmplitudeRelation(
+    const vector<double>& amplitudes,
+    const vector<double>& residuals,
+    TDirectory& directory,
+    const string& name,
+    const string& title,
+    int bins) {
+    vector<double> finiteAmplitudes;
+    vector<double> finiteResiduals;
+    const size_t entries = min(amplitudes.size(), residuals.size());
+    finiteAmplitudes.reserve(entries);
+    finiteResiduals.reserve(entries);
+    for (size_t index = 0; index < entries; ++index) {
+        if (!isfinite(amplitudes[index]) ||
+            !isfinite(residuals[index]))
+            continue;
+        finiteAmplitudes.push_back(amplitudes[index]);
+        finiteResiduals.push_back(residuals[index]);
+    }
+    if (finiteAmplitudes.size() < 3) return;
+
+    auto [amplitudeLow, amplitudeHigh] =
+        RobustRange(finiteAmplitudes);
+    auto [residualLow, residualHigh] =
+        RobustRange(finiteResiduals);
+    const double amplitudePadding =
+        0.05 * max(1.0e-6, amplitudeHigh - amplitudeLow);
+    const double residualPadding =
+        0.05 * max(1.0e-6, residualHigh - residualLow);
+    amplitudeLow -= amplitudePadding;
+    amplitudeHigh += amplitudePadding;
+    residualLow -= residualPadding;
+    residualHigh += residualPadding;
+    const int plotBins = max(20, min(bins, 100));
+
+    TDirectory::TContext context(&directory);
+    TH2D histogram(
+        ("h_" + name).c_str(), title.c_str(),
+        plotBins, amplitudeLow, amplitudeHigh,
+        plotBins, residualLow, residualHigh);
+    TProfile profile(
+        ("p_" + name).c_str(),
+        (title + " profile").c_str(),
+        plotBins, amplitudeLow, amplitudeHigh,
+        residualLow, residualHigh);
+    histogram.SetStats(false);
+    for (size_t index = 0; index < finiteAmplitudes.size(); ++index) {
+        histogram.Fill(
+            finiteAmplitudes[index], finiteResiduals[index]);
+        profile.Fill(
+            finiteAmplitudes[index], finiteResiduals[index]);
+    }
+    profile.SetLineColor(kRed + 1);
+    profile.SetMarkerColor(kRed + 1);
+    profile.SetMarkerStyle(20);
+
+    TCanvas canvas(
+        ("c_" + name).c_str(),
+        title.c_str(), 1000, 750);
+    canvas.SetRightMargin(0.14);
+    histogram.Draw("COLZ");
+    profile.Draw("SAME");
+    histogram.Write();
+    profile.Write();
+    canvas.Write();
+}
+
+TimeWalkCorrection FitTimeWalkCorrection(
+    const vector<double>& amplitudes,
+    const vector<double>& residuals) {
+    TimeWalkCorrection result;
+    vector<double> finiteAmplitudes;
+    vector<double> finiteResiduals;
+    const size_t entries = min(amplitudes.size(), residuals.size());
+    finiteAmplitudes.reserve(entries);
+    finiteResiduals.reserve(entries);
+    for (size_t index = 0; index < entries; ++index) {
+        if (!isfinite(amplitudes[index]) ||
+            !isfinite(residuals[index]))
+            continue;
+        finiteAmplitudes.push_back(amplitudes[index]);
+        finiteResiduals.push_back(residuals[index]);
+    }
+    result.entries = finiteAmplitudes.size();
+    if (finiteAmplitudes.size() < 20) return result;
+
+    const auto [amplitudeLow, amplitudeHigh] =
+        RobustRange(finiteAmplitudes);
+    const auto [residualLow, residualHigh] =
+        RobustRange(finiteResiduals);
+    if (!(amplitudeHigh > amplitudeLow) ||
+        !(residualHigh > residualLow))
+        return result;
+
+    static unsigned long fitCounter = 0;
+    const string suffix = to_string(fitCounter++);
+    TProfile profile(
+        ("time_walk_profile_" + suffix).c_str(), "",
+        100, amplitudeLow, amplitudeHigh,
+        residualLow, residualHigh);
+    profile.SetDirectory(nullptr);
+    for (size_t index = 0; index < finiteAmplitudes.size(); ++index)
+        profile.Fill(
+            finiteAmplitudes[index], finiteResiduals[index]);
+
+    TF1 fit(
+        ("time_walk_fit_" + suffix).c_str(), "pol3",
+        amplitudeLow, amplitudeHigh);
+    if (profile.Fit(&fit, "QNR") != 0) return result;
+
+    double fittedMean = 0.0;
+    for (double amplitude : finiteAmplitudes)
+        fittedMean += fit.Eval(
+            clamp(amplitude, amplitudeLow, amplitudeHigh));
+    fittedMean /= static_cast<double>(finiteAmplitudes.size());
+
+    result.valid = true;
+    result.amplitudeLow = amplitudeLow;
+    result.amplitudeHigh = amplitudeHigh;
+    for (size_t parameter = 0; parameter < result.parameter.size();
+         ++parameter) {
+        result.parameter[parameter] =
+            fit.GetParameter(static_cast<int>(parameter));
+    }
+    result.parameter[0] -= fittedMean;
+    return result;
+}
+
+double CorrectedClusterTime(
+    const vector<double>& times,
+    const vector<double>& errors,
+    const vector<double>& amplitudes,
+    const vector<int>& planes,
+    const TimeWalkCorrection& correction,
+    const string& timeMethod,
+    double amplitudeWeightPower) {
+    if (!correction.valid) return numeric_limits<double>::quiet_NaN();
+    vector<double> correctedTimes;
+    vector<double> correctedErrors;
+    vector<double> correctedAmplitudes;
+    vector<int> correctedPlanes;
+    const size_t entries = min(
+        {times.size(), amplitudes.size(), planes.size()});
+    correctedTimes.reserve(entries);
+    correctedErrors.reserve(entries);
+    correctedAmplitudes.reserve(entries);
+    correctedPlanes.reserve(entries);
+    for (size_t index = 0; index < entries; ++index) {
+        const double timeCorrection =
+            correction.Evaluate(amplitudes[index]);
+        if (!isfinite(times[index]) || !isfinite(timeCorrection)) continue;
+        correctedTimes.push_back(times[index] - timeCorrection);
+        correctedErrors.push_back(
+            index < errors.size()
+                ? errors[index]
+                : numeric_limits<double>::quiet_NaN());
+        correctedAmplitudes.push_back(amplitudes[index]);
+        correctedPlanes.push_back(planes[index]);
+    }
+    return CalculateConfiguredTime(
+        correctedTimes, correctedErrors, correctedAmplitudes,
+        correctedPlanes, timeMethod, amplitudeWeightPower);
 }
 
 TimingEfficiencyResult WriteCompactTimingEfficiency(
@@ -2317,10 +1410,58 @@ TimingEfficiencyResult WriteCompactTimingEfficiency(
 
     WriteAndFit(
         sorted, directory, "hTimeResidual",
-        "DUT cluster time relative to external T0;"
+        "Amplitude-corrected DUT cluster time relative to external T0;"
         "t_{DUT}-T0 [ns];Entries",
         histogramBins);
     TDirectory::TContext context(&directory);
+    auto* residualHistogram =
+        dynamic_cast<TH1D*>(directory.Get("hTimeResidual"));
+    if (residualHistogram) {
+        gStyle->SetOptStat(1);
+        gStyle->SetOptFit(1);
+        residualHistogram->SetStats(true);
+        TCanvas residualCanvas(
+            "cTimeResidualFit",
+            "DUT timing residual, Gaussian fit, and selected window",
+            1000, 700);
+        residualHistogram->Draw("HIST");
+        TF1* gaussian = residualHistogram->GetFunction(
+            "hTimeResidual_gaus");
+        if (gaussian) {
+            gaussian->SetLineColor(kGreen + 2);
+            gaussian->SetLineWidth(3);
+            gaussian->Draw("SAME");
+        }
+        const double yMaximum =
+            1.08 * residualHistogram->GetMaximum();
+        residualHistogram->SetMaximum(yMaximum);
+        TLine windowStart(
+            result.bestWindowStart, 0.0,
+            result.bestWindowStart, yMaximum);
+        TLine windowEnd(
+            result.bestWindowEnd, 0.0,
+            result.bestWindowEnd, yMaximum);
+        for (TLine* line : {&windowStart, &windowEnd}) {
+            line->SetLineColor(kRed + 1);
+            line->SetLineStyle(2);
+            line->SetLineWidth(3);
+            line->Draw("SAME");
+        }
+        ostringstream annotation;
+        annotation << fixed << setprecision(2)
+                   << "selected " << windowWidthNs
+                   << " ns window: ["
+                   << result.bestWindowStart << ", "
+                   << result.bestWindowEnd << "] ns";
+        TLatex label;
+        label.SetNDC();
+        label.SetTextColor(kRed + 1);
+        label.SetTextSize(0.035);
+        label.DrawLatex(0.14, 0.86, annotation.str().c_str());
+        residualCanvas.Modified();
+        residualCanvas.Update();
+        residualCanvas.Write();
+    }
     TH1D efficiency(
         "hWindowEfficiency25ns",
         "DUT 25 ns timing-window efficiency;"
@@ -2338,11 +1479,14 @@ TimingEfficiencyResult WriteCompactTimingEfficiency(
 bool WriteCompactTimingOutput(
     const string& outputPath,
     const map<TrackKey, map<int, DetectorTimes>>& trackTimes,
-    const map<TrackKey, int>& eventIDs,
+    const map<TrackKey, uint64_t>& rawEventIDs,
     const OscilloscopeT0Result& oscilloscopeT0,
     const array<int, 3>& trackerIDs,
     const DUTTimingResult& dutTiming,
     const TrackTimeWeights& trackWeights,
+    const string& timeMethod,
+    double amplitudeWeightPower,
+    double maximumStripAmplitude,
     double timingEfficiencyWindowNs,
     double timingEfficiencyStepNs,
     int histogramBins,
@@ -2393,31 +1537,153 @@ bool WriteCompactTimingOutput(
     timingTree.Branch(
         "dutMinusExternalT0", &treeDUTMinusExternalT0);
 
+    Int_t stripTreeEventID = -1;
+    ULong64_t stripTreeRawEventID = 0;
+    Int_t stripTreeTrackIndex = -1;
+    Int_t stripTreeDetectorID = -1;
+    Bool_t stripTreeIsDUT = false;
+    Int_t stripTreePlane = -1;
+    Int_t stripTreeChannelID = -1;
+    Int_t stripTreeClusterStripCount = 0;
+    Double_t stripTreeTime = numeric_limits<double>::quiet_NaN();
+    Double_t stripTreeAmplitude = numeric_limits<double>::quiet_NaN();
+    Double_t stripTreeRiseTime = numeric_limits<double>::quiet_NaN();
+    Double_t stripTreeTimeOverThreshold =
+        numeric_limits<double>::quiet_NaN();
+    Bool_t stripTreeHasExternalT0 = false;
+    Double_t stripTreeExternalT0 =
+        numeric_limits<double>::quiet_NaN();
+    Double_t stripTreeTimeMinusExternalT0 =
+        numeric_limits<double>::quiet_NaN();
+    TTree stripTimingTree(
+        "StripTimingTree",
+        "Per-strip timing observables for independent T0 validation");
+    stripTimingTree.Branch("eventID", &stripTreeEventID);
+    stripTimingTree.Branch("rawEventID", &stripTreeRawEventID);
+    stripTimingTree.Branch("trackIndex", &stripTreeTrackIndex);
+    stripTimingTree.Branch("detectorID", &stripTreeDetectorID);
+    stripTimingTree.Branch("isDUT", &stripTreeIsDUT);
+    stripTimingTree.Branch("plane", &stripTreePlane);
+    stripTimingTree.Branch("channelID", &stripTreeChannelID);
+    stripTimingTree.Branch(
+        "clusterStripCount", &stripTreeClusterStripCount);
+    stripTimingTree.Branch("time", &stripTreeTime);
+    stripTimingTree.Branch("amplitude", &stripTreeAmplitude);
+    stripTimingTree.Branch("riseTime", &stripTreeRiseTime);
+    stripTimingTree.Branch(
+        "timeOverThreshold", &stripTreeTimeOverThreshold);
+    stripTimingTree.Branch("hasExternalT0", &stripTreeHasExternalT0);
+    stripTimingTree.Branch("externalT0", &stripTreeExternalT0);
+    stripTimingTree.Branch(
+        "timeMinusExternalT0", &stripTreeTimeMinusExternalT0);
+    const auto fillStripTiming =
+        [&](int eventID, uint64_t rawEventID, int trackIndex,
+            int detectorID, bool isDUT, const auto& timing,
+            bool hasExternalT0, double externalT0) {
+            const size_t stripCount = min(
+                {timing.stripTimes.size(), timing.stripAmplitudes.size(),
+                 timing.stripIDs.size(), timing.stripPlanes.size()});
+            stripTreeEventID = eventID;
+            stripTreeRawEventID = rawEventID;
+            stripTreeTrackIndex = trackIndex;
+            stripTreeDetectorID = detectorID;
+            stripTreeIsDUT = isDUT;
+            stripTreeClusterStripCount =
+                static_cast<Int_t>(stripCount);
+            stripTreeHasExternalT0 = hasExternalT0;
+            stripTreeExternalT0 =
+                hasExternalT0
+                    ? externalT0
+                    : numeric_limits<double>::quiet_NaN();
+            for (size_t strip = 0; strip < stripCount; ++strip) {
+                stripTreePlane = timing.stripPlanes[strip];
+                stripTreeChannelID = timing.stripIDs[strip];
+                stripTreeTime = timing.stripTimes[strip];
+                stripTreeAmplitude = timing.stripAmplitudes[strip];
+                stripTreeRiseTime =
+                    strip < timing.stripRiseTimes.size()
+                        ? timing.stripRiseTimes[strip]
+                        : numeric_limits<double>::quiet_NaN();
+                stripTreeTimeOverThreshold =
+                    strip < timing.stripWidths.size()
+                        ? timing.stripWidths[strip]
+                        : numeric_limits<double>::quiet_NaN();
+                stripTreeTimeMinusExternalT0 =
+                    hasExternalT0 && isfinite(stripTreeTime)
+                        ? stripTreeTime - externalT0
+                        : numeric_limits<double>::quiet_NaN();
+                stripTimingTree.Fill();
+            }
+        };
+
     map<TrackKey, vector<const DUTTimingSample*>> dutSamplesByTrack;
     for (const auto& [dutID, samples] : dutTiming.samplesByDetector) {
         (void)dutID;
         for (const DUTTimingSample& sample : samples)
             dutSamplesByTrack[
-                {sample.rawEventID, sample.trackIndex}].push_back(&sample);
+                {sample.eventID, sample.trackIndex}].push_back(&sample);
     }
+    const auto exceedsMaximumStripAmplitude =
+        [&](const vector<double>& amplitudes) {
+            return maximumStripAmplitude > 0.0 &&
+                   any_of(
+                       amplitudes.begin(), amplitudes.end(),
+                       [&](double amplitude) {
+                           return isfinite(amplitude) &&
+                                  amplitude > maximumStripAmplitude;
+                       });
+        };
 
     map<int, vector<double>> rawDetectorTimes;
-    map<int, vector<double>> externalResiduals;
+    map<int, T0ResidualSamples> externalResiduals;
+    map<int, vector<double>> externalStripAmplitudes;
+    map<int, vector<double>> externalStripResiduals;
     array<vector<double>, 3> trackerPairResiduals;
     vector<double> trackTimeSamples;
-    vector<double> trackExternalResiduals;
+    T0ResidualSamples trackExternalResiduals;
     const array<pair<size_t, size_t>, 3> pairIndices = {
         pair<size_t, size_t>{0, 1}, {0, 2}, {1, 2}};
 
     for (const auto& [key, detectors] : trackTimes) {
-        const auto external = oscilloscopeT0.references.find(key.first);
+        const auto rawEvent = rawEventIDs.find(key);
+        if (rawEvent == rawEventIDs.end()) continue;
+        const auto external =
+            oscilloscopeT0.references.find(rawEvent->second);
         for (const auto& [detectorID, times] : detectors) {
-            const double time = times.value[kTrackerTimingEstimator];
+            fillStripTiming(
+                key.first, rawEvent->second, key.second, detectorID,
+                false, times,
+                external != oscilloscopeT0.references.end(),
+                external != oscilloscopeT0.references.end()
+                    ? external->second.time
+                    : numeric_limits<double>::quiet_NaN());
+            const double time = times.clusterTime;
             if (!isfinite(time)) continue;
             rawDetectorTimes[detectorID].push_back(time);
-            if (external != oscilloscopeT0.references.end())
-                externalResiduals[detectorID].push_back(
-                    time - external->second.time);
+            if (external != oscilloscopeT0.references.end()) {
+                auto& residualSamples =
+                    externalResiduals[detectorID];
+                const size_t previousSize =
+                    residualSamples.residual.size();
+                residualSamples.Add(
+                    time - external->second.time,
+                    external->second.resolution);
+                if (residualSamples.residual.size() > previousSize) {
+                    const size_t stripCount = min(
+                        times.stripTimes.size(),
+                        times.stripAmplitudes.size());
+                    for (size_t strip = 0; strip < stripCount; ++strip) {
+                        if (!isfinite(times.stripTimes[strip]) ||
+                            !isfinite(times.stripAmplitudes[strip]))
+                            continue;
+                        externalStripAmplitudes[detectorID].push_back(
+                            times.stripAmplitudes[strip]);
+                        externalStripResiduals[detectorID].push_back(
+                            times.stripTimes[strip] -
+                            external->second.time);
+                    }
+                }
+            }
         }
 
         array<double, 3> selectedTimes{};
@@ -2425,12 +1691,11 @@ bool WriteCompactTimingOutput(
         for (size_t index = 0; index < trackerIDs.size(); ++index) {
             const auto detector = detectors.find(trackerIDs[index]);
             if (detector == detectors.end() ||
-                !isfinite(detector->second.value[kTrackerTimingEstimator])) {
+                !isfinite(detector->second.clusterTime)) {
                 complete = false;
                 break;
             }
-            selectedTimes[index] =
-                detector->second.value[kTrackerTimingEstimator];
+            selectedTimes[index] = detector->second.clusterTime;
         }
         if (!complete) continue;
         for (size_t pairIndex = 0; pairIndex < pairIndices.size();
@@ -2444,13 +1709,13 @@ bool WriteCompactTimingOutput(
                           trackWeights.value.begin(), 0.0);
         trackTimeSamples.push_back(trackTime);
         if (external != oscilloscopeT0.references.end())
-            trackExternalResiduals.push_back(
-                trackTime - external->second.time);
+            trackExternalResiduals.Add(
+                trackTime - external->second.time,
+                external->second.resolution);
 
-        treeRawEventID = key.first;
+        treeRawEventID = rawEvent->second;
         treeTrackIndex = key.second;
-        const auto event = eventIDs.find(key);
-        treeEventID = event == eventIDs.end() ? -1 : event->second;
+        treeEventID = key.first;
         treeTracker1Time = selectedTimes[0];
         treeTracker2Time = selectedTimes[1];
         treeTracker3Time = selectedTimes[2];
@@ -2491,8 +1756,10 @@ bool WriteCompactTimingOutput(
 
     map<int, vector<double>> dutTimes;
     map<int, vector<double>> dutMinusTrack;
-    map<int, vector<double>> dutExternalResiduals;
-    map<int, vector<double>> dutEfficiencyExternalResiduals;
+    map<int, T0ResidualSamples> dutExternalResiduals;
+    map<int, T0ResidualSamples> dutEfficiencyExternalResiduals;
+    map<int, vector<double>> dutExternalStripAmplitudes;
+    map<int, vector<double>> dutExternalStripResiduals;
     for (const auto& [dutID, samples] : dutTiming.samplesByDetector) {
         for (const DUTTimingSample& sample : samples) {
             if (isfinite(sample.dutTime))
@@ -2501,14 +1768,133 @@ bool WriteCompactTimingOutput(
                 dutMinusTrack[dutID].push_back(sample.residual);
             const auto external =
                 oscilloscopeT0.references.find(sample.rawEventID);
+            fillStripTiming(
+                sample.eventID, sample.rawEventID, sample.trackIndex,
+                dutID, true, sample,
+                external != oscilloscopeT0.references.end(),
+                external != oscilloscopeT0.references.end()
+                    ? external->second.time
+                    : numeric_limits<double>::quiet_NaN());
             if (external == oscilloscopeT0.references.end() ||
                 !isfinite(sample.dutTime))
                 continue;
+            if (exceedsMaximumStripAmplitude(sample.stripAmplitudes))
+                continue;
             const double residual =
                 sample.dutTime - external->second.time;
-            dutExternalResiduals[dutID].push_back(residual);
+            auto& residualSamples =
+                dutExternalResiduals[dutID];
+            const size_t previousSize =
+                residualSamples.residual.size();
+            residualSamples.Add(
+                residual, external->second.resolution);
+            if (residualSamples.residual.size() > previousSize) {
+                const size_t stripCount = min(
+                    sample.stripTimes.size(),
+                    sample.stripAmplitudes.size());
+                for (size_t strip = 0; strip < stripCount; ++strip) {
+                    if (!isfinite(sample.stripTimes[strip]) ||
+                        !isfinite(sample.stripAmplitudes[strip]))
+                        continue;
+                    dutExternalStripAmplitudes[dutID].push_back(
+                        sample.stripAmplitudes[strip]);
+                    dutExternalStripResiduals[dutID].push_back(
+                        sample.stripTimes[strip] -
+                        external->second.time);
+                }
+            }
             if (sample.insideActiveArea)
-                dutEfficiencyExternalResiduals[dutID].push_back(residual);
+                dutEfficiencyExternalResiduals[dutID].Add(
+                    residual, external->second.resolution);
+        }
+    }
+
+    map<int, TimeWalkCorrection> trackerTimeWalkCorrections;
+    for (const auto& [detectorID, amplitudes] :
+         externalStripAmplitudes) {
+        const TimeWalkCorrection correction =
+            FitTimeWalkCorrection(
+                amplitudes, externalStripResiduals[detectorID]);
+        if (correction.valid)
+            trackerTimeWalkCorrections[detectorID] = correction;
+    }
+    map<int, TimeWalkCorrection> dutTimeWalkCorrections;
+    for (const auto& [dutID, amplitudes] :
+         dutExternalStripAmplitudes) {
+        const TimeWalkCorrection correction =
+            FitTimeWalkCorrection(
+                amplitudes, dutExternalStripResiduals[dutID]);
+        if (correction.valid)
+            dutTimeWalkCorrections[dutID] = correction;
+    }
+
+    map<int, T0ResidualSamples> correctedExternalResiduals;
+    T0ResidualSamples correctedTrackExternalResiduals;
+    for (const auto& [key, detectors] : trackTimes) {
+        const auto rawEvent = rawEventIDs.find(key);
+        if (rawEvent == rawEventIDs.end()) continue;
+        const auto external =
+            oscilloscopeT0.references.find(rawEvent->second);
+        if (external == oscilloscopeT0.references.end()) continue;
+        map<int, double> correctedTimes;
+        for (const auto& [detectorID, times] : detectors) {
+            const auto correction =
+                trackerTimeWalkCorrections.find(detectorID);
+            if (correction == trackerTimeWalkCorrections.end()) continue;
+            const double correctedTime = CorrectedClusterTime(
+                times.stripTimes, times.stripTimeErrors,
+                times.stripAmplitudes, times.stripPlanes,
+                correction->second, timeMethod,
+                amplitudeWeightPower);
+            if (!isfinite(correctedTime)) continue;
+            correctedTimes[detectorID] = correctedTime;
+            correctedExternalResiduals[detectorID].Add(
+                correctedTime - external->second.time,
+                external->second.resolution);
+        }
+        array<double, 3> selectedTimes{};
+        bool complete = true;
+        for (size_t tracker = 0; tracker < trackerIDs.size(); ++tracker) {
+            const auto time = correctedTimes.find(trackerIDs[tracker]);
+            if (time == correctedTimes.end()) {
+                complete = false;
+                break;
+            }
+            selectedTimes[tracker] = time->second;
+        }
+        if (!complete) continue;
+        const double correctedTrackTime = inner_product(
+            selectedTimes.begin(), selectedTimes.end(),
+            trackWeights.value.begin(), 0.0);
+        correctedTrackExternalResiduals.Add(
+            correctedTrackTime - external->second.time,
+            external->second.resolution);
+    }
+
+    map<int, T0ResidualSamples> correctedDUTExternalResiduals;
+    map<int, T0ResidualSamples> correctedDUTEfficiencyResiduals;
+    for (const auto& [dutID, samples] : dutTiming.samplesByDetector) {
+        const auto correction = dutTimeWalkCorrections.find(dutID);
+        if (correction == dutTimeWalkCorrections.end()) continue;
+        for (const DUTTimingSample& sample : samples) {
+            const auto external =
+                oscilloscopeT0.references.find(sample.rawEventID);
+            if (external == oscilloscopeT0.references.end()) continue;
+            if (exceedsMaximumStripAmplitude(sample.stripAmplitudes))
+                continue;
+            const double correctedTime = CorrectedClusterTime(
+                sample.stripTimes, sample.stripTimeErrors,
+                sample.stripAmplitudes, sample.stripPlanes,
+                correction->second, timeMethod,
+                amplitudeWeightPower);
+            if (!isfinite(correctedTime)) continue;
+            const double residual =
+                correctedTime - external->second.time;
+            correctedDUTExternalResiduals[dutID].Add(
+                residual, external->second.resolution);
+            if (sample.insideActiveArea)
+                correctedDUTEfficiencyResiduals[dutID].Add(
+                    residual, external->second.resolution);
         }
     }
 
@@ -2582,6 +1968,7 @@ bool WriteCompactTimingOutput(
     double externalTrackResolution =
         numeric_limits<double>::quiet_NaN();
     FitResult externalTrackFit;
+    map<int, double> externalDetectorResolutions;
     map<int, double> externalDUTResolutions;
     map<int, FitResult> externalDetectorFits;
     map<int, FitResult> externalDUTFits;
@@ -2599,36 +1986,83 @@ bool WriteCompactTimingOutput(
                          : "Detector" + to_string(detectorID);
             TDirectory* detectorDirectory =
                 externalDirectory->mkdir(SafeName(label).c_str());
+            const auto corrected =
+                correctedExternalResiduals.find(detectorID);
+            const T0ResidualSamples& fittedSamples =
+                corrected != correctedExternalResiduals.end() &&
+                        !corrected->second.residual.empty()
+                    ? corrected->second
+                    : samples;
             const FitResult fit = WriteAndFit(
-                samples, *detectorDirectory,
+                fittedSamples.residual, *detectorDirectory,
                 "hClusterTimeMinusT0",
-                label + " cluster time relative to external T0;"
+                label +
+                    " amplitude-corrected cluster time relative to external T0;"
                         "t-T0 [ns];Entries",
                 histogramBins);
             externalDetectorFits[detectorID] = fit;
+            externalDetectorResolutions[detectorID] =
+                SubtractReferenceResolution(fit, fittedSamples);
+            TDirectory* timeAmplitudeDirectory =
+                detectorDirectory->mkdir("TimeAmplitude");
+            WriteTimeAmplitudeRelation(
+                externalStripAmplitudes[detectorID],
+                externalStripResiduals[detectorID],
+                *timeAmplitudeDirectory,
+                "strip_time_minus_t0_vs_amplitude",
+                label +
+                    " individual-strip time relative to external T0 vs amplitude;"
+                    "Fitted strip amplitude [ADC];"
+                    "t_{strip}-T0 [ns]",
+                histogramBins);
         }
         TDirectory* trackDirectory =
             externalDirectory->mkdir("TrackTime");
+        const T0ResidualSamples& fittedTrackSamples =
+            !correctedTrackExternalResiduals.residual.empty()
+                ? correctedTrackExternalResiduals
+                : trackExternalResiduals;
         externalTrackFit = WriteAndFit(
-            trackExternalResiduals, *trackDirectory,
+            fittedTrackSamples.residual, *trackDirectory,
             "hTrackTimeMinusT0",
-            "Track time relative to external T0;"
+            "Amplitude-corrected track time relative to external T0;"
             "t_{track}-T0 [ns];Entries",
             histogramBins);
-        externalTrackResolution = externalTrackFit.sigma;
+        externalTrackResolution = SubtractReferenceResolution(
+            externalTrackFit, fittedTrackSamples);
 
         for (const auto& [dutID, samples] : dutExternalResiduals) {
             TDirectory* detectorDirectory =
                 externalDirectory->mkdir(
                     ("DUT" + to_string(dutID)).c_str());
+            const auto corrected =
+                correctedDUTExternalResiduals.find(dutID);
+            const T0ResidualSamples& fittedSamples =
+                corrected != correctedDUTExternalResiduals.end() &&
+                        !corrected->second.residual.empty()
+                    ? corrected->second
+                    : samples;
             const FitResult fit = WriteAndFit(
-                samples, *detectorDirectory,
+                fittedSamples.residual, *detectorDirectory,
                 "hClusterTimeMinusT0",
-                "DUT cluster time relative to external T0;"
+                "Amplitude-corrected DUT cluster time relative to external T0;"
                 "t_{DUT}-T0 [ns];Entries",
                 histogramBins);
             externalDUTFits[dutID] = fit;
-            externalDUTResolutions[dutID] = fit.sigma;
+            externalDUTResolutions[dutID] =
+                SubtractReferenceResolution(fit, fittedSamples);
+            TDirectory* timeAmplitudeDirectory =
+                detectorDirectory->mkdir("TimeAmplitude");
+            WriteTimeAmplitudeRelation(
+                dutExternalStripAmplitudes[dutID],
+                dutExternalStripResiduals[dutID],
+                *timeAmplitudeDirectory,
+                "strip_time_minus_t0_vs_amplitude",
+                "DUT" + to_string(dutID) +
+                    " individual-strip time relative to external T0 vs amplitude;"
+                    "Fitted strip amplitude [ADC];"
+                    "t_{strip}-T0 [ns]",
+                histogramBins);
         }
 
         TDirectory* efficiencyRoot =
@@ -2641,8 +2075,10 @@ bool WriteCompactTimingOutput(
                 denominator = static_cast<size_t>(count_if(
                     cases->second.begin(), cases->second.end(),
                     [&](const TrackKey& key) {
-                        return oscilloscopeT0.references.count(
-                                   key.first) != 0;
+                        const auto rawEvent = rawEventIDs.find(key);
+                        return rawEvent != rawEventIDs.end() &&
+                               oscilloscopeT0.references.count(
+                                   rawEvent->second) != 0;
                     }));
             }
             efficiencyDenominators[dutID] = denominator;
@@ -2654,16 +2090,25 @@ bool WriteCompactTimingOutput(
                         matchedCases->second.begin(),
                         matchedCases->second.end(),
                         [&](const TrackKey& key) {
-                            return oscilloscopeT0.references.count(
-                                       key.first) != 0;
+                            const auto rawEvent = rawEventIDs.find(key);
+                            return rawEvent != rawEventIDs.end() &&
+                                   oscilloscopeT0.references.count(
+                                       rawEvent->second) != 0;
                         }));
             }
             TDirectory* detectorDirectory =
                 efficiencyRoot->mkdir(
                     ("DUT" + to_string(dutID)).c_str());
+            const auto corrected =
+                correctedDUTEfficiencyResiduals.find(dutID);
+            const T0ResidualSamples& efficiencySamples =
+                corrected != correctedDUTEfficiencyResiduals.end() &&
+                        !corrected->second.residual.empty()
+                    ? corrected->second
+                    : residuals;
             const TimingEfficiencyResult result =
                 WriteCompactTimingEfficiency(
-                    residuals, denominator,
+                    efficiencySamples.residual, denominator,
                     timingEfficiencyWindowNs, timingEfficiencyStepNs,
                     histogramBins, *detectorDirectory);
             if (result.valid) efficiencyResults[dutID] = result;
@@ -2684,6 +2129,7 @@ bool WriteCompactTimingOutput(
     Double_t resultEfficiency = numeric_limits<double>::quiet_NaN();
     Double_t resultWindowStart = numeric_limits<double>::quiet_NaN();
     Double_t resultWindowEnd = numeric_limits<double>::quiet_NaN();
+    Bool_t resultAmplitudeCorrected = false;
     TTree resultsTree("TimingResults", "Timing fit and efficiency results");
     resultsTree.Branch("analysis", &resultAnalysis);
     resultsTree.Branch("object", &resultObject);
@@ -2699,10 +2145,13 @@ bool WriteCompactTimingOutput(
     resultsTree.Branch("efficiency", &resultEfficiency);
     resultsTree.Branch("windowStartNs", &resultWindowStart);
     resultsTree.Branch("windowEndNs", &resultWindowEnd);
+    resultsTree.Branch(
+        "amplitudeCorrected", &resultAmplitudeCorrected);
     const auto fillResult = [&](const string& analysis,
                                 const string& object, int detectorA,
                                 int detectorB, const FitResult& fit,
-                                double resolution) {
+                                double resolution,
+                                bool amplitudeCorrected = false) {
         resultAnalysis = analysis;
         resultObject = object;
         resultDetectorA = detectorA;
@@ -2717,6 +2166,7 @@ bool WriteCompactTimingOutput(
         resultEfficiency = numeric_limits<double>::quiet_NaN();
         resultWindowStart = numeric_limits<double>::quiet_NaN();
         resultWindowEnd = numeric_limits<double>::quiet_NaN();
+        resultAmplitudeCorrected = amplitudeCorrected;
         resultsTree.Fill();
     };
     for (size_t index = 0; index < pairFits.size(); ++index) {
@@ -2747,15 +2197,18 @@ bool WriteCompactTimingOutput(
                    internalDUTResolutions[dutID]);
     for (const auto& [detectorID, fit] : externalDetectorFits)
         fillResult("with_external_t0", "detector", detectorID, -1,
-                   fit, fit.sigma);
+                   fit, externalDetectorResolutions[detectorID],
+                   trackerTimeWalkCorrections.count(detectorID) != 0);
     if (isfinite(externalTrackResolution)) {
         fillResult("with_external_t0", "track_time", -1, -1,
                    externalTrackFit,
-                   externalTrackResolution);
+                   externalTrackResolution,
+                   !correctedTrackExternalResiduals.residual.empty());
     }
     for (const auto& [dutID, fit] : externalDUTFits)
         fillResult("with_external_t0", "dut", dutID, -1, fit,
-                   fit.sigma);
+                   externalDUTResolutions[dutID],
+                   dutTimeWalkCorrections.count(dutID) != 0);
     for (const auto& [dutID, efficiency] : efficiencyResults) {
         resultAnalysis = "with_external_t0";
         resultObject = "dut_timing_window";
@@ -2772,11 +2225,53 @@ bool WriteCompactTimingOutput(
         resultEfficiency = efficiency.bestEfficiency;
         resultWindowStart = efficiency.bestWindowStart;
         resultWindowEnd = efficiency.bestWindowEnd;
+        resultAmplitudeCorrected =
+            correctedDUTEfficiencyResiduals.count(dutID) != 0 &&
+            !correctedDUTEfficiencyResiduals.at(dutID).residual.empty();
         resultsTree.Fill();
     }
+
+    string correctionSource;
+    Int_t correctionDetectorID = -1;
+    Long64_t correctionEntries = 0;
+    Double_t correctionAmplitudeLow =
+        numeric_limits<double>::quiet_NaN();
+    Double_t correctionAmplitudeHigh =
+        numeric_limits<double>::quiet_NaN();
+    array<Double_t, 4> correctionParameter{};
+    TTree correctionTree(
+        "TimeAmplitudeCorrections",
+        "Applied cubic single-strip time-amplitude correction parameters");
+    correctionTree.Branch("source", &correctionSource);
+    correctionTree.Branch("detectorID", &correctionDetectorID);
+    correctionTree.Branch("entries", &correctionEntries);
+    correctionTree.Branch("amplitudeLow", &correctionAmplitudeLow);
+    correctionTree.Branch("amplitudeHigh", &correctionAmplitudeHigh);
+    correctionTree.Branch(
+        "parameter", correctionParameter.data(), "parameter[4]/D");
+    const auto fillCorrection = [&](const string& source, int detectorID,
+                                    const TimeWalkCorrection& correction) {
+        correctionSource = source;
+        correctionDetectorID = detectorID;
+        correctionEntries =
+            static_cast<Long64_t>(correction.entries);
+        correctionAmplitudeLow = correction.amplitudeLow;
+        correctionAmplitudeHigh = correction.amplitudeHigh;
+        copy(correction.parameter.begin(), correction.parameter.end(),
+             correctionParameter.begin());
+        correctionTree.Fill();
+    };
+    for (const auto& [detectorID, correction] :
+         trackerTimeWalkCorrections)
+        fillCorrection("tracker", detectorID, correction);
+    for (const auto& [detectorID, correction] : dutTimeWalkCorrections)
+        fillCorrection("dut", detectorID, correction);
+
     output->cd();
     timingTree.Write();
+    stripTimingTree.Write();
     resultsTree.Write();
+    correctionTree.Write();
     output->Close();
 
     const auto row = [](const string& label, const string& value) {
@@ -2816,7 +2311,8 @@ bool WriteCompactTimingOutput(
         }
         row("Ambiguous event IDs",
             count(oscilloscopeT0.duplicateEventIDs));
-        row("Associated tracks", count(trackExternalResiduals.size()));
+        row("Associated tracks",
+            count(trackExternalResiduals.residual.size()));
         {
             ostringstream weights;
             weights << fixed << setprecision(2)
@@ -2876,13 +2372,14 @@ bool WriteCompactTimingOutput(
     separator();
     cout << Terminal::Accent("Time Resolution") << '\n'
          << "  " << left << setw(31) << "Detector / Reference" << right
-         << setw(23) << "Self-calibration" << setw(20) << "External T0"
+         << setw(23) << "Self-calibration"
+         << setw(24) << "External T0 (A-corr.)"
          << '\n';
     const auto resolutionRow = [&](const string& label,
                                    const string& self,
                                    const string& external) {
         cout << "  " << left << setw(31) << label << right << setw(23)
-             << self << setw(20) << external << '\n';
+             << self << setw(24) << external << '\n';
     };
     for (size_t index = 0; index < trackerIDs.size(); ++index) {
         const auto detector =
@@ -2892,7 +2389,11 @@ bool WriteCompactTimingOutput(
                      : "Tracker" + to_string(index + 1),
             fixedValue(sqrt(trackWeights.detectorVariance[index]), 2,
                        " ns"),
-            "—");
+            externalDetectorResolutions.count(trackerIDs[index])
+                ? fixedValue(
+                      externalDetectorResolutions.at(trackerIDs[index]),
+                      2, " ns")
+                : "—");
     }
     resolutionRow(
         "Combined tracker reference",
@@ -2935,6 +2436,13 @@ void TimeResolutionScript::LoadConfig(const json& config) {
         "timingEfficiencyWindowNs", m_timingEfficiencyWindowNs);
     m_timingEfficiencyStepNs = config.value(
         "timingEfficiencyStepNs", m_timingEfficiencyStepNs);
+    if (config.contains("timeMethod"))
+        m_timeMethod = CanonicalTimeMethod(
+            config["timeMethod"].get<string>());
+    m_amplitudeWeightPower = config.value(
+        "amplitudeWeightPower", m_amplitudeWeightPower);
+    m_maximumStripAmplitude = config.value(
+        "maximumStripAmplitude", m_maximumStripAmplitude);
     if (config.contains("timingWaveform"))
         m_timingWaveformConfig = config["timingWaveform"];
 }
@@ -2950,6 +2458,8 @@ void TimeResolutionScript::Print() const {
     }
     cout << "  DUT timing=" << (m_analyzeDUTTiming ? "enabled" : "disabled")
          << '\n';
+    if (m_analyzeDUTTiming)
+        cout << "  DUT timing file=" << m_dutFile << '\n';
     cout << "  oscilloscope T0 file="
          << (m_oscilloscopeFile.empty() ? "disabled"
                                         : m_oscilloscopeFile)
@@ -2965,6 +2475,11 @@ bool TimeResolutionScript::Validate() const {
            m_timingEfficiencyWindowNs > 0.0 &&
            isfinite(m_timingEfficiencyStepNs) &&
            m_timingEfficiencyStepNs > 0.0 &&
+           !m_timeMethod.empty() &&
+           isfinite(m_amplitudeWeightPower) &&
+           m_amplitudeWeightPower >= 0.0 &&
+           isfinite(m_maximumStripAmplitude) &&
+           m_maximumStripAmplitude != 0.0 &&
            (m_trackerIDs.empty() || m_trackerIDs.size() == 3) &&
            set<int>(m_trackerIDs.begin(), m_trackerIDs.end()).size() ==
                m_trackerIDs.size();
@@ -3019,6 +2534,7 @@ bool TimeResolutionScript::Execute() {
     size_t waveformFits = 0;
     if (!LoadReconstructionTimes(
             *validation, *parser, m_timingWaveformConfig,
+            m_timeMethod, m_amplitudeWeightPower,
             waveformFits, reconstruction))
         return false;
     if (Terminal::Verbose()) {
@@ -3027,9 +2543,15 @@ bool TimeResolutionScript::Execute() {
             " tracks · " +
             Terminal::Count(reconstruction.wantedEventIDs.size()) +
             " raw event IDs");
+        if (!reconstruction.ambiguousRawEventIDs.empty())
+            Terminal::Detail(
+                Terminal::Warning(
+                    Terminal::Count(
+                        reconstruction.ambiguousRawEventIDs.size()) +
+                    " repeated raw event IDs excluded from external T0 matching"));
     }
-    const TrackTimeWeights trackWeights =
-        CalculateTrackTimeWeights(reconstruction.trackTimes, trackerIDs);
+    const TrackTimeWeights trackWeights = CalculateTrackTimeWeights(
+        reconstruction.trackTimes, trackerIDs);
     if (!trackWeights.valid) {
         cerr << "[TimeResolution] cannot derive positive tracker variances "
                 "for inverse-variance track-time weights\n";
@@ -3058,26 +2580,32 @@ bool TimeResolutionScript::Execute() {
             cerr << "[TimeResolution] cannot open DUT file " << dutPath << '\n';
             return false;
         }
-        auto* dutTree = dynamic_cast<TTree*>(dutFile->Get("PadDUTTree"));
+        auto* dutTree = dynamic_cast<TTree*>(dutFile->Get("DUTTree"));
+        if (!dutTree)
+            dutTree =
+                dynamic_cast<TTree*>(dutFile->Get("PadDUTTree"));
         if (!dutTree) {
-            cerr << "[TimeResolution] PadDUTTree is missing in " << dutPath
-                 << '\n';
+            cerr << "[TimeResolution] neither DUTTree nor PadDUTTree is "
+                    "present in "
+                 << dutPath << '\n';
             return false;
         }
         const auto references = BuildTrackTimeReferences(
-            reconstruction.trackTimes, reconstruction.eventIDs, trackerIDs,
+            reconstruction.trackTimes, reconstruction.rawEventIDs, trackerIDs,
             trackWeights);
         dutTiming = LoadDUTTiming(
             *dutTree, *parser, references, m_timingWaveformConfig,
-            waveformFits);
+            m_timeMethod, m_amplitudeWeightPower, waveformFits);
     }
 
     const auto& trackTimes = reconstruction.trackTimes;
 
     const bool wroteOutput =
         WriteCompactTimingOutput(
-            outputPath, trackTimes, reconstruction.eventIDs,
+            outputPath, trackTimes, reconstruction.rawEventIDs,
             oscilloscopeT0, trackerIDs, dutTiming, trackWeights,
+            m_timeMethod, m_amplitudeWeightPower,
+            m_maximumStripAmplitude,
             m_timingEfficiencyWindowNs,
             m_timingEfficiencyStepNs, m_histogramBins, analysisStarted);
     if (Terminal::Verbose()) {

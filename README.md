@@ -2,6 +2,8 @@
 
 BeamAnalysis 将数据转换、探测器初始化、ROOT 数据读取和分析脚本统一到一个非交互式运行流程中。正式调用格式只有一种：
 
+当前已实现的分析逻辑、run346 uTPC 回归基线和后续开发优先级见 [分析开发状态](docs/ANALYSIS_DEVELOPMENT_STATUS.md)。
+
 ```bash
 ./BeamAnalysis <base_dir> <run_id>
 ```

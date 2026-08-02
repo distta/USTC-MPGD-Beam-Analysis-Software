@@ -49,5 +49,6 @@ bool DetectorFrame::Process(double t0) {
 }
 
 bool DetectorFrame::Process() {
+    t0 = std::numeric_limits<double>::quiet_NaN();
     return AnalyzeRaw() && Clustering() && Reconstruct() && TransformToGlobal();
 }

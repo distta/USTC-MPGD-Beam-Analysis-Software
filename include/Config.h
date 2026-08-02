@@ -104,6 +104,11 @@ class ReconstructionConfig : public AlgorithmConfig {
     ReconstructionMethod method = ReconstructionMethod::ChargeWeighted;
     std::string weightSource = "amp";
     double weightPower = 1.0;
+    double driftVelocity = 0.022;
+    double gasGap = 5.0;
+    double timeOffset = 0.0;
+    double stripTimeSlope = 0.0;  // ns per strip, centred on the readout plane
+    double chargeCentroidXError = 0.3;  // mm
 
     void loadFrom(const json& config) override {
         const json* cfg = &config;
@@ -124,12 +129,39 @@ class ReconstructionConfig : public AlgorithmConfig {
             weightSource = (*cfg)["weightSource"].get<std::string>();
         if (cfg->contains("weightPower"))
             weightPower = (*cfg)["weightPower"].get<double>();
+        if (cfg->contains("driftVelocity"))
+            driftVelocity = (*cfg)["driftVelocity"].get<double>();
+        if (cfg->contains("gasGap"))
+            gasGap = (*cfg)["gasGap"].get<double>();
+        if (cfg->contains("timeOffset"))
+            timeOffset = (*cfg)["timeOffset"].get<double>();
+        if (cfg->contains("stripTimeSlope"))
+            stripTimeSlope = (*cfg)["stripTimeSlope"].get<double>();
+        if (cfg->contains("chargeCentroidXError"))
+            chargeCentroidXError =
+                (*cfg)["chargeCentroidXError"].get<double>();
         if (weightSource != "charge" && weightSource != "amp")
             throw std::runtime_error(
                 "ReconstructionConfig.weightSource must be charge or amp");
         if (!std::isfinite(weightPower) || weightPower < 0.0)
             throw std::runtime_error(
                 "ReconstructionConfig.weightPower must be finite and non-negative");
+        if (!std::isfinite(driftVelocity) || driftVelocity <= 0.0)
+            throw std::runtime_error(
+                "ReconstructionConfig.driftVelocity must be finite and positive");
+        if (!std::isfinite(gasGap) || gasGap <= 0.0)
+            throw std::runtime_error(
+                "ReconstructionConfig.gasGap must be finite and positive");
+        if (!std::isfinite(timeOffset))
+            throw std::runtime_error(
+                "ReconstructionConfig.timeOffset must be finite");
+        if (!std::isfinite(stripTimeSlope))
+            throw std::runtime_error(
+                "ReconstructionConfig.stripTimeSlope must be finite");
+        if (!std::isfinite(chargeCentroidXError) ||
+            chargeCentroidXError <= 0.0)
+            throw std::runtime_error(
+                "ReconstructionConfig.chargeCentroidXError must be finite and positive");
     }
 
     void print() const override {

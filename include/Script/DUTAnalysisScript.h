@@ -46,6 +46,10 @@ class DUTAnalysisScript : public IScript {
     double m_effXMax = 100.0;
     double m_effYMin = 0.0;
     double m_effYMax = 100.0;
+    double m_alignmentXMin = 0.0;
+    double m_alignmentXMax = 100.0;
+    double m_alignmentYMin = 0.0;
+    double m_alignmentYMax = 100.0;
     DUTEfficiency::Config m_efficiencyConfig;
 
     // 私有方法

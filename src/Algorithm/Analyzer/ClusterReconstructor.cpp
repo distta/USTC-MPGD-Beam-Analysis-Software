@@ -23,9 +23,15 @@ bool ClusterReconstructor::Process(DetectorFrame& frame) {
         if (m_detector && m_detector->GetPlanarPadConfig()) {
             reconstructPadChargeWeighted(cluster, channelHits);
         } else if (m_config.method == ReconstructionMethod::UTPC) {
-            reconstructUTPC(cluster, channelHits, 0);
+            if (frame.HasT0())
+                reconstructUTPC(cluster, channelHits, frame.GetT0());
+            else
+                reconstructChargeWeighted(cluster, channelHits);
         } else if (m_config.method == ReconstructionMethod::RawUTPC) {
-            reconstructRawUTPC(cluster, channelHits, 0);
+            if (frame.HasT0())
+                reconstructRawUTPC(cluster, channelHits, frame.GetT0());
+            else
+                reconstructChargeWeighted(cluster, channelHits);
         } else if (m_config.method == ReconstructionMethod::ChargeWeighted) {
             reconstructChargeWeighted(cluster, channelHits);
         } else {
@@ -99,7 +105,8 @@ void ClusterReconstructor::reconstructChargeWeighted(Cluster& cluster, const std
     }
 }
 
-double LinearFitIter(const std::vector<ChannelHit>& channelHits, double x0) {
+double LinearFitIter(const std::vector<ChannelHit>& channelHits, double x0,
+                     double t0) {
 
     double lorentzAngle = 0. / 180 * TMath::Pi();
     double velocity = 0.021;
@@ -142,7 +149,7 @@ double LinearFitIter(const std::vector<ChannelHit>& channelHits, double x0) {
         double dis = (x - x0) * 0.4;
         double disCor = disCorFunc.Eval(dis);
         double tCor = tCorFunc.Eval(strip.time);
-        double y = (strip.time + disCor + tCor) * velocity;
+        double y = (strip.time - t0 + disCor + tCor) * velocity;
         // y = tzFunc.Eval(strip.time);
 
         if (y < -0.4 || y > gasGap + 0.4) continue;
@@ -207,12 +214,13 @@ void ClusterReconstructor::reconstructUTPC(Cluster& cluster, const std::vector<C
     std::sort(modifiedStrips.begin(), modifiedStrips.end(),
               [](const auto& a, const auto& b) { return a.id0 < b.id0; });
 
-    double pos = LinearFitIter(modifiedStrips, ccRecPos);
+    double pos = LinearFitIter(modifiedStrips, ccRecPos, t0);
     double lastPos = -99;
     int iter = 1;
     while (abs(pos - lastPos) > 0.01 && iter < 5) {
         lastPos = pos;
-        pos = (LinearFitIter(modifiedStrips, pos) + pos * iter) / (iter + 1);
+        pos = (LinearFitIter(modifiedStrips, pos, t0) + pos * iter) /
+              (iter + 1);
         iter++;
     }
 
@@ -224,8 +232,6 @@ void ClusterReconstructor::reconstructRawUTPC(Cluster& cluster, const std::vecto
         cluster.pos = 0.0;
         return;
     }
-
-    TGraph* track = new TGraph();
 
     double weightedSum = 0.0;
     double totalCharge = 0.0;
@@ -248,9 +254,24 @@ void ClusterReconstructor::reconstructRawUTPC(Cluster& cluster, const std::vecto
         return;
     }
 
-    double lorentzAngle = 0. / 180 * TMath::Pi();
-    double velocity = 0.022754;
-    double gasGap = 5;
+    const double velocity = m_config.driftVelocity;
+    const double gasGap = m_config.gasGap;
+    double pitch = 0.4;
+    double centerStrip = 0.0;
+    if (m_detector) {
+        if (const auto* planar = m_detector->GetPlanarConfig()) {
+            const auto pitchEntry =
+                planar->readoutPlanePitch.find(cluster.type);
+            if (pitchEntry != planar->readoutPlanePitch.end() &&
+                pitchEntry->second > 0.0)
+                pitch = pitchEntry->second;
+            const auto stripNumber =
+                planar->readoutPlaneStripNumber.find(cluster.type);
+            if (stripNumber != planar->readoutPlaneStripNumber.end() &&
+                stripNumber->second > 0)
+                centerStrip = 0.5 * (stripNumber->second - 1);
+        }
+    }
 
     std::vector<ChannelHit> modifiedStrips;
     modifiedStrips.reserve(cluster.channelHitIndices.size());
@@ -261,23 +282,107 @@ void ClusterReconstructor::reconstructRawUTPC(Cluster& cluster, const std::vecto
     std::sort(modifiedStrips.begin(), modifiedStrips.end(),
               [](const auto& a, const auto& b) { return a.id0 < b.id0; });
 
-    for (auto& strip : modifiedStrips) {
-        double deltaT = strip.time - 100;
-        double x0 = strip.id0;
-        double y0 = deltaT * velocity;
-
-        int index = track->GetN();
-        track->SetPoint(index, x0, y0);
+    std::vector<double> validTimeErrors;
+    validTimeErrors.reserve(modifiedStrips.size());
+    for (const auto& strip : modifiedStrips) {
+        if (std::isfinite(strip.timeError) && strip.timeError > 0.0)
+            validTimeErrors.push_back(strip.timeError);
+    }
+    double fallbackTimeError = 1.0;
+    if (!validTimeErrors.empty()) {
+        const auto middle = validTimeErrors.begin() + validTimeErrors.size() / 2;
+        std::nth_element(validTimeErrors.begin(), middle,
+                         validTimeErrors.end());
+        fallbackTimeError = *middle;
     }
 
-    if (track->GetN() < 3) {
+    struct FitPoint {
+        double x;
+        double y;
+        double xError;
+        double yError;
+    };
+    std::vector<FitPoint> fitPoints;
+    fitPoints.reserve(modifiedStrips.size() + 1);
+    for (const auto& strip : modifiedStrips) {
+        // timeOffset is the calibrated DUT-minus-tracker correction and is
+        // added to the measured strip time relative to the track T0.
+        const double deltaT =
+            strip.time - t0 + m_config.timeOffset +
+            m_config.stripTimeSlope * (strip.id0 - centerStrip);
+        const double x = strip.id0 * pitch;
+        const double y = deltaT * velocity;
+        const double timeError =
+            std::isfinite(strip.timeError) && strip.timeError > 0.0
+                ? strip.timeError
+                : fallbackTimeError;
+        const double yError = timeError * velocity;
+        fitPoints.push_back({x, y, 0.0, yError});
+    }
+
+    const auto fitLine = [&](double slopeForErrors, size_t pointCount,
+                             double& slope, double& intercept) {
+        double sumWeight = 0.0;
+        double sumX = 0.0;
+        double sumY = 0.0;
+        for (size_t i = 0; i < pointCount; ++i) {
+            const auto& point = fitPoints[i];
+            const double variance =
+                point.yError * point.yError +
+                slopeForErrors * slopeForErrors *
+                    point.xError * point.xError;
+            if (!(variance > 0.0) || !std::isfinite(variance)) return false;
+            const double weight = 1.0 / variance;
+            sumWeight += weight;
+            sumX += weight * point.x;
+            sumY += weight * point.y;
+        }
+        if (!(sumWeight > 0.0)) return false;
+
+        const double meanX = sumX / sumWeight;
+        const double meanY = sumY / sumWeight;
+        double varianceX = 0.0;
+        double covarianceXY = 0.0;
+        for (size_t i = 0; i < pointCount; ++i) {
+            const auto& point = fitPoints[i];
+            const double variance =
+                point.yError * point.yError +
+                slopeForErrors * slopeForErrors *
+                    point.xError * point.xError;
+            const double weight = 1.0 / variance;
+            varianceX += weight * (point.x - meanX) *
+                         (point.x - meanX);
+            covarianceXY += weight * (point.x - meanX) *
+                            (point.y - meanY);
+        }
+        if (!(varianceX > 0.0)) return false;
+        slope = covarianceXY / varianceX;
+        intercept = meanY - slope * meanX;
+        return std::isfinite(slope) && std::isfinite(intercept);
+    };
+
+    double k = 0.0;
+    double b = 0.0;
+    if (!fitLine(0.0, fitPoints.size(), k, b) ||
+        std::abs(k) < 1e-12) {
         cluster.pos = ccRecPos;
         return;
     }
 
-    track->Fit("pol1", "q");
-    double k = track->GetFunction("pol1")->GetParameter(1);
-    double b = track->GetFunction("pol1")->GetParameter(0);
+    fitPoints.push_back({ccRecPos * pitch, gasGap / 2,
+                         m_config.chargeCentroidXError, 0.0});
+    for (int iteration = 0; iteration < 10; ++iteration) {
+        double nextK = k;
+        double nextB = b;
+        if (!fitLine(k, fitPoints.size(), nextK, nextB) ||
+            std::abs(nextK) < 1e-12)
+            break;
+        const bool converged =
+            std::abs(nextK - k) <= 1e-6 * std::max(1.0, std::abs(k));
+        k = nextK;
+        b = nextB;
+        if (converged) break;
+    }
 
-    cluster.pos = (gasGap / 2 - b) / k;
+    cluster.pos = ((gasGap / 2 - b) / k) / pitch;
 }

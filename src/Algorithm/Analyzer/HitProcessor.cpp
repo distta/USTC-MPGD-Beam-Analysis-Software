@@ -225,28 +225,40 @@ ChannelHit HitProcessor::processWaveformDefault(const RawData& rawData) {
       }
    }
 
-   // Constant-fraction leading-edge time with sample-to-sample interpolation.
-   const double targetY = baseline + m_config.cfdFraction * peakAmp;
-   int crossingIdx = -1;
-   for (int i = 1; i <= peakTime; ++i) {
-      if (waveform[i - 1] < targetY && waveform[i] >= targetY) {
-         crossingIdx = i;
-         break;
+   const auto risingCrossing = [&](double target) {
+      for (int i = 1; i <= peakTime; ++i) {
+         const double y1 = waveform[i - 1];
+         const double y2 = waveform[i];
+         if (y1 < target && y2 >= target && y2 != y1)
+            return static_cast<double>(i - 1) +
+                   (target - y1) / (y2 - y1);
       }
-   }
+      return std::numeric_limits<double>::quiet_NaN();
+   };
+   const auto fallingCrossing = [&](double target) {
+      for (size_t i = static_cast<size_t>(peakTime + 1);
+           i < nSamples; ++i) {
+         const double y1 = waveform[i - 1];
+         const double y2 = waveform[i];
+         if (y1 >= target && y2 < target && y2 != y1)
+            return static_cast<double>(i - 1) +
+                   (y1 - target) / (y1 - y2);
+      }
+      return std::numeric_limits<double>::quiet_NaN();
+   };
 
-   double fitTime = std::numeric_limits<double>::quiet_NaN();
-   if (crossingIdx < 0) {
-      channelData.isValid = false;
-   } else {
-      const double y1 = waveform[crossingIdx - 1];
-      const double y2 = waveform[crossingIdx];
-      if (y2 == y1) {
-         channelData.isValid = false;
-      } else {
-         fitTime = (crossingIdx - 1) + (targetY - y1) / (y2 - y1);
-      }
-   }
+   // The fixed-threshold mode uses the configured ADC threshold for time;
+   // Default keeps constant-fraction timing.
+   const double thresholdRise = risingCrossing(baseline + noiseTh);
+   const double fitTime =
+       m_config.mode == "FixedThreshold"
+           ? thresholdRise
+           : risingCrossing(
+                 baseline + m_config.cfdFraction * peakAmp);
+   const double time10 = risingCrossing(baseline + 0.10 * peakAmp);
+   const double time90 = risingCrossing(baseline + 0.90 * peakAmp);
+   const double thresholdFall = fallingCrossing(baseline + noiseTh);
+   if (!std::isfinite(fitTime)) channelData.isValid = false;
 
    if (channelData.isValid &&
        (fitTime * m_config.timePitch < m_config.timeWindowStart ||
@@ -257,7 +269,15 @@ ChannelHit HitProcessor::processWaveformDefault(const RawData& rawData) {
    channelData.charge = inducedCharge;
    channelData.peakTime = peakTime * m_config.timePitch;
    channelData.time = fitTime * m_config.timePitch;
-   channelData.riseTime = 0;
+   channelData.riseTime =
+       std::isfinite(time10) && std::isfinite(time90) && time90 >= time10
+           ? (time90 - time10) * m_config.timePitch
+           : std::numeric_limits<double>::quiet_NaN();
+   channelData.width =
+       std::isfinite(thresholdRise) && std::isfinite(thresholdFall) &&
+               thresholdFall >= thresholdRise
+           ? (thresholdFall - thresholdRise) * m_config.timePitch
+           : std::numeric_limits<double>::quiet_NaN();
    channelData.timeError = 0;
    channelData.isSaturated = (peakAmp > m_config.saturationLevel);
 

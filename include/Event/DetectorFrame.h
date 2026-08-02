@@ -4,6 +4,8 @@
 #include "Algorithm/Analyzer/HitProcessor.h"
 #include "DataModel.h"
 #include "Detector.h"
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 
 class DetectorFrame {
@@ -16,6 +18,7 @@ class DetectorFrame {
     void AddRawData(const RawData& raw) { m_raw.push_back(raw); }
 
     double GetT0() const { return t0; }
+    bool HasT0() const { return std::isfinite(t0); }
     const std::vector<RawData>& Raw() const { return m_raw; }
     const std::vector<ChannelHit>& ChannelHits() const { return m_channelHits; }
     const std::vector<Cluster>& Clusters() const { return m_clusters; }
@@ -80,7 +83,7 @@ class DetectorFrame {
     const Detector& det() const { return m_det; }
 
    private:
-    double t0;
+    double t0{std::numeric_limits<double>::quiet_NaN()};
     //   Raw Level (from DAQ)
     std::vector<RawData> m_raw;
 
